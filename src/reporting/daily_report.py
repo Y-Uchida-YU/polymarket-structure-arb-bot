@@ -164,7 +164,9 @@ class DailyReportGenerator:
                 label=f"date_{date}",
             )
         hours = max(1, int(last_hours or 24))
-        end = datetime.now(tz=UTC)
+        # Keep the query end bound exclusive while avoiding boundary misses when
+        # a row timestamp equals "now" at microsecond precision.
+        end = datetime.now(tz=UTC) + timedelta(microseconds=1)
         start = end - timedelta(hours=hours)
         return ReportWindow(
             start_iso=start.isoformat(),
