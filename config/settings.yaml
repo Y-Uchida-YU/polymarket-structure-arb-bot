@@ -1,0 +1,39 @@
+api:
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  gamma_markets_endpoint: "/markets"
+  gamma_page_size: 200
+  gamma_max_pages: 10
+  ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+strategy:
+  entry_threshold_sum_ask: 0.985
+  min_ask: 0.01
+  max_ask: 0.99
+  expiry_block_minutes: 180
+  signal_cooldown_seconds: 30
+
+risk:
+  max_open_positions: 5
+  max_positions_per_market: 1
+  paper_order_size_usdc: 5.0
+  max_daily_signals: 200
+
+storage:
+  sqlite_path: "data/state/state.db"
+  export_dir: "data/exports"
+  log_dir: "data/logs"
+
+runtime:
+  reconnect_base_seconds: 2.0
+  reconnect_max_seconds: 30.0
+  websocket_ping_interval_seconds: 20
+  websocket_ping_timeout_seconds: 20
+  market_refresh_minutes: 60
+
+market_filters:
+  exclude_categories:
+    - politics
+    - geopolitics
+    - death
+    - celebrity
+  exclude_keywords: []

@@ -1,0 +1,12 @@
+# Optional market-level controls.
+# include_slugs is empty by default (allow all except excluded ones).
+include_slugs: []
+exclude_slugs: []
+
+exclude_categories:
+  - politics
+  - geopolitics
+  - death
+  - celebrity
+
+exclude_keywords: []
