@@ -18,8 +18,7 @@ class SQLiteStore:
 
     def _create_tables(self) -> None:
         with self.conn:
-            self.conn.execute(
-                """
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS markets (
                   market_id TEXT PRIMARY KEY,
                   slug TEXT NOT NULL,
@@ -30,10 +29,8 @@ class SQLiteStore:
                   no_token_id TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 )
-                """
-            )
-            self.conn.execute(
-                """
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS quotes (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   market_id TEXT NOT NULL,
@@ -43,10 +40,8 @@ class SQLiteStore:
                   best_ask REAL,
                   quote_time TEXT NOT NULL
                 )
-                """
-            )
-            self.conn.execute(
-                """
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                   signal_id TEXT PRIMARY KEY,
                   market_id TEXT NOT NULL,
@@ -58,10 +53,8 @@ class SQLiteStore:
                   detected_at TEXT NOT NULL,
                   reason TEXT NOT NULL
                 )
-                """
-            )
-            self.conn.execute(
-                """
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                   order_id TEXT PRIMARY KEY,
                   signal_id TEXT NOT NULL,
@@ -73,10 +66,8 @@ class SQLiteStore:
                   status TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 )
-                """
-            )
-            self.conn.execute(
-                """
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS fills (
                   fill_id TEXT PRIMARY KEY,
                   order_id TEXT NOT NULL,
@@ -88,10 +79,8 @@ class SQLiteStore:
                   fee REAL NOT NULL,
                   filled_at TEXT NOT NULL
                 )
-                """
-            )
-            self.conn.execute(
-                """
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS pnl_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   signal_id TEXT NOT NULL,
@@ -99,25 +88,31 @@ class SQLiteStore:
                   estimated_final_pnl REAL NOT NULL,
                   created_at TEXT NOT NULL
                 )
-                """
-            )
-            self.conn.execute(
-                """
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS errors (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   stage TEXT NOT NULL,
                   error_message TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 )
-                """
-            )
+                """)
 
     def upsert_market(self, market: BinaryMarket, updated_at_iso: str) -> None:
         with self.conn:
             self.conn.execute(
                 """
                 INSERT INTO markets
-                (market_id, slug, question, category, end_time, yes_token_id, no_token_id, updated_at)
+                (
+                  market_id,
+                  slug,
+                  question,
+                  category,
+                  end_time,
+                  yes_token_id,
+                  no_token_id,
+                  updated_at
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(market_id) DO UPDATE SET
                   slug=excluded.slug,
@@ -167,7 +162,17 @@ class SQLiteStore:
             self.conn.execute(
                 """
                 INSERT INTO signals
-                (signal_id, market_id, slug, ask_yes, ask_no, sum_ask, threshold, detected_at, reason)
+                (
+                  signal_id,
+                  market_id,
+                  slug,
+                  ask_yes,
+                  ask_no,
+                  sum_ask,
+                  threshold,
+                  detected_at,
+                  reason
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -188,7 +193,17 @@ class SQLiteStore:
             self.conn.execute(
                 """
                 INSERT INTO orders
-                (order_id, signal_id, market_id, token_id, side, quantity, limit_price, status, created_at)
+                (
+                  order_id,
+                  signal_id,
+                  market_id,
+                  token_id,
+                  side,
+                  quantity,
+                  limit_price,
+                  status,
+                  created_at
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
@@ -209,7 +224,17 @@ class SQLiteStore:
             self.conn.execute(
                 """
                 INSERT INTO fills
-                (fill_id, order_id, signal_id, market_id, token_id, filled_qty, fill_price, fee, filled_at)
+                (
+                  fill_id,
+                  order_id,
+                  signal_id,
+                  market_id,
+                  token_id,
+                  filled_qty,
+                  fill_price,
+                  fee,
+                  filled_at
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (

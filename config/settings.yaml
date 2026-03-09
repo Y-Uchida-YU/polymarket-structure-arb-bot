@@ -17,6 +17,8 @@ risk:
   max_positions_per_market: 1
   paper_order_size_usdc: 5.0
   max_daily_signals: 200
+  min_book_size: 0.0
+  stale_quote_ms: 3000
 
 storage:
   sqlite_path: "data/state/state.db"

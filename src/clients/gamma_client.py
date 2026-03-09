@@ -26,7 +26,10 @@ class GammaClient:
         markets: list[dict[str, Any]] = []
         offset = 0
 
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=self.timeout_seconds,
+        ) as client:
             for _ in range(max_pages):
                 params = {
                     "active": "true",

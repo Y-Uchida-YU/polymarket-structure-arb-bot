@@ -17,6 +17,7 @@ class MarketWebSocketClient:
         asset_ids: list[str],
         on_message: Callable[[str], Awaitable[None]],
         logger: logging.Logger,
+        get_asset_ids: Callable[[], list[str]] | None = None,
         reconnect_base_seconds: float = 2.0,
         reconnect_max_seconds: float = 30.0,
         ping_interval_seconds: int = 20,
@@ -24,6 +25,7 @@ class MarketWebSocketClient:
     ) -> None:
         self.url = url
         self.asset_ids = asset_ids
+        self.get_asset_ids = get_asset_ids
         self.on_message = on_message
         self.logger = logger
         self.reconnect_base_seconds = reconnect_base_seconds
@@ -31,11 +33,18 @@ class MarketWebSocketClient:
         self.ping_interval_seconds = ping_interval_seconds
         self.ping_timeout_seconds = ping_timeout_seconds
 
-    async def run_forever(self, stop_event: asyncio.Event) -> None:
+    async def run_forever(
+        self,
+        stop_event: asyncio.Event,
+        resubscribe_event: asyncio.Event | None = None,
+    ) -> None:
         backoff = self.reconnect_base_seconds
         while not stop_event.is_set():
             try:
-                await self._connect_and_stream(stop_event=stop_event)
+                await self._connect_and_stream(
+                    stop_event=stop_event,
+                    resubscribe_event=resubscribe_event,
+                )
                 backoff = self.reconnect_base_seconds
             except asyncio.CancelledError:
                 raise
@@ -44,8 +53,13 @@ class MarketWebSocketClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.reconnect_max_seconds)
 
-    async def _connect_and_stream(self, stop_event: asyncio.Event) -> None:
-        if not self.asset_ids:
+    async def _connect_and_stream(
+        self,
+        stop_event: asyncio.Event,
+        resubscribe_event: asyncio.Event | None,
+    ) -> None:
+        current_asset_ids = self._current_asset_ids()
+        if not current_asset_ids:
             self.logger.warning("No asset IDs to subscribe. Retrying.")
             await asyncio.sleep(self.reconnect_base_seconds)
             return
@@ -57,9 +71,14 @@ class MarketWebSocketClient:
             max_queue=4096,
         ) as ws:
             self.logger.info("WebSocket connected: %s", self.url)
-            await self._subscribe(ws, self.asset_ids)
+            await self._subscribe(ws, current_asset_ids)
 
             while not stop_event.is_set():
+                if resubscribe_event is not None and resubscribe_event.is_set():
+                    resubscribe_event.clear()
+                    self.logger.info("Resubscribe requested, reconnecting websocket.")
+                    return
+
                 try:
                     raw_message = await asyncio.wait_for(
                         ws.recv(),
@@ -79,12 +98,22 @@ class MarketWebSocketClient:
     async def _subscribe(self, ws: Any, asset_ids: list[str]) -> None:
         # As documented in market channel examples, subscription key is `assets_ids`.
         for chunk in self._chunk(asset_ids, size=500):
-            payload = {
-                "type": "market",
-                "assets_ids": chunk,
-            }
+            payload = self.build_subscription_payload(chunk)
             await ws.send(json.dumps(payload))
             self.logger.info("Subscribed market channel chunk size=%s", len(chunk))
+
+    @staticmethod
+    def build_subscription_payload(asset_ids: list[str]) -> dict[str, object]:
+        return {
+            "type": "market",
+            "assets_ids": asset_ids,
+            "custom_feature_enabled": True,
+        }
+
+    def _current_asset_ids(self) -> list[str]:
+        if self.get_asset_ids is None:
+            return list(self.asset_ids)
+        return list(self.get_asset_ids())
 
     @staticmethod
     def _chunk(items: Iterable[str], size: int) -> list[list[str]]:

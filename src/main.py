@@ -5,11 +5,8 @@ import asyncio
 import sys
 from pathlib import Path
 
-
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-
-from src.app.bootstrap import run_app  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +20,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from src.app.bootstrap import run_app
+
     args = parse_args()
     root_dir = Path(__file__).resolve().parents[1]
     asyncio.run(run_app(root_dir=root_dir, once=args.once))

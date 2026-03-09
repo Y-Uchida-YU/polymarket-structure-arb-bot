@@ -24,7 +24,7 @@ class StrategySettings(BaseModel):
     signal_cooldown_seconds: int = 30
 
     @model_validator(mode="after")
-    def validate_bounds(self) -> "StrategySettings":
+    def validate_bounds(self) -> StrategySettings:
         if self.min_ask < 0 or self.max_ask > 1 or self.min_ask > self.max_ask:
             raise ValueError("strategy min_ask/max_ask must satisfy 0 <= min_ask <= max_ask <= 1")
         return self
@@ -35,6 +35,8 @@ class RiskSettings(BaseModel):
     max_positions_per_market: int = 1
     paper_order_size_usdc: float = 5.0
     max_daily_signals: int = 200
+    min_book_size: float = 0.0
+    stale_quote_ms: int = 3000
 
 
 class StorageSettings(BaseModel):

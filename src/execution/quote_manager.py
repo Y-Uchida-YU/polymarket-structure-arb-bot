@@ -13,6 +13,8 @@ class BestBidAskUpdate:
     asset_id: str
     best_bid: float | None
     best_ask: float | None
+    best_bid_size: float | None
+    best_ask_size: float | None
     event_type: str
     timestamp: datetime
 
@@ -20,9 +22,24 @@ class BestBidAskUpdate:
 class QuoteManager:
     def __init__(self, token_to_market_side: dict[str, tuple[str, str]]) -> None:
         # token_to_market_side[token_id] = (market_id, "yes"|"no")
-        self.token_to_market_side = token_to_market_side
+        self.token_to_market_side = dict(token_to_market_side)
         self.best_quotes_by_asset: dict[str, BestBidAskUpdate] = {}
-        self.market_asks: dict[str, dict[str, float | None]] = {}
+        self.market_quotes: dict[str, dict[str, BestBidAskUpdate | None]] = {}
+
+    def update_token_mapping(self, token_to_market_side: dict[str, tuple[str, str]]) -> None:
+        self.token_to_market_side = dict(token_to_market_side)
+        valid_assets = set(token_to_market_side.keys())
+        self.best_quotes_by_asset = {
+            asset_id: quote
+            for asset_id, quote in self.best_quotes_by_asset.items()
+            if asset_id in valid_assets
+        }
+        valid_markets = {market_id for market_id, _ in token_to_market_side.values()}
+        self.market_quotes = {
+            market_id: state
+            for market_id, state in self.market_quotes.items()
+            if market_id in valid_markets
+        }
 
     def ingest_ws_message(self, raw_message: str) -> list[BestBidAskUpdate]:
         payload = self._parse_payload(raw_message)
@@ -49,7 +66,16 @@ class QuoteManager:
         return updates
 
     def get_market_asks(self, market_id: str) -> tuple[float | None, float | None]:
-        state = self.market_asks.get(market_id, {"yes": None, "no": None})
+        yes_quote, no_quote = self.get_market_quotes(market_id)
+        ask_yes = yes_quote.best_ask if yes_quote is not None else None
+        ask_no = no_quote.best_ask if no_quote is not None else None
+        return ask_yes, ask_no
+
+    def get_market_quotes(
+        self,
+        market_id: str,
+    ) -> tuple[BestBidAskUpdate | None, BestBidAskUpdate | None]:
+        state = self.market_quotes.get(market_id, {"yes": None, "no": None})
         return state.get("yes"), state.get("no")
 
     def _update_market_ask(self, update: BestBidAskUpdate) -> None:
@@ -58,9 +84,8 @@ class QuoteManager:
             return
 
         market_id, side = mapping
-        market_state = self.market_asks.setdefault(market_id, {"yes": None, "no": None})
-        if update.best_ask is not None:
-            market_state[side] = update.best_ask
+        market_state = self.market_quotes.setdefault(market_id, {"yes": None, "no": None})
+        market_state[side] = update
 
     @staticmethod
     def _parse_payload(raw_message: str) -> Any:
@@ -91,6 +116,18 @@ class QuoteManager:
             event.get("bestBid"),
             event.get("b"),
         )
+        best_ask_size = QuoteManager._first_float(
+            event.get("ask_size"),
+            event.get("best_ask_size"),
+            event.get("bestAskSize"),
+            event.get("as"),
+        )
+        best_bid_size = QuoteManager._first_float(
+            event.get("bid_size"),
+            event.get("best_bid_size"),
+            event.get("bestBidSize"),
+            event.get("bs"),
+        )
 
         if best_ask is None and best_bid is None:
             return None
@@ -100,6 +137,8 @@ class QuoteManager:
             asset_id=asset_id,
             best_bid=best_bid,
             best_ask=best_ask,
+            best_bid_size=best_bid_size,
+            best_ask_size=best_ask_size,
             event_type=event_type or "best_bid_ask",
             timestamp=timestamp,
         )
