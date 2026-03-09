@@ -85,6 +85,7 @@ class Settings(BaseModel):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    guardrails: GuardrailSettings = Field(default_factory=GuardrailSettings)
     market_filters: MarketFilterSettings = Field(default_factory=MarketFilterSettings)
     secrets: SecretSettings = Field(default_factory=SecretSettings)
 

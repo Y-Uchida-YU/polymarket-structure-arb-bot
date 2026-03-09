@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from src.domain.accounting import InventorySnapshot, PnLSnapshot
 from src.domain.order import FillEvent, PaperOrder
 from src.domain.signal import ArbSignal
 from src.execution.fill_model import FillModelConfig, PaperFillModel
@@ -13,7 +14,6 @@ from src.execution.quote_manager import BestBidAskUpdate
 class PaperExecutionResult:
     orders: list[PaperOrder]
     fills: list[FillEvent]
-    estimated_final_pnl: float
     accepted: bool
     rejection_reason: str | None
     fill_status: str

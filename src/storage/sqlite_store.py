@@ -6,6 +6,7 @@ from pathlib import Path
 from src.domain.book import TickSizeUpdate
 from src.domain.market import BinaryMarket
 from src.domain.order import FillEvent, PaperOrder
+from src.domain.run import RunSnapshot, RunSummary
 from src.domain.signal import ArbSignal
 from src.execution.quote_manager import BestBidAskUpdate
 
@@ -35,6 +36,7 @@ class SQLiteStore:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS quotes (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT,
                   market_id TEXT NOT NULL,
                   asset_id TEXT NOT NULL,
                   side TEXT NOT NULL,
@@ -52,6 +54,7 @@ class SQLiteStore:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                   signal_id TEXT PRIMARY KEY,
+                  run_id TEXT,
                   market_id TEXT NOT NULL,
                   slug TEXT NOT NULL,
                   ask_yes REAL NOT NULL,
@@ -78,6 +81,7 @@ class SQLiteStore:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                   order_id TEXT PRIMARY KEY,
+                  run_id TEXT,
                   signal_id TEXT NOT NULL,
                   market_id TEXT NOT NULL,
                   token_id TEXT NOT NULL,
@@ -91,6 +95,7 @@ class SQLiteStore:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS fills (
                   fill_id TEXT PRIMARY KEY,
+                  run_id TEXT,
                   order_id TEXT NOT NULL,
                   signal_id TEXT NOT NULL,
                   market_id TEXT NOT NULL,
@@ -104,15 +109,42 @@ class SQLiteStore:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS pnl_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT,
                   signal_id TEXT NOT NULL,
                   market_id TEXT NOT NULL,
-                  estimated_final_pnl REAL NOT NULL,
+                  market_slug TEXT NOT NULL DEFAULT '',
+                  estimated_final_pnl REAL NOT NULL DEFAULT 0,
+                  estimated_edge_at_signal REAL NOT NULL DEFAULT 0,
+                  projected_matched_pnl REAL NOT NULL DEFAULT 0,
+                  unmatched_inventory_mtm REAL NOT NULL DEFAULT 0,
+                  total_projected_pnl REAL NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL
+                )
+                """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS inventory_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT,
+                  signal_id TEXT NOT NULL,
+                  market_id TEXT NOT NULL,
+                  market_slug TEXT NOT NULL,
+                  yes_filled_qty REAL NOT NULL,
+                  no_filled_qty REAL NOT NULL,
+                  matched_qty REAL NOT NULL,
+                  unmatched_yes_qty REAL NOT NULL,
+                  unmatched_no_qty REAL NOT NULL,
+                  avg_fill_price_yes REAL NOT NULL,
+                  avg_fill_price_no REAL NOT NULL,
+                  yes_mark_price REAL NOT NULL,
+                  no_mark_price REAL NOT NULL,
+                  valuation_mode TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 )
                 """)
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS errors (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT,
                   stage TEXT NOT NULL,
                   error_message TEXT NOT NULL,
                   created_at TEXT NOT NULL
@@ -238,6 +270,7 @@ class SQLiteStore:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    run_id,
                     market_id,
                     update.asset_id,
                     side,
@@ -254,11 +287,15 @@ class SQLiteStore:
             )
 
     def save_signal(self, signal: ArbSignal) -> None:
+        self.save_signal_with_run(signal=signal, run_id=None)
+
+    def save_signal_with_run(self, signal: ArbSignal, run_id: str | None) -> None:
         with self.conn:
             self.conn.execute(
                 """
                 INSERT INTO signals (
                   signal_id,
+                  run_id,
                   market_id,
                   slug,
                   ask_yes,
@@ -285,6 +322,7 @@ class SQLiteStore:
                 """,
                 (
                     signal.signal_id,
+                    run_id,
                     signal.market_id,
                     signal.slug,
                     signal.ask_yes,
@@ -309,7 +347,7 @@ class SQLiteStore:
                 ),
             )
 
-    def save_order(self, order: PaperOrder) -> None:
+    def save_order(self, order: PaperOrder, run_id: str | None = None) -> None:
         with self.conn:
             self.conn.execute(
                 """
@@ -318,10 +356,11 @@ class SQLiteStore:
                   order_id, signal_id, market_id, token_id, side,
                   quantity, limit_price, status, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order.order_id,
+                    run_id,
                     order.signal_id,
                     order.market_id,
                     order.token_id,
@@ -333,7 +372,7 @@ class SQLiteStore:
                 ),
             )
 
-    def save_fill(self, fill: FillEvent) -> None:
+    def save_fill(self, fill: FillEvent, run_id: str | None = None) -> None:
         with self.conn:
             self.conn.execute(
                 """
@@ -342,10 +381,11 @@ class SQLiteStore:
                   fill_id, order_id, signal_id, market_id, token_id,
                   filled_qty, fill_price, fee, filled_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     fill.fill_id,
+                    run_id,
                     fill.order_id,
                     fill.signal_id,
                     fill.market_id,
@@ -357,37 +397,140 @@ class SQLiteStore:
                 ),
             )
 
-    def save_pnl_snapshot(
-        self,
-        signal_id: str,
-        market_id: str,
-        estimated_final_pnl: float,
-        created_at_iso: str,
+    def save_pnl_snapshot(self, snapshot: PnLSnapshot, run_id: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO pnl_snapshots (
+                  run_id,
+                  signal_id,
+                  market_id,
+                  market_slug,
+                  estimated_final_pnl,
+                  estimated_edge_at_signal,
+                  projected_matched_pnl,
+                  unmatched_inventory_mtm,
+                  total_projected_pnl,
+                  created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    snapshot.signal_id,
+                    snapshot.market_id,
+                    snapshot.market_slug,
+                    snapshot.total_projected_pnl,
+                    snapshot.estimated_edge_at_signal,
+                    snapshot.projected_matched_pnl,
+                    snapshot.unmatched_inventory_mtm,
+                    snapshot.total_projected_pnl,
+                    snapshot.timestamp.isoformat(),
+                ),
+            )
+
+    def save_inventory_snapshot(
+        self, snapshot: InventorySnapshot, run_id: str | None = None
     ) -> None:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO pnl_snapshots (signal_id, market_id, estimated_final_pnl, created_at)
+                INSERT INTO inventory_snapshots (
+                  run_id,
+                  signal_id,
+                  market_id,
+                  market_slug,
+                  yes_filled_qty,
+                  no_filled_qty,
+                  matched_qty,
+                  unmatched_yes_qty,
+                  unmatched_no_qty,
+                  avg_fill_price_yes,
+                  avg_fill_price_no,
+                  yes_mark_price,
+                  no_mark_price,
+                  valuation_mode,
+                  created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    snapshot.signal_id,
+                    snapshot.market_id,
+                    snapshot.market_slug,
+                    snapshot.yes_filled_qty,
+                    snapshot.no_filled_qty,
+                    snapshot.matched_qty,
+                    snapshot.unmatched_yes_qty,
+                    snapshot.unmatched_no_qty,
+                    snapshot.avg_fill_price_yes,
+                    snapshot.avg_fill_price_no,
+                    snapshot.yes_mark_price,
+                    snapshot.no_mark_price,
+                    snapshot.valuation_mode,
+                    snapshot.timestamp.isoformat(),
+                ),
+            )
+
+    def save_error(
+        self,
+        stage: str,
+        error_message: str,
+        created_at_iso: str,
+        run_id: str | None = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO errors (run_id, stage, error_message, created_at)
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    signal_id,
-                    market_id,
-                    estimated_final_pnl,
+                    run_id,
+                    stage,
+                    error_message,
                     created_at_iso,
                 ),
             )
 
-    def save_error(self, stage: str, error_message: str, created_at_iso: str) -> None:
+    def save_tick_size_update(self, update: TickSizeUpdate, run_id: str | None = None) -> None:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO errors (stage, error_message, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO tick_sizes (run_id, asset_id, tick_size, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    stage,
-                    error_message,
+                    run_id,
+                    update.asset_id,
+                    update.tick_size,
+                    update.source,
+                    update.updated_at.isoformat(),
+                ),
+            )
+
+    def save_resync_event(
+        self,
+        asset_id: str,
+        reason: str,
+        status: str,
+        details: str,
+        created_at_iso: str,
+        run_id: str | None = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO resync_events (run_id, asset_id, reason, status, details, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    asset_id,
+                    reason,
+                    status,
+                    details,
                     created_at_iso,
                 ),
             )

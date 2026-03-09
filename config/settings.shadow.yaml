@@ -1,0 +1,71 @@
+api:
+  gamma_base_url: "https://gamma-api.polymarket.com"
+  gamma_markets_endpoint: "/markets"
+  clob_base_url: "https://clob.polymarket.com"
+  gamma_page_size: 200
+  gamma_max_pages: 12
+  ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+strategy:
+  entry_threshold_sum_ask: 0.985
+  min_ask: 0.01
+  max_ask: 0.99
+  expiry_block_minutes: 180
+  signal_cooldown_seconds: 45
+  enable_quality_guards: true
+  max_spread_per_leg: 0.04
+  min_depth_per_leg: 10.0
+  max_quote_age_ms_for_signal: 2500
+  adjusted_edge_min: 0.002
+  slippage_penalty_ticks: 1.5
+
+risk:
+  max_open_positions: 3
+  max_positions_per_market: 1
+  paper_order_size_usdc: 3.0
+  max_daily_signals: 120
+  min_book_size: 5.0
+  stale_quote_ms: 2500
+  fill_latency_ms: 400
+  slip_ticks: 2
+  base_fill_probability: 0.9
+  allow_partial_fills: true
+
+storage:
+  sqlite_path: "data/state/state.db"
+  export_dir: "data/exports"
+  log_dir: "data/logs"
+
+runtime:
+  reconnect_base_seconds: 2.0
+  reconnect_max_seconds: 30.0
+  websocket_ping_interval_seconds: 20
+  websocket_ping_timeout_seconds: 20
+  market_refresh_minutes: 30
+  stale_asset_ms: 12000
+  book_resync_idle_ms: 20000
+  resync_batch_size: 80
+  snapshot_interval_minutes: 60
+  report_export_interval_minutes: 1440
+  environment_name: "shadow-paper-win11"
+
+guardrails:
+  window_minutes: 20
+  safe_mode_cooldown_minutes: 20
+  max_signal_rate_per_min: 12.0
+  max_reject_rate: 0.65
+  max_one_leg_rate: 0.30
+  max_unmatched_rate: 0.35
+  max_stale_asset_rate: 0.70
+  max_resync_rate_per_min: 25.0
+  max_exception_rate_per_min: 6.0
+  hard_stop_on_exception_spike: false
+  hard_stop_exception_rate_per_min: 15.0
+
+market_filters:
+  exclude_categories:
+    - politics
+    - geopolitics
+    - death
+    - celebrity
+  exclude_keywords: []
