@@ -7,7 +7,6 @@ from src.domain.accounting import InventorySnapshot, PnLSnapshot
 from src.domain.order import FillEvent, PaperOrder
 from src.domain.signal import ArbSignal
 from src.execution.fill_model import FillModelConfig, PaperFillModel
-from src.execution.pnl_engine import PaperPnLEngine, PnLEngineConfig
 from src.execution.quote_manager import BestBidAskUpdate
 
 
@@ -22,13 +21,6 @@ class PaperExecutionResult:
     fill_probability_score: float
     signal_edge_after_slippage: float
     partial_fill: bool
-    inventory_snapshot: InventorySnapshot
-    pnl_snapshot: PnLSnapshot
-    estimated_edge_at_signal: float
-    projected_matched_pnl: float
-    unmatched_inventory_mtm: float
-    total_projected_pnl: float
-    estimated_final_pnl: float
 
 
 class PaperOrderRouter:
@@ -51,12 +43,6 @@ class PaperOrderRouter:
                 slip_ticks=max(0, slip_ticks),
                 base_fill_probability=max(0.0, min(1.0, base_fill_probability)),
                 allow_partial_fills=allow_partial_fills,
-            )
-        )
-        self.pnl_engine = PaperPnLEngine(
-            PnLEngineConfig(
-                stale_quote_ms=max(0, stale_quote_ms),
-                conservative_unmatched_mark=0.0,
             )
         )
 
@@ -136,19 +122,15 @@ class PaperOrderRouter:
                 )
             )
 
-        inventory_snapshot, pnl_snapshot = self.pnl_engine.build_snapshots(
-            signal=signal,
-            fills=fills,
-            now_utc=now_utc,
-            yes_quote=yes_quote,
-            no_quote=no_quote,
-        )
+        matched_qty = min(fill_decision.yes_leg.filled_qty, fill_decision.no_leg.filled_qty)
+        estimated_final_pnl = matched_qty * max(0.0, 1.0 - (signal.ask_yes + signal.ask_no))
 
         quote_age_ms = max(fill_decision.yes_leg.quote_age_ms, fill_decision.no_leg.quote_age_ms)
         partial_fill = fill_decision.fill_status.startswith("partial")
         return PaperExecutionResult(
             orders=orders,
             fills=fills,
+            estimated_final_pnl=estimated_final_pnl,
             accepted=fill_decision.accepted,
             rejection_reason=fill_decision.reject_reason,
             fill_status=fill_decision.fill_status,
@@ -156,13 +138,6 @@ class PaperOrderRouter:
             fill_probability_score=fill_decision.fill_probability_score,
             signal_edge_after_slippage=fill_decision.signal_edge_after_slippage,
             partial_fill=partial_fill,
-            inventory_snapshot=inventory_snapshot,
-            pnl_snapshot=pnl_snapshot,
-            estimated_edge_at_signal=pnl_snapshot.estimated_edge_at_signal,
-            projected_matched_pnl=pnl_snapshot.projected_matched_pnl,
-            unmatched_inventory_mtm=pnl_snapshot.unmatched_inventory_mtm,
-            total_projected_pnl=pnl_snapshot.total_projected_pnl,
-            estimated_final_pnl=pnl_snapshot.total_projected_pnl,
         )
 
     def _fallback_quotes_from_signal(

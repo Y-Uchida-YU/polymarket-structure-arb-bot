@@ -39,15 +39,6 @@ class CsvEventLogger:
     def log_metric(self, row: dict[str, Any], now_utc: datetime) -> Path:
         return self._append("metrics", row, now_utc)
 
-    def log_snapshot(self, row: dict[str, Any], now_utc: datetime) -> Path:
-        return self._append("run_snapshots", row, now_utc)
-
-    def log_run_summary(self, row: dict[str, Any], now_utc: datetime) -> Path:
-        return self._append("run_summaries", row, now_utc)
-
-    def log_execution(self, row: dict[str, Any], now_utc: datetime) -> Path:
-        return self._append("execution_events", row, now_utc)
-
     def _append(self, name: str, row: dict[str, Any], now_utc: datetime) -> Path:
         file_path = self.export_dir / f"{name}_{now_utc:%Y%m%d}.csv"
         frame = pd.DataFrame([row])

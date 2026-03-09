@@ -65,23 +65,6 @@ class RuntimeSettings(BaseModel):
     stale_asset_ms: int = 15_000
     book_resync_idle_ms: int = 20_000
     resync_batch_size: int = 100
-    snapshot_interval_minutes: int = 60
-    report_export_interval_minutes: int = 1_440
-    environment_name: str = "win11-local"
-
-
-class GuardrailSettings(BaseModel):
-    window_minutes: int = 15
-    safe_mode_cooldown_minutes: int = 15
-    max_signal_rate_per_min: float = 20.0
-    max_reject_rate: float = 0.70
-    max_one_leg_rate: float = 0.35
-    max_unmatched_rate: float = 0.40
-    max_stale_asset_rate: float = 0.80
-    max_resync_rate_per_min: float = 40.0
-    max_exception_rate_per_min: float = 8.0
-    hard_stop_on_exception_spike: bool = False
-    hard_stop_exception_rate_per_min: float = 20.0
 
 
 class MarketFilterSettings(BaseModel):

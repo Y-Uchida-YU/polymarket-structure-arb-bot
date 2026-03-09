@@ -45,22 +45,6 @@ runtime:
   stale_asset_ms: 15000
   book_resync_idle_ms: 20000
   resync_batch_size: 100
-  snapshot_interval_minutes: 60
-  report_export_interval_minutes: 1440
-  environment_name: "win11-local"
-
-guardrails:
-  window_minutes: 15
-  safe_mode_cooldown_minutes: 15
-  max_signal_rate_per_min: 20.0
-  max_reject_rate: 0.70
-  max_one_leg_rate: 0.35
-  max_unmatched_rate: 0.40
-  max_stale_asset_rate: 0.80
-  max_resync_rate_per_min: 40.0
-  max_exception_rate_per_min: 8.0
-  hard_stop_on_exception_spike: false
-  hard_stop_exception_rate_per_min: 20.0
 
 market_filters:
   exclude_categories:
