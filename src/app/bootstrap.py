@@ -68,7 +68,22 @@ class AppState:
     last_resync_reason_by_asset: dict[str, str] = field(default_factory=dict)
     stale_assets: set[str] = field(default_factory=set)
     safe_mode_active: bool = False
+    safe_mode_reason: str | None = None
+    safe_mode_entered_at: datetime | None = None
+    safe_mode_count: int = 0
     last_ws_idle_resync_ts: float = 0.0
+    run_id: str = field(default_factory=lambda: uuid4().hex)
+    run_started_at: datetime = field(default_factory=utc_now)
+    run_mode: str = "paper"
+    total_signals: int = 0
+    total_fills: int = 0
+    total_rejects: int = 0
+    total_resync_events: int = 0
+    total_exceptions: int = 0
+    total_stale_events: int = 0
+    total_unmatched_events: int = 0
+    cumulative_projected_pnl: float = 0.0
+    cumulative_unmatched_inventory: float = 0.0
 
 
 @dataclass(slots=True)
@@ -176,16 +191,6 @@ class PolymarketStructureArbApp:
             asset_ids_changed=asset_ids_changed,
             asset_ids=asset_ids,
         )
-        for item in results:
-            if item is None:
-                continue
-            self.quote_manager.apply_tick_size_snapshot(
-                asset_id=item.asset_id,
-                tick_size=item.tick_size,
-                source=item.source,
-                timestamp=item.updated_at,
-            )
-            self._persist_tick_size_update(item)
 
     async def _load_initial_tick_sizes(self, asset_ids: list[str]) -> None:
         if not asset_ids:
@@ -239,6 +244,7 @@ class PolymarketStructureArbApp:
                     market_id=market_id,
                     side=side,
                     update=update,
+                    run_id=self.state.run_id,
                     quote_age_ms=quote_age_ms,
                     tick_size=tick_size,
                     source=update.event_type,
@@ -277,19 +283,13 @@ class PolymarketStructureArbApp:
                 if not risk_decision.allowed:
                     continue
 
-                execution_result = self._execute_paper_trade(
+                self._execute_paper_trade(
                     signal=signal,
                     now=now,
                     yes_quote=yes_quote,
                     no_quote=no_quote,
                     tick_yes=tick_yes,
                     tick_no=tick_no,
-                )
-                signal.fill_status = execution_result.fill_status
-                signal.reject_reason = execution_result.rejection_reason
-                signal.signal_edge_after_slippage = execution_result.signal_edge_after_slippage
-                signal.resync_reason = self.state.last_resync_reason_by_asset.get(
-                    market.yes_token_id
                 )
 
                 self._record_signal(signal)
@@ -326,9 +326,10 @@ class PolymarketStructureArbApp:
                 self.stop_event.set()
 
     def _persist_tick_size_update(self, update: TickSizeUpdate) -> None:
-        self.sqlite_store.save_tick_size_update(update)
+        self.sqlite_store.save_tick_size_update(update, run_id=self.state.run_id)
         self.csv_logger.log_tick_size(
             {
+                "run_id": self.state.run_id,
                 "asset_id": update.asset_id,
                 "tick_size": update.tick_size,
                 "source": update.source,
@@ -394,22 +395,19 @@ class PolymarketStructureArbApp:
                 "threshold": signal.threshold,
                 "quote_age_ms": signal.quote_age_ms,
                 "signal_edge_raw": signal.raw_edge,
-                "signal_edge_after_slippage": signal.signal_edge_after_slippage,
                 "adjusted_edge": signal.adjusted_edge,
-                "fill_status": signal.fill_status,
-                "reject_reason": signal.reject_reason,
-                "resync_reason": signal.resync_reason,
+                "safe_mode_reason": self.state.safe_mode_reason,
+                "resync_reason": self.state.last_resync_reason_by_asset.get(signal.yes_token_id),
                 "reason": signal.reason,
             },
             now_utc=signal.detected_at,
         )
         self.logger.info(
-            "Signal detected market=%s slug=%s raw_edge=%.6f adjusted_edge=%.6f fill_status=%s",
+            "Signal detected market=%s slug=%s raw_edge=%.6f adjusted_edge=%.6f",
             signal.market_id,
             signal.slug,
             signal.raw_edge,
             signal.adjusted_edge,
-            signal.fill_status,
         )
 
     def _execute_paper_trade(
@@ -429,23 +427,31 @@ class PolymarketStructureArbApp:
             yes_tick_size=tick_yes,
             no_tick_size=tick_no,
         )
-        fills_by_token = {fill.token_id: fill for fill in result.fills}
-        yes_fill = fills_by_token.get(signal.yes_token_id)
-        no_fill = fills_by_token.get(signal.no_token_id)
-        if yes_fill is not None and no_fill is not None:
-            matched_qty = min(yes_fill.filled_qty, no_fill.filled_qty)
-            if matched_qty > 0:
-                self.exposure.add_position(
-                    Position(
-                        market_id=signal.market_id,
-                        signal_id=signal.signal_id,
-                        yes_qty=matched_qty,
-                        no_qty=matched_qty,
-                        yes_entry_price=yes_fill.fill_price,
-                        no_entry_price=no_fill.fill_price,
-                        opened_at=now,
-                    )
+        self.state.total_fills += len(result.fills)
+        self.state.cumulative_projected_pnl += result.total_projected_pnl
+        self.state.cumulative_unmatched_inventory += (
+            result.inventory_snapshot.unmatched_yes_qty + result.inventory_snapshot.unmatched_no_qty
+        )
+        if (
+            result.inventory_snapshot.unmatched_yes_qty > 0
+            or result.inventory_snapshot.unmatched_no_qty > 0
+        ):
+            self.state.total_unmatched_events += 1
+            self.guardrail_monitor.record_unmatched(now)
+        if result.fill_status in {"one_leg_yes_only", "one_leg_no_only"}:
+            self.guardrail_monitor.record_one_leg(now)
+        if result.inventory_snapshot.matched_qty > 0:
+            self.exposure.add_position(
+                Position(
+                    market_id=signal.market_id,
+                    signal_id=signal.signal_id,
+                    yes_qty=result.inventory_snapshot.matched_qty,
+                    no_qty=result.inventory_snapshot.matched_qty,
+                    yes_entry_price=result.inventory_snapshot.avg_fill_price_yes,
+                    no_entry_price=result.inventory_snapshot.avg_fill_price_no,
+                    opened_at=now,
                 )
+            )
 
         if not result.accepted:
             self.state.total_rejects += 1
@@ -510,6 +516,8 @@ class PolymarketStructureArbApp:
                     "reject_reason": result.rejection_reason,
                     "partial_fill": result.partial_fill,
                     "quote_age_ms": result.quote_age_ms,
+                    "quote_age_ms_at_signal": signal.quote_age_ms,
+                    "signal_edge_after_slippage": result.signal_edge_after_slippage,
                 },
                 now_utc=now,
             )
@@ -548,11 +556,53 @@ class PolymarketStructureArbApp:
                 "market_id": signal.market_id,
                 "market_slug": signal.slug,
                 "created_at": now.isoformat(),
+                "estimated_edge_at_signal": result.estimated_edge_at_signal,
+                "projected_matched_pnl": result.projected_matched_pnl,
+                "unmatched_inventory_mtm": result.unmatched_inventory_mtm,
+                "total_projected_pnl": result.total_projected_pnl,
                 "fill_status": result.fill_status,
                 "reject_reason": result.rejection_reason,
+                "matched_qty": result.inventory_snapshot.matched_qty,
+                "unmatched_yes_qty": result.inventory_snapshot.unmatched_yes_qty,
+                "unmatched_no_qty": result.inventory_snapshot.unmatched_no_qty,
+                "avg_fill_price_yes": result.inventory_snapshot.avg_fill_price_yes,
+                "avg_fill_price_no": result.inventory_snapshot.avg_fill_price_no,
+                "safe_mode_reason": self.state.safe_mode_reason,
+                "resync_reason": self.state.last_resync_reason_by_asset.get(signal.yes_token_id),
             },
             now_utc=now,
         )
+        signal_to_complete_latency_ms = max(
+            0.0, (now - signal.detected_at).total_seconds() * 1000.0
+        )
+        execution_row = {
+            "run_id": self.state.run_id,
+            "signal_id": signal.signal_id,
+            "market_id": signal.market_id,
+            "market_slug": signal.slug,
+            "fill_status": result.fill_status,
+            "detected_at": signal.detected_at.isoformat(),
+            "completed_at": now.isoformat(),
+            "signal_to_fill_latency_ms": signal_to_complete_latency_ms if result.accepted else None,
+            "signal_to_reject_latency_ms": (
+                signal_to_complete_latency_ms if not result.accepted else None
+            ),
+            "quote_age_ms_at_signal": signal.quote_age_ms,
+            "quote_age_ms_at_fill": result.quote_age_ms,
+            "raw_edge": signal.raw_edge,
+            "adjusted_edge": signal.adjusted_edge,
+            "avg_fill_price_yes": result.inventory_snapshot.avg_fill_price_yes,
+            "avg_fill_price_no": result.inventory_snapshot.avg_fill_price_no,
+            "matched_qty": result.inventory_snapshot.matched_qty,
+            "unmatched_yes_qty": result.inventory_snapshot.unmatched_yes_qty,
+            "unmatched_no_qty": result.inventory_snapshot.unmatched_no_qty,
+            "total_projected_pnl": result.total_projected_pnl,
+            "reject_reason": result.rejection_reason,
+            "safe_mode_reason": self.state.safe_mode_reason,
+            "resync_reason": self.state.last_resync_reason_by_asset.get(signal.yes_token_id),
+        }
+        self.sqlite_store.save_execution_event(execution_row)
+        self.csv_logger.log_execution(execution_row, now_utc=now)
         return result
 
     def get_subscribed_asset_ids(self) -> list[str]:
@@ -693,98 +743,136 @@ class PolymarketStructureArbApp:
             stale_asset_rate=len(stale_assets) / max(1, len(tracked_assets)),
         )
 
-    async def on_ws_connected(self, asset_ids: list[str]) -> None:
-        await self.resync_assets(asset_ids=asset_ids, reason="ws_connected")
-
-    def on_ws_reconnect_required(self, reason: str) -> None:
-        self.logger.warning("WebSocket reconnect requested reason=%s", reason)
-        now = utc_now()
+    def _enter_safe_mode(self, reason: str, now_utc: datetime) -> None:
+        if self.state.safe_mode_active and self.state.safe_mode_reason == reason:
+            return
+        self.state.safe_mode_active = True
+        self.state.safe_mode_reason = reason
+        self.state.safe_mode_entered_at = now_utc
+        self.state.safe_mode_count += 1
+        self.logger.error("Safe mode enabled reason=%s", reason)
         self.sqlite_store.save_metric(
-            metric_name="ws_reconnect_required",
+            metric_name="safe_mode_entered",
             metric_value=1.0,
             details=reason,
-            created_at_iso=now.isoformat(),
+            created_at_iso=now_utc.isoformat(),
+            run_id=self.state.run_id,
         )
         self.csv_logger.log_metric(
             {
-                "created_at": now.isoformat(),
-                "metric_name": "ws_reconnect_required",
+                "run_id": self.state.run_id,
+                "created_at": now_utc.isoformat(),
+                "metric_name": "safe_mode_entered",
                 "metric_value": 1.0,
-                "reason": reason,
+                "safe_mode_reason": reason,
             },
-            now_utc=now,
+            now_utc=now_utc,
         )
 
-    async def check_data_freshness_and_resync(self) -> None:
-        now = utc_now()
-        tracked_assets = list(self.token_to_market_side.keys())
-        last_ws_message_at = self.healthcheck.state.last_ws_message_at
-        ws_idle_ms = (
-            max(0.0, (now - last_ws_message_at).total_seconds() * 1000.0)
-            if last_ws_message_at is not None
-            else 0.0
-        )
+    def _maybe_exit_safe_mode(self, now_utc: datetime) -> None:
+        if not self.state.safe_mode_active:
+            return
+        self.state.safe_mode_active = False
+        previous_reason = self.state.safe_mode_reason
+        self.state.safe_mode_reason = None
+        self.state.safe_mode_entered_at = None
+        self.logger.warning("Safe mode disabled previous_reason=%s", previous_reason)
         self.sqlite_store.save_metric(
-            metric_name="ws_idle_ms",
-            metric_value=ws_idle_ms,
-            details=f"has_last_ws_message={last_ws_message_at is not None}",
-            created_at_iso=now.isoformat(),
+            metric_name="safe_mode_exited",
+            metric_value=1.0,
+            details=previous_reason or "",
+            created_at_iso=now_utc.isoformat(),
+            run_id=self.state.run_id,
         )
         self.csv_logger.log_metric(
             {
-                "created_at": now.isoformat(),
-                "metric_name": "ws_idle_ms",
-                "metric_value": ws_idle_ms,
-                "has_last_ws_message": last_ws_message_at is not None,
+                "run_id": self.state.run_id,
+                "created_at": now_utc.isoformat(),
+                "metric_name": "safe_mode_exited",
+                "metric_value": 1.0,
+                "safe_mode_reason": previous_reason,
             },
-            now_utc=now,
+            now_utc=now_utc,
         )
-        stale_assets = self.healthcheck.stale_assets(
-            tracked_assets=tracked_assets,
-            now_utc=now,
-            max_age_ms=self.config.settings.runtime.stale_asset_ms,
-        )
-        self.state.stale_assets = set(stale_assets)
-        self.sqlite_store.save_metric(
-            metric_name="stale_asset_count",
-            metric_value=float(len(stale_assets)),
-            details=f"tracked_assets={len(tracked_assets)}",
-            created_at_iso=now.isoformat(),
-        )
-        self.csv_logger.log_metric(
-            {
-                "created_at": now.isoformat(),
-                "metric_name": "stale_asset_count",
-                "metric_value": len(stale_assets),
-                "tracked_assets": len(tracked_assets),
-            },
-            now_utc=now,
-        )
-        if not stale_assets:
-            self.state.safe_mode_active = False
-        else:
-            stale_ratio = len(stale_assets) / max(1, len(tracked_assets))
-            self.logger.warning(
-                "Stale assets detected count=%s total=%s ratio=%.3f",
-                len(stale_assets),
-                len(tracked_assets),
-                stale_ratio,
-            )
-            self.state.safe_mode_active = False
-            if len(stale_assets) == len(tracked_assets):
-                self.state.safe_mode_active = True
-                self.logger.error(
-                    "All tracked assets are stale. Entering safe mode (signal creation paused)."
-                )
-            await self.resync_assets(asset_ids=stale_assets, reason="stale_asset")
 
-        if self._is_ws_idle(now):
+    def _stale_asset_rate(self) -> float:
+        tracked_assets = len(self.token_to_market_side)
+        if tracked_assets <= 0:
+            return 0.0
+        return len(self.state.stale_assets) / tracked_assets
+
+    def _evaluate_guardrails(self, now_utc: datetime, stale_asset_rate: float) -> None:
+        decision = self.guardrail_monitor.evaluate(
+            now_utc=now_utc,
+            stale_asset_rate=stale_asset_rate,
+            safe_mode_active=self.state.safe_mode_active,
+            safe_mode_entered_at=self.state.safe_mode_entered_at,
+        )
+        self._apply_guardrail_decision(now_utc=now_utc, decision=decision)
+
+    def _apply_guardrail_decision(self, now_utc: datetime, decision: GuardrailDecision) -> None:
+        for warning in decision.warnings:
             self.logger.warning(
-                "WebSocket stream appears idle for over %sms. Triggering full resync.",
-                self.config.settings.runtime.book_resync_idle_ms,
+                (
+                    "Guardrail warning=%s signal_rate=%.2f reject_rate=%.2f "
+                    "one_leg_rate=%.2f stale_rate=%.2f resync_rate=%.2f "
+                    "exception_rate=%.2f"
+                ),
+                warning,
+                decision.metrics.signal_rate_per_min,
+                decision.metrics.reject_rate,
+                decision.metrics.one_leg_rate,
+                decision.metrics.stale_asset_rate,
+                decision.metrics.resync_rate_per_min,
+                decision.metrics.exception_rate_per_min,
             )
-            self.state.last_ws_idle_resync_ts = now.timestamp()
-            await self.resync_assets(asset_ids=tracked_assets, reason="ws_idle_gap")
+            self.sqlite_store.save_metric(
+                metric_name=f"guardrail_warning_{warning}",
+                metric_value=1.0,
+                details=(
+                    "signal_rate_per_min="
+                    f"{decision.metrics.signal_rate_per_min:.4f};"
+                    f"reject_rate={decision.metrics.reject_rate:.4f};"
+                    f"one_leg_rate={decision.metrics.one_leg_rate:.4f};"
+                    f"unmatched_rate={decision.metrics.unmatched_rate:.4f};"
+                    f"stale_asset_rate={decision.metrics.stale_asset_rate:.4f};"
+                    f"resync_rate_per_min={decision.metrics.resync_rate_per_min:.4f};"
+                    f"exception_rate_per_min={decision.metrics.exception_rate_per_min:.4f}"
+                ),
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": f"guardrail_warning_{warning}",
+                    "metric_value": 1.0,
+                    "signal_rate_per_min": decision.metrics.signal_rate_per_min,
+                    "reject_rate": decision.metrics.reject_rate,
+                    "one_leg_rate": decision.metrics.one_leg_rate,
+                    "unmatched_rate": decision.metrics.unmatched_rate,
+                    "stale_asset_rate": decision.metrics.stale_asset_rate,
+                    "resync_rate_per_min": decision.metrics.resync_rate_per_min,
+                    "exception_rate_per_min": decision.metrics.exception_rate_per_min,
+                },
+                now_utc=now_utc,
+            )
+        if decision.enter_safe_mode_reason is not None:
+            self._enter_safe_mode(reason=decision.enter_safe_mode_reason, now_utc=now_utc)
+        elif decision.exit_safe_mode:
+            self._maybe_exit_safe_mode(now_utc)
+
+        if decision.hard_stop_reason is not None:
+            self.logger.error("Guardrail hard stop reason=%s", decision.hard_stop_reason)
+            self.sqlite_store.save_metric(
+                metric_name="guardrail_hard_stop",
+                metric_value=1.0,
+                details=decision.hard_stop_reason,
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.stop_event.set()
 
     def _is_ws_idle(self, now_utc: datetime) -> bool:
         last_ws_message_at = self.healthcheck.state.last_ws_message_at
@@ -805,6 +893,8 @@ class PolymarketStructureArbApp:
         for index in range(0, len(asset_ids), batch_size):
             batch = asset_ids[index : index + batch_size]
             for asset_id in batch:
+                self.state.total_resync_events += 1
+                self.guardrail_monitor.record_resync(now)
                 try:
                     summary = await self.book_client.fetch_book_summary(asset_id)
                     if summary is None:
@@ -814,9 +904,11 @@ class PolymarketStructureArbApp:
                             status="no_data",
                             details="book summary missing",
                             created_at_iso=now.isoformat(),
+                            run_id=self.state.run_id,
                         )
                         self.csv_logger.log_resync(
                             {
+                                "run_id": self.state.run_id,
                                 "created_at": now.isoformat(),
                                 "asset_id": asset_id,
                                 "resync_reason": reason,
@@ -837,6 +929,7 @@ class PolymarketStructureArbApp:
                             market_id=market_id,
                             side=side,
                             update=update,
+                            run_id=self.state.run_id,
                             quote_age_ms=quote_age_ms,
                             tick_size=self.quote_manager.get_tick_size(asset_id),
                             source="book_resync",
@@ -850,9 +943,11 @@ class PolymarketStructureArbApp:
                         status="ok",
                         details="resync_applied",
                         created_at_iso=now.isoformat(),
+                        run_id=self.state.run_id,
                     )
                     self.csv_logger.log_resync(
                         {
+                            "run_id": self.state.run_id,
                             "created_at": now.isoformat(),
                             "asset_id": asset_id,
                             "resync_reason": reason,
@@ -865,6 +960,8 @@ class PolymarketStructureArbApp:
                         now_utc=now,
                     )
                 except Exception as exc:  # noqa: BLE001
+                    self.state.total_exceptions += 1
+                    self.guardrail_monitor.record_exception(now)
                     error_text = f"{type(exc).__name__}: {exc}"
                     self.sqlite_store.save_resync_event(
                         asset_id=asset_id,
@@ -872,9 +969,11 @@ class PolymarketStructureArbApp:
                         status="failed",
                         details=error_text,
                         created_at_iso=now.isoformat(),
+                        run_id=self.state.run_id,
                     )
                     self.csv_logger.log_resync(
                         {
+                            "run_id": self.state.run_id,
                             "created_at": now.isoformat(),
                             "asset_id": asset_id,
                             "resync_reason": reason,
@@ -886,8 +985,159 @@ class PolymarketStructureArbApp:
                     self.logger.exception(
                         "Resync failed asset=%s reason=%s error=%s", asset_id, reason, error_text
                     )
+                self._evaluate_guardrails(now_utc=now, stale_asset_rate=self._stale_asset_rate())
 
-    async def run(self, once: bool = False, paper_mode: bool = True, dry_run: bool = False) -> None:
+    async def emit_periodic_report(self) -> None:
+        now = utc_now()
+        try:
+            report = self.report_generator.generate(
+                date=None,
+                last_hours=24,
+                run_id=self.state.run_id,
+            )
+            json_path, csv_path = self.report_generator.save(report)
+            self.logger.info(
+                "Periodic report exported run_id=%s json=%s csv=%s",
+                self.state.run_id,
+                json_path,
+                csv_path,
+            )
+            self.sqlite_store.save_metric(
+                metric_name="periodic_report_exported",
+                metric_value=1.0,
+                details=f"json={json_path.name};csv={csv_path.name}",
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": "periodic_report_exported",
+                    "metric_value": 1.0,
+                    "json_file": json_path.name,
+                    "csv_file": csv_path.name,
+                },
+                now_utc=now,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.state.total_exceptions += 1
+            self.guardrail_monitor.record_exception(now)
+            error_text = f"{type(exc).__name__}: {exc}"
+            self.logger.exception("Periodic report export failed: %s", error_text)
+            self.sqlite_store.save_error(
+                stage="periodic_report",
+                error_message=error_text,
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_error(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "stage": "periodic_report",
+                    "error_message": error_text,
+                },
+                now_utc=now,
+            )
+
+    async def emit_periodic_snapshot(self) -> None:
+        now = utc_now()
+        snapshot = RunSnapshot(
+            run_id=self.state.run_id,
+            timestamp=now,
+            active_markets=len(self.markets_by_id),
+            stale_assets=len(self.state.stale_assets),
+            total_signals=self.state.total_signals,
+            total_fills=self.state.total_fills,
+            open_unmatched_inventory=self.state.cumulative_unmatched_inventory,
+            cumulative_projected_pnl=self.state.cumulative_projected_pnl,
+            safe_mode_active=self.state.safe_mode_active,
+            safe_mode_reason=self.state.safe_mode_reason,
+            resync_cumulative_count=self.state.total_resync_events,
+        )
+        self.sqlite_store.save_run_snapshot(snapshot)
+        self.csv_logger.log_snapshot(
+            {
+                "run_id": snapshot.run_id,
+                "timestamp": snapshot.timestamp.isoformat(),
+                "active_markets": snapshot.active_markets,
+                "stale_assets": snapshot.stale_assets,
+                "total_signals": snapshot.total_signals,
+                "total_fills": snapshot.total_fills,
+                "open_unmatched_inventory": snapshot.open_unmatched_inventory,
+                "cumulative_projected_pnl": snapshot.cumulative_projected_pnl,
+                "safe_mode_active": snapshot.safe_mode_active,
+                "safe_mode_reason": snapshot.safe_mode_reason,
+                "resync_cumulative_count": snapshot.resync_cumulative_count,
+            },
+            now_utc=now,
+        )
+
+    def emit_run_summary(self, status: str = "completed") -> None:
+        if self._run_summary_emitted:
+            return
+        self._run_summary_emitted = True
+        ended_at = utc_now()
+        uptime_seconds = max(0.0, (ended_at - self.state.run_started_at).total_seconds())
+        summary = RunSummary(
+            run_id=self.state.run_id,
+            mode=f"{self.state.run_mode}:{status}",
+            started_at=self.state.run_started_at,
+            ended_at=ended_at,
+            uptime_seconds=uptime_seconds,
+            total_signals=self.state.total_signals,
+            total_fills=self.state.total_fills,
+            total_projected_pnl=self.state.cumulative_projected_pnl,
+            safe_mode_count=self.state.safe_mode_count,
+            exception_count=self.state.total_exceptions,
+            stale_events=self.state.total_stale_events,
+            resync_events=self.state.total_resync_events,
+        )
+        self.sqlite_store.save_run_summary(summary)
+        self.csv_logger.log_run_summary(
+            {
+                "run_id": summary.run_id,
+                "mode": summary.mode,
+                "started_at": summary.started_at.isoformat(),
+                "ended_at": summary.ended_at.isoformat(),
+                "uptime_seconds": summary.uptime_seconds,
+                "total_signals": summary.total_signals,
+                "total_fills": summary.total_fills,
+                "total_projected_pnl": summary.total_projected_pnl,
+                "safe_mode_count": summary.safe_mode_count,
+                "exception_count": summary.exception_count,
+                "stale_events": summary.stale_events,
+                "resync_events": summary.resync_events,
+            },
+            now_utc=ended_at,
+        )
+        self.logger.info(
+            (
+                "Run summary run_id=%s mode=%s uptime_sec=%.1f signals=%s fills=%s "
+                "projected_pnl=%.4f safe_mode_count=%s exceptions=%s "
+                "stale_events=%s resync_events=%s"
+            ),
+            summary.run_id,
+            summary.mode,
+            summary.uptime_seconds,
+            summary.total_signals,
+            summary.total_fills,
+            summary.total_projected_pnl,
+            summary.safe_mode_count,
+            summary.exception_count,
+            summary.stale_events,
+            summary.resync_events,
+        )
+
+    async def run(
+        self,
+        once: bool = False,
+        paper_mode: bool = True,
+        dry_run: bool = False,
+        shadow_paper: bool = False,
+    ) -> None:
+        self.state.run_mode = "shadow_paper" if shadow_paper else "paper"
         initial_load_result = await self.load_markets()
         if initial_load_result.market_count == 0:
             self.notifier.error("No eligible binary markets after filters.")
@@ -931,6 +1181,30 @@ class PolymarketStructureArbApp:
                 stop_event=self.stop_event,
             )
         )
+        snapshot_interval_seconds = max(
+            60.0,
+            float(self.config.settings.runtime.snapshot_interval_minutes) * 60.0,
+        )
+        snapshot_task = asyncio.create_task(
+            run_periodic(
+                task=self.emit_periodic_snapshot,
+                interval_seconds=snapshot_interval_seconds,
+                stop_event=self.stop_event,
+            )
+        )
+        report_task: asyncio.Task[None] | None = None
+        if shadow_paper:
+            report_interval_seconds = max(
+                300.0,
+                float(self.config.settings.runtime.report_export_interval_minutes) * 60.0,
+            )
+            report_task = asyncio.create_task(
+                run_periodic(
+                    task=self.emit_periodic_report,
+                    interval_seconds=report_interval_seconds,
+                    stop_event=self.stop_event,
+                )
+            )
 
         try:
             await ws_client.run_forever(
@@ -941,7 +1215,16 @@ class PolymarketStructureArbApp:
             self.stop_event.set()
             refresh_task.cancel()
             freshness_task.cancel()
-            await asyncio.gather(refresh_task, freshness_task, return_exceptions=True)
+            snapshot_task.cancel()
+            if report_task is not None:
+                report_task.cancel()
+            gather_tasks: list[asyncio.Task[object]] = [refresh_task, freshness_task, snapshot_task]
+            if report_task is not None:
+                gather_tasks.append(report_task)
+            await asyncio.gather(
+                *gather_tasks,
+                return_exceptions=True,
+            )
 
     async def shutdown(self) -> None:
         self.sqlite_store.close()
@@ -952,13 +1235,23 @@ async def run_app(
     once: bool = False,
     paper_mode: bool = True,
     dry_run: bool = False,
+    shadow_paper: bool = False,
+    settings_path: str = "config/settings.yaml",
 ) -> None:
-    config = load_app_config(root_dir=root_dir)
+    config = load_app_config(root_dir=root_dir, settings_path=settings_path)
     logger = setup_logging(config.log_dir)
     app = PolymarketStructureArbApp(config=config, logger=logger)
     run_status = "completed"
     try:
-        await app.run(once=once, paper_mode=paper_mode, dry_run=dry_run)
+        await app.run(
+            once=once,
+            paper_mode=paper_mode,
+            dry_run=dry_run,
+            shadow_paper=shadow_paper,
+        )
+    except Exception:  # noqa: BLE001
+        run_status = "crashed"
+        raise
     finally:
         if shadow_paper:
             await app.emit_periodic_report()
