@@ -35,16 +35,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def print_startup_summary(root_dir: Path) -> None:
+def build_startup_summary(
+    root_dir: Path,
+    *,
+    paper_mode: bool,
+    dry_run: bool,
+    once: bool,
+    mode: str,
+) -> dict[str, object]:
     from src.config.loader import load_app_config
 
     config = load_app_config(root_dir=root_dir)
+    return {
+        "mode": mode,
+        "paper_trade": paper_mode,
+        "dry_run": dry_run,
+        "once": once,
+        "max_open_markets": config.settings.risk.max_open_positions,
+        "entry_threshold_sum_ask": config.settings.strategy.entry_threshold_sum_ask,
+        "stale_quote_ms": config.settings.risk.stale_quote_ms,
+        "max_quote_age_ms_for_signal": config.settings.strategy.max_quote_age_ms_for_signal,
+        "stale_asset_ms": config.settings.runtime.stale_asset_ms,
+        "market_refresh_minutes": config.settings.runtime.market_refresh_minutes,
+    }
+
+
+def print_startup_summary(root_dir: Path, args: argparse.Namespace) -> None:
+    mode = "run"
+    if args.validate_config:
+        mode = "validate_config"
+    elif args.dry_run:
+        mode = "dry_run"
+    elif args.once:
+        mode = "once"
+    summary = build_startup_summary(
+        root_dir=root_dir,
+        paper_mode=args.paper,
+        dry_run=args.dry_run,
+        once=args.once,
+        mode=mode,
+    )
     print("=== Startup Summary ===")
-    print(f"paper_trade: {True}")
-    print(f"max_open_markets: {config.settings.risk.max_open_positions}")
-    print(f"entry_threshold_sum_ask: {config.settings.strategy.entry_threshold_sum_ask}")
-    print(f"stale_quote_ms: {config.settings.risk.stale_quote_ms}")
-    print(f"market_refresh_minutes: {config.settings.runtime.market_refresh_minutes}")
+    for key, value in summary.items():
+        print(f"{key}: {value}")
     print("NOTICE: Live trading/auth/signing/balance/cancel-replace are NOT implemented.")
 
 
@@ -53,7 +86,7 @@ def main() -> None:
 
     args = parse_args()
     root_dir = Path(__file__).resolve().parents[1]
-    print_startup_summary(root_dir=root_dir)
+    print_startup_summary(root_dir=root_dir, args=args)
     if args.validate_config:
         print("Config validation succeeded.")
         return

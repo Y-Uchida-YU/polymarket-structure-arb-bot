@@ -256,19 +256,13 @@ class PolymarketStructureArbApp:
                 if not risk_decision.allowed:
                     continue
 
-                execution_result = self._execute_paper_trade(
+                self._execute_paper_trade(
                     signal=signal,
                     now=now,
                     yes_quote=yes_quote,
                     no_quote=no_quote,
                     tick_yes=tick_yes,
                     tick_no=tick_no,
-                )
-                signal.fill_status = execution_result.fill_status
-                signal.reject_reason = execution_result.rejection_reason
-                signal.signal_edge_after_slippage = execution_result.signal_edge_after_slippage
-                signal.resync_reason = self.state.last_resync_reason_by_asset.get(
-                    market.yes_token_id
                 )
 
                 self._record_signal(signal)
@@ -364,22 +358,17 @@ class PolymarketStructureArbApp:
                 "threshold": signal.threshold,
                 "quote_age_ms": signal.quote_age_ms,
                 "signal_edge_raw": signal.raw_edge,
-                "signal_edge_after_slippage": signal.signal_edge_after_slippage,
                 "adjusted_edge": signal.adjusted_edge,
-                "fill_status": signal.fill_status,
-                "reject_reason": signal.reject_reason,
-                "resync_reason": signal.resync_reason,
                 "reason": signal.reason,
             },
             now_utc=signal.detected_at,
         )
         self.logger.info(
-            "Signal detected market=%s slug=%s raw_edge=%.6f adjusted_edge=%.6f fill_status=%s",
+            "Signal detected market=%s slug=%s raw_edge=%.6f adjusted_edge=%.6f",
             signal.market_id,
             signal.slug,
             signal.raw_edge,
             signal.adjusted_edge,
-            signal.fill_status,
         )
 
     def _execute_paper_trade(
@@ -399,23 +388,18 @@ class PolymarketStructureArbApp:
             yes_tick_size=tick_yes,
             no_tick_size=tick_no,
         )
-        fills_by_token = {fill.token_id: fill for fill in result.fills}
-        yes_fill = fills_by_token.get(signal.yes_token_id)
-        no_fill = fills_by_token.get(signal.no_token_id)
-        if yes_fill is not None and no_fill is not None:
-            matched_qty = min(yes_fill.filled_qty, no_fill.filled_qty)
-            if matched_qty > 0:
-                self.exposure.add_position(
-                    Position(
-                        market_id=signal.market_id,
-                        signal_id=signal.signal_id,
-                        yes_qty=matched_qty,
-                        no_qty=matched_qty,
-                        yes_entry_price=yes_fill.fill_price,
-                        no_entry_price=no_fill.fill_price,
-                        opened_at=now,
-                    )
+        if result.inventory_snapshot.matched_qty > 0:
+            self.exposure.add_position(
+                Position(
+                    market_id=signal.market_id,
+                    signal_id=signal.signal_id,
+                    yes_qty=result.inventory_snapshot.matched_qty,
+                    no_qty=result.inventory_snapshot.matched_qty,
+                    yes_entry_price=result.inventory_snapshot.avg_fill_price_yes,
+                    no_entry_price=result.inventory_snapshot.avg_fill_price_no,
+                    opened_at=now,
                 )
+            )
 
         if not result.accepted:
             rejection_reason = result.rejection_reason or "unknown_rejection"
@@ -474,22 +458,43 @@ class PolymarketStructureArbApp:
                     "reject_reason": result.rejection_reason,
                     "partial_fill": result.partial_fill,
                     "quote_age_ms": result.quote_age_ms,
+                    "signal_edge_after_slippage": result.signal_edge_after_slippage,
                 },
                 now_utc=now,
             )
 
-        self.sqlite_store.save_pnl_snapshot(
-            signal_id=signal.signal_id,
-            market_id=signal.market_id,
-            estimated_final_pnl=result.estimated_final_pnl,
-            created_at_iso=now.isoformat(),
+        self.sqlite_store.save_inventory_snapshot(result.inventory_snapshot)
+        self.csv_logger.log_inventory(
+            {
+                "signal_id": result.inventory_snapshot.signal_id,
+                "market_id": result.inventory_snapshot.market_id,
+                "market_slug": result.inventory_snapshot.market_slug,
+                "timestamp": result.inventory_snapshot.timestamp.isoformat(),
+                "yes_filled_qty": result.inventory_snapshot.yes_filled_qty,
+                "no_filled_qty": result.inventory_snapshot.no_filled_qty,
+                "matched_qty": result.inventory_snapshot.matched_qty,
+                "unmatched_yes_qty": result.inventory_snapshot.unmatched_yes_qty,
+                "unmatched_no_qty": result.inventory_snapshot.unmatched_no_qty,
+                "avg_fill_price_yes": result.inventory_snapshot.avg_fill_price_yes,
+                "avg_fill_price_no": result.inventory_snapshot.avg_fill_price_no,
+                "yes_mark_price": result.inventory_snapshot.yes_mark_price,
+                "no_mark_price": result.inventory_snapshot.no_mark_price,
+                "valuation_mode": result.inventory_snapshot.valuation_mode,
+            },
+            now_utc=now,
         )
+
+        self.sqlite_store.save_pnl_snapshot(result.pnl_snapshot)
         self.csv_logger.log_pnl(
             {
                 "signal_id": signal.signal_id,
                 "market_id": signal.market_id,
-                "estimated_final_pnl": result.estimated_final_pnl,
+                "market_slug": signal.slug,
                 "created_at": now.isoformat(),
+                "estimated_edge_at_signal": result.estimated_edge_at_signal,
+                "projected_matched_pnl": result.projected_matched_pnl,
+                "unmatched_inventory_mtm": result.unmatched_inventory_mtm,
+                "total_projected_pnl": result.total_projected_pnl,
                 "fill_status": result.fill_status,
                 "reject_reason": result.rejection_reason,
             },
