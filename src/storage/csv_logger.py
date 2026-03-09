@@ -24,6 +24,9 @@ class CsvEventLogger:
     def log_pnl(self, row: dict[str, Any], now_utc: datetime) -> Path:
         return self._append("pnl", row, now_utc)
 
+    def log_inventory(self, row: dict[str, Any], now_utc: datetime) -> Path:
+        return self._append("inventory", row, now_utc)
+
     def log_error(self, row: dict[str, Any], now_utc: datetime) -> Path:
         return self._append("errors", row, now_utc)
 
