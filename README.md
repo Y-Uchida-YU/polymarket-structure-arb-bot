@@ -1,51 +1,59 @@
-# Polymarket Structure Arb Bot (Paper Trading MVP v2)
+﻿# Polymarket Structure Arb Bot (Paper Trading MVP v3)
 
-This project monitors Polymarket binary markets and emits a paper-trading signal when:
+Polymarket の binary market を監視し、`ask_yes + ask_no` の非整合シグナルを検出する paper-trading bot です。
 
-`ask_yes + ask_no <= entry_threshold_sum_ask`
+## Live Trading Status (Important)
 
-The bot is intentionally **paper trading only** in this phase. Live order placement is not implemented.
+- このリポジトリは **still not live-ready** です。
+- live order / auth / signing / balances / cancel-replace は未実装です。
+- 現在は「観測Bot + signal bot + 現実寄り paper bot」までを対象にしています。
 
-## Important Scope
+## v3 でできること
 
-- This version is focused on observation quality and safer paper execution.
-- Live trading is out of scope in this phase.
-- Existing layered architecture is preserved: strategy / execution / risk / storage.
-
-## What It Can Do
-
-- Fetch active and open markets from Gamma API.
-- Filter only eligible binary markets with strict conditions:
+- Gamma API から active markets を取得し、binary market を抽出
+- 市場フィルタ（以下をすべて満たす市場のみ採用）
   - `active == true`
   - `closed == false`
   - `archived == false`
-  - exactly 2 outcomes
-  - exactly 2 `clobTokenIds`
-  - `enableOrderBook == true` (missing value is excluded)
-- Map YES/NO token ids robustly from normalized outcome labels.
-- Subscribe to CLOB market websocket and request custom feature stream with:
-  - `custom_feature_enabled: true`
-- Maintain latest best bid/ask state by `asset_id`.
-- Detect structure-arb signals from latest yes/no asks.
-- Run paper execution with basic realism guards:
-  - reject stale quotes
-  - reject if one side is missing
-  - reject if ask size is missing/insufficient
-- Persist events:
-  - CSV: signal / order / fill / pnl / error
-  - SQLite: markets / quotes / signals / orders / fills / pnl / errors
-- Rotate app logs daily.
-- Refresh market universe periodically via `market_refresh_minutes`.
-- Trigger websocket resubscribe when subscribed asset ids change.
+  - outcomes が 2 要素で Yes/No と判定可能
+  - `clobTokenIds` が 2 要素
+  - `enableOrderBook == true`（欠損は除外）
+- `outcomes` と `clobTokenIds` の index 対応を前提に Yes/No token を安全にマッピング
+- market websocket 接続と自動再接続（再接続後再購読）
+- 購読 payload に `custom_feature_enabled: true` を付与
+- `best_bid_ask` を asset_id ごとに保持
+- tick size 管理
+  - 初期取得: `/tick-size/{token_id}`
+  - 変更追随: websocket `tick_size_change`
+  - 価格丸め utility（tick 準拠）
+- orderbook summary resync
+  - 接続直後
+  - stale asset 検知時
+  - ws idle gap 検知時
+- signal quality guard
+  - max spread / min depth / max quote age
+  - raw edge と adjusted edge を分離
+- paper fill model（v2 より現実寄り）
+  - quote age
+  - available size
+  - slip ticks
+  - fill probability
+  - partial / one-leg / reject の区別
+- CSV と SQLite への永続化
+  - signal / order / fill / pnl / error
+  - tick size / resync / metrics
+- `market_refresh_minutes` による定期市場再取得
 
-## What It Cannot Do (Yet)
+## v3 でも未対応のこと
 
-- No live order placement.
-- No CLOB authenticated flow (L1/L2 auth, POLY_* headers) yet.
-- No real geoblock provider integration yet.
-- No real balance checks / cancel-reprice loop / inventory management yet.
+- live order placement
+- CLOB 認証（L1/L2, POLY_* headers）
+- signing
+- balance / allowance
+- cancel / replace
+- 取引所レベルの完全 queue simulation
 
-## Repository Layout
+## ディレクトリ
 
 ```text
 polymarket-structure-arb-bot/
@@ -62,78 +70,52 @@ polymarket-structure-arb-bot/
 ├─ src/
 │  ├─ main.py
 │  ├─ app/
-│  │  ├─ bootstrap.py
-│  │  └─ scheduler.py
-│  ├─ config/
-│  │  └─ loader.py
 │  ├─ clients/
-│  │  ├─ gamma_client.py
-│  │  ├─ clob_client.py
-│  │  ├─ ws_client.py
-│  │  └─ geoblock_client.py
+│  ├─ config/
 │  ├─ domain/
-│  │  ├─ market.py
-│  │  ├─ order.py
-│  │  ├─ position.py
-│  │  └─ signal.py
-│  ├─ strategy/
-│  │  ├─ complement_arb.py
-│  │  └─ filters.py
 │  ├─ execution/
-│  │  ├─ order_router.py
-│  │  ├─ quote_manager.py
-│  │  └─ cancel_manager.py
-│  ├─ risk/
-│  │  ├─ limits.py
-│  │  ├─ kill_switch.py
-│  │  └─ exposure.py
-│  ├─ storage/
-│  │  ├─ sqlite_store.py
-│  │  └─ csv_logger.py
 │  ├─ monitoring/
-│  │  ├─ healthcheck.py
-│  │  └─ notifier.py
+│  ├─ risk/
+│  ├─ storage/
+│  ├─ strategy/
 │  └─ utils/
-│     ├─ clock.py
-│     ├─ math_ext.py
-│     └─ retry.py
 └─ tests/
 ```
 
-## Windows 11 Setup
+## Windows 11 セットアップ
 
-1. Install Python 3.12.
-2. Open PowerShell and move to project:
+1. Python 3.12 をインストール
+2. PowerShell でプロジェクトへ移動
 
 ```powershell
 cd C:\MyProjects\polymarket-structure-arb-bot
 ```
 
-3. Create and activate virtual environment:
+3. venv 作成と有効化
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-4. Install dependencies:
+4. 依存関係インストール
 
 ```powershell
 pip install -U pip
 pip install -e .[dev]
 ```
 
-5. Create local env file:
+5. `.env` 作成
 
 ```powershell
 copy .env.example .env
 ```
 
-## Configuration
+## 設定ファイル
 
 ### `.env`
 
-Current phase does not use live credentials, but keep keys for future integration:
+現フェーズでは live key は使いませんが、将来用に保持しています。
 
 ```env
 POLYMARKET_PRIVATE_KEY=
@@ -142,44 +124,82 @@ POLYMARKET_API_SECRET=
 POLYMARKET_PASSPHRASE=
 ```
 
-### `config/settings.yaml` (key values)
+### `config/settings.yaml` 主要項目
 
-- `strategy.entry_threshold_sum_ask`: signal threshold
-- `strategy.expiry_block_minutes`: block new signals near expiry
-- `risk.max_open_positions`: global cap
-- `risk.max_positions_per_market`: per-market cap
-- `risk.paper_order_size_usdc`: paper notional
-- `risk.min_book_size`: minimum required visible ask size per leg
-- `risk.stale_quote_ms`: max quote age to accept paper fill
-- `runtime.market_refresh_minutes`: periodic market-universe refresh interval
+- `strategy.entry_threshold_sum_ask`: しきい値
+- `strategy.enable_quality_guards`: quality guard ON/OFF
+- `strategy.max_spread_per_leg`: 脚ごとの最大 spread
+- `strategy.min_depth_per_leg`: 脚ごとの最小 depth
+- `strategy.max_quote_age_ms_for_signal`: signal 用 freshness 条件
+- `strategy.adjusted_edge_min`: adjusted edge 最低値
+- `risk.paper_order_size_usdc`: paper 注文サイズ
+- `risk.min_book_size`: 最低板サイズ
+- `risk.stale_quote_ms`: fill 許容 quote age
+- `risk.slip_ticks`: 擬似スリッページ
+- `runtime.market_refresh_minutes`: 市場再取得周期
+- `runtime.stale_asset_ms`: stale 判定閾値
+- `runtime.book_resync_idle_ms`: ws idle gap resync 閾値
 
 ### `config/markets.yaml`
 
-- `include_slugs`: allow-list (if empty, no allow-list restriction)
-- `exclude_slugs`: explicit deny-list
-- `exclude_categories` / `exclude_keywords`: extra exclusion filters
+- `include_slugs`: allow-list
+- `exclude_slugs`: deny-list
+- `exclude_categories` / `exclude_keywords`: 追加除外
 
-## Run
+## 実行モード
 
-Normal run:
+通常起動:
 
 ```powershell
 python -m src.main
 ```
 
-or:
-
-```powershell
-python src/main.py
-```
-
-One-shot mode (fetch/filter only, no websocket loop):
+1回実行のみ（市場読み込み後に終了）:
 
 ```powershell
 python -m src.main --once
 ```
 
-## Quality Commands
+dry-run（市場読み込み経路の確認だけして終了）:
+
+```powershell
+python -m src.main --dry-run
+```
+
+設定検証のみ:
+
+```powershell
+python -m src.main --validate-config
+```
+
+明示的 paper 指定:
+
+```powershell
+python -m src.main --paper
+```
+
+起動時に設定サマリーと「live 未実装」警告を表示します。
+
+## ログ/保存データ
+
+### CSV (`data/exports/`)
+
+- `signals_YYYYMMDD.csv`
+  - `signal_timestamp`, `quote_age_ms`
+  - `yes_bid/yes_ask`, `no_bid/no_ask`
+  - `yes_size`, `no_size`
+  - `tick_size_yes`, `tick_size_no`
+  - `signal_edge_raw`, `signal_edge_after_slippage`
+  - `fill_status`, `reject_reason`, `resync_reason`
+- `orders_*.csv`, `fills_*.csv`, `pnl_*.csv`, `errors_*.csv`
+- `tick_sizes_*.csv`, `resync_*.csv`, `metrics_*.csv`
+
+### SQLite (`data/state/state.db`)
+
+- `markets`, `quotes`, `signals`, `orders`, `fills`, `pnl_snapshots`, `errors`
+- `tick_sizes`, `resync_events`, `metrics`
+
+## 品質コマンド
 
 ```powershell
 pytest -q
@@ -187,8 +207,8 @@ ruff check .
 black --check .
 ```
 
-## Placeholder Notes
+## Placeholder 実装について
 
-- `ClobClient` is a paper-trading placeholder only.
-- `GeoBlockClient` is a paper-trading placeholder only.
-- Do not treat this repository as live-ready in the current phase.
+- `src/clients/clob_client.py` は paper placeholder です。
+- `src/clients/geoblock_client.py` は paper placeholder です。
+- 本番利用時は実 API 接続・認証・署名実装が必須です。

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 class ApiSettings(BaseModel):
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     gamma_markets_endpoint: str = "/markets"
+    clob_base_url: str = "https://clob.polymarket.com"
     gamma_page_size: int = 200
     gamma_max_pages: int = 10
     ws_market_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -22,6 +23,12 @@ class StrategySettings(BaseModel):
     max_ask: float = 0.99
     expiry_block_minutes: int = 180
     signal_cooldown_seconds: int = 30
+    enable_quality_guards: bool = True
+    max_spread_per_leg: float = 0.05
+    min_depth_per_leg: float = 5.0
+    max_quote_age_ms_for_signal: int = 3_000
+    adjusted_edge_min: float = 0.0
+    slippage_penalty_ticks: float = 1.0
 
     @model_validator(mode="after")
     def validate_bounds(self) -> StrategySettings:
@@ -37,6 +44,10 @@ class RiskSettings(BaseModel):
     max_daily_signals: int = 200
     min_book_size: float = 0.0
     stale_quote_ms: int = 3000
+    fill_latency_ms: int = 300
+    slip_ticks: int = 1
+    base_fill_probability: float = 0.95
+    allow_partial_fills: bool = True
 
 
 class StorageSettings(BaseModel):
@@ -51,6 +62,9 @@ class RuntimeSettings(BaseModel):
     websocket_ping_interval_seconds: int = 20
     websocket_ping_timeout_seconds: int = 20
     market_refresh_minutes: int = 60
+    stale_asset_ms: int = 15_000
+    book_resync_idle_ms: int = 20_000
+    resync_batch_size: int = 100
 
 
 class MarketFilterSettings(BaseModel):
