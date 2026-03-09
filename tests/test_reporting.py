@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from src.reporting.daily_report import DailyReportGenerator
 from src.storage.sqlite_store import SQLiteStore
 
@@ -124,3 +126,43 @@ def test_daily_report_generator_writes_json_and_csv(tmp_path: Path) -> None:
     json_path, csv_path = generator.save(report)
     assert json_path.exists()
     assert csv_path.exists()
+
+
+def test_daily_report_last_hours_with_run_id_includes_boundary_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    fixed_now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+    ts = fixed_now.isoformat()
+
+    with store.conn:
+        store.conn.execute(
+            """
+            INSERT INTO signals (
+              signal_id, run_id, market_id, slug,
+              ask_yes, ask_no, sum_ask, threshold, reason, detected_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("sig-boundary", "run-1", "m1", "market-1", 0.45, 0.5, 0.95, 0.98, "seed", ts),
+        )
+    store.close()
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object | None = None) -> datetime:
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+        @classmethod
+        def fromisoformat(cls, date_string: str) -> datetime:
+            return datetime.fromisoformat(date_string)
+
+    monkeypatch.setattr("src.reporting.daily_report.datetime", FixedDateTime)
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    assert report["totals"]["total_signals"] == 1
