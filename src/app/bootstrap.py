@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from src.app.scheduler import run_periodic
+from src.clients.book_client import BookClient
 from src.clients.gamma_client import GammaClient
+from src.clients.tick_size_client import TickSizeClient
 from src.clients.ws_client import MarketWebSocketClient
 from src.config.loader import AppConfig, load_app_config
+from src.domain.book import TickSizeUpdate
 from src.domain.market import BinaryMarket
 from src.domain.position import Position
 from src.domain.signal import ArbSignal
-from src.execution.order_router import PaperOrderRouter
-from src.execution.quote_manager import QuoteManager
+from src.execution.order_router import PaperExecutionResult, PaperOrderRouter
+from src.execution.quote_manager import BestBidAskUpdate, QuoteManager
 from src.monitoring.healthcheck import HealthCheck
 from src.monitoring.notifier import Notifier
 from src.risk.exposure import ExposureManager
@@ -58,12 +61,17 @@ def setup_logging(log_dir: Path) -> logging.Logger:
 @dataclass(slots=True)
 class AppState:
     last_signal_at_by_market: dict[str, float]
+    last_resync_reason_by_asset: dict[str, str] = field(default_factory=dict)
+    stale_assets: set[str] = field(default_factory=set)
+    safe_mode_active: bool = False
+    last_ws_idle_resync_ts: float = 0.0
 
 
 @dataclass(slots=True)
 class MarketLoadResult:
     market_count: int
     asset_ids_changed: bool
+    asset_ids: list[str]
 
 
 class PolymarketStructureArbApp:
@@ -75,11 +83,19 @@ class PolymarketStructureArbApp:
             base_url=config.settings.api.gamma_base_url,
             markets_endpoint=config.settings.api.gamma_markets_endpoint,
         )
+        self.book_client = BookClient(base_url=config.settings.api.clob_base_url)
+        self.tick_size_client = TickSizeClient(base_url=config.settings.api.clob_base_url)
         self.strategy = ComplementArbStrategy(
             ComplementArbConfig(
                 entry_threshold_sum_ask=config.settings.strategy.entry_threshold_sum_ask,
                 min_ask=config.settings.strategy.min_ask,
                 max_ask=config.settings.strategy.max_ask,
+                enable_quality_guards=config.settings.strategy.enable_quality_guards,
+                max_spread_per_leg=config.settings.strategy.max_spread_per_leg,
+                min_depth_per_leg=config.settings.strategy.min_depth_per_leg,
+                max_quote_age_ms_for_signal=config.settings.strategy.max_quote_age_ms_for_signal,
+                adjusted_edge_min=config.settings.strategy.adjusted_edge_min,
+                slippage_penalty_ticks=config.settings.strategy.slippage_penalty_ticks,
             )
         )
         self.risk_limiter = RiskLimiter(
@@ -92,6 +108,10 @@ class PolymarketStructureArbApp:
             order_size_usdc=config.settings.risk.paper_order_size_usdc,
             min_book_size=config.settings.risk.min_book_size,
             stale_quote_ms=config.settings.risk.stale_quote_ms,
+            fill_latency_ms=config.settings.risk.fill_latency_ms,
+            slip_ticks=config.settings.risk.slip_ticks,
+            base_fill_probability=config.settings.risk.base_fill_probability,
+            allow_partial_fills=config.settings.risk.allow_partial_fills,
         )
         self.csv_logger = CsvEventLogger(export_dir=config.export_dir)
         self.sqlite_store = SQLiteStore(db_path=config.sqlite_path)
@@ -128,7 +148,10 @@ class PolymarketStructureArbApp:
 
         self.token_to_market_side = token_to_market_side
         self.quote_manager.update_token_mapping(token_to_market_side)
-        current_asset_ids = set(token_to_market_side.keys())
+        asset_ids = list(token_to_market_side.keys())
+        await self._load_initial_tick_sizes(asset_ids)
+
+        current_asset_ids = set(asset_ids)
         asset_ids_changed = bool(previous_asset_ids) and previous_asset_ids != current_asset_ids
         self.logger.info(
             "Loaded raw_markets=%s binary_markets=%s subscribed_assets=%s changed=%s",
@@ -140,36 +163,88 @@ class PolymarketStructureArbApp:
         return MarketLoadResult(
             market_count=len(binary_markets),
             asset_ids_changed=asset_ids_changed,
+            asset_ids=asset_ids,
         )
+
+    async def _load_initial_tick_sizes(self, asset_ids: list[str]) -> None:
+        if not asset_ids:
+            return
+
+        semaphore = asyncio.Semaphore(20)
+
+        async def _fetch(asset_id: str) -> TickSizeUpdate | None:
+            async with semaphore:
+                try:
+                    return await self.tick_size_client.fetch_tick_size(asset_id)
+                except Exception:  # noqa: BLE001
+                    return None
+
+        results = await asyncio.gather(
+            *[_fetch(asset_id) for asset_id in asset_ids], return_exceptions=False
+        )
+        for item in results:
+            if item is None:
+                continue
+            self.quote_manager.apply_tick_size_snapshot(
+                asset_id=item.asset_id,
+                tick_size=item.tick_size,
+                source=item.source,
+                timestamp=item.updated_at,
+            )
+            self._persist_tick_size_update(item)
 
     async def handle_ws_message(self, raw_message: str) -> None:
         now = utc_now()
         try:
             updates = self.quote_manager.ingest_ws_message(raw_message)
+            tick_updates = self.quote_manager.drain_tick_size_updates()
+            for update in tick_updates:
+                self._persist_tick_size_update(update)
+
             if not updates:
                 return
 
             for update in updates:
                 self.healthcheck.on_ws_message(now)
+                self.healthcheck.on_asset_quote_update(update.asset_id, update.timestamp)
                 mapping = self.token_to_market_side.get(update.asset_id)
                 if mapping is None:
                     continue
+
                 market_id, side = mapping
-                self.sqlite_store.save_quote(market_id=market_id, side=side, update=update)
+                quote_age_ms = max(0.0, (now - update.timestamp).total_seconds() * 1000.0)
+                tick_size = self.quote_manager.get_tick_size(update.asset_id)
+                self.sqlite_store.save_quote(
+                    market_id=market_id,
+                    side=side,
+                    update=update,
+                    quote_age_ms=quote_age_ms,
+                    tick_size=tick_size,
+                    source=update.event_type,
+                )
+
                 market = self.markets_by_id.get(market_id)
-                if market is None:
+                if market is None or self.state.safe_mode_active:
+                    continue
+                yes_quote, no_quote = self.quote_manager.get_market_quotes(market_id)
+                if yes_quote is None or no_quote is None:
+                    continue
+                if self._market_has_stale_quotes(market=market, now_utc=now):
                     continue
 
-                ask_yes, ask_no = self.quote_manager.get_market_asks(market_id)
-                signal = self.strategy.evaluate(
+                tick_yes = self.quote_manager.get_tick_size(market.yes_token_id)
+                tick_no = self.quote_manager.get_tick_size(market.no_token_id)
+                signal = self.strategy.evaluate_with_quotes(
                     market=market,
-                    ask_yes=ask_yes,
-                    ask_no=ask_no,
+                    yes_quote=yes_quote,
+                    no_quote=no_quote,
                     now_utc=now,
+                    tick_size_yes=tick_yes,
+                    tick_size_no=tick_no,
+                    order_size_usdc=self.config.settings.risk.paper_order_size_usdc,
                 )
                 if signal is None:
                     continue
-
                 if not self._passes_cooldown(market_id=market_id, now_ts=now.timestamp()):
                     continue
 
@@ -181,8 +256,22 @@ class PolymarketStructureArbApp:
                 if not risk_decision.allowed:
                     continue
 
+                execution_result = self._execute_paper_trade(
+                    signal=signal,
+                    now=now,
+                    yes_quote=yes_quote,
+                    no_quote=no_quote,
+                    tick_yes=tick_yes,
+                    tick_no=tick_no,
+                )
+                signal.fill_status = execution_result.fill_status
+                signal.reject_reason = execution_result.rejection_reason
+                signal.signal_edge_after_slippage = execution_result.signal_edge_after_slippage
+                signal.resync_reason = self.state.last_resync_reason_by_asset.get(
+                    market.yes_token_id
+                )
+
                 self._record_signal(signal)
-                self._execute_paper_trade(signal=signal, now=now)
                 self.state.last_signal_at_by_market[market_id] = now.timestamp()
                 self.exposure.increment_daily_signal_count(now.date())
                 self.healthcheck.on_signal(now)
@@ -209,6 +298,41 @@ class PolymarketStructureArbApp:
                 self.notifier.error("Kill switch triggered. Stopping app.")
                 self.stop_event.set()
 
+    def _persist_tick_size_update(self, update: TickSizeUpdate) -> None:
+        self.sqlite_store.save_tick_size_update(update)
+        self.csv_logger.log_tick_size(
+            {
+                "asset_id": update.asset_id,
+                "tick_size": update.tick_size,
+                "source": update.source,
+                "updated_at": update.updated_at.isoformat(),
+            },
+            now_utc=update.updated_at,
+        )
+        self.logger.info(
+            "Tick size updated asset=%s tick_size=%.6f source=%s",
+            update.asset_id,
+            update.tick_size,
+            update.source,
+        )
+
+    def _market_has_stale_quotes(self, market: BinaryMarket, now_utc: datetime) -> bool:
+        if (
+            market.yes_token_id in self.state.stale_assets
+            or market.no_token_id in self.state.stale_assets
+        ):
+            return True
+        max_age_ms = self.config.settings.strategy.max_quote_age_ms_for_signal
+        return self.quote_manager.is_asset_stale(
+            asset_id=market.yes_token_id,
+            now_utc=now_utc,
+            max_age_ms=max_age_ms,
+        ) or self.quote_manager.is_asset_stale(
+            asset_id=market.no_token_id,
+            now_utc=now_utc,
+            max_age_ms=max_age_ms,
+        )
+
     def _passes_cooldown(self, market_id: str, now_ts: float) -> bool:
         cooldown = self.config.settings.strategy.signal_cooldown_seconds
         last_ts = self.state.last_signal_at_by_market.get(market_id)
@@ -225,40 +349,82 @@ class PolymarketStructureArbApp:
                 "slug": signal.slug,
                 "yes_token_id": signal.yes_token_id,
                 "no_token_id": signal.no_token_id,
+                "signal_timestamp": signal.detected_at.isoformat(),
                 "ask_yes": signal.ask_yes,
                 "ask_no": signal.ask_no,
+                "yes_ask": signal.ask_yes,
+                "no_ask": signal.ask_no,
+                "yes_bid": signal.bid_yes,
+                "no_bid": signal.bid_no,
+                "yes_size": signal.size_yes,
+                "no_size": signal.size_no,
+                "tick_size_yes": signal.tick_size_yes,
+                "tick_size_no": signal.tick_size_no,
                 "sum_ask": signal.sum_ask,
                 "threshold": signal.threshold,
-                "detected_at": signal.detected_at.isoformat(),
+                "quote_age_ms": signal.quote_age_ms,
+                "signal_edge_raw": signal.raw_edge,
+                "signal_edge_after_slippage": signal.signal_edge_after_slippage,
+                "adjusted_edge": signal.adjusted_edge,
+                "fill_status": signal.fill_status,
+                "reject_reason": signal.reject_reason,
+                "resync_reason": signal.resync_reason,
                 "reason": signal.reason,
             },
             now_utc=signal.detected_at,
         )
         self.logger.info(
-            "Signal detected market=%s slug=%s ask_yes=%.4f ask_no=%.4f sum=%.4f threshold=%.4f",
+            "Signal detected market=%s slug=%s raw_edge=%.6f adjusted_edge=%.6f fill_status=%s",
             signal.market_id,
             signal.slug,
-            signal.ask_yes,
-            signal.ask_no,
-            signal.sum_ask,
-            signal.threshold,
+            signal.raw_edge,
+            signal.adjusted_edge,
+            signal.fill_status,
         )
 
-    def _execute_paper_trade(self, signal: ArbSignal, now: datetime) -> None:
-        yes_quote, no_quote = self.quote_manager.get_market_quotes(signal.market_id)
+    def _execute_paper_trade(
+        self,
+        signal: ArbSignal,
+        now: datetime,
+        yes_quote: BestBidAskUpdate,
+        no_quote: BestBidAskUpdate,
+        tick_yes: float,
+        tick_no: float,
+    ) -> PaperExecutionResult:
         result = self.order_router.execute_signal(
             signal=signal,
             now_utc=now,
             yes_quote=yes_quote,
             no_quote=no_quote,
+            yes_tick_size=tick_yes,
+            no_tick_size=tick_no,
         )
+        fills_by_token = {fill.token_id: fill for fill in result.fills}
+        yes_fill = fills_by_token.get(signal.yes_token_id)
+        no_fill = fills_by_token.get(signal.no_token_id)
+        if yes_fill is not None and no_fill is not None:
+            matched_qty = min(yes_fill.filled_qty, no_fill.filled_qty)
+            if matched_qty > 0:
+                self.exposure.add_position(
+                    Position(
+                        market_id=signal.market_id,
+                        signal_id=signal.signal_id,
+                        yes_qty=matched_qty,
+                        no_qty=matched_qty,
+                        yes_entry_price=yes_fill.fill_price,
+                        no_entry_price=no_fill.fill_price,
+                        opened_at=now,
+                    )
+                )
+
         if not result.accepted:
             rejection_reason = result.rejection_reason or "unknown_rejection"
             self.logger.info(
-                "Paper trade rejected market=%s signal=%s reason=%s",
+                "Paper execution rejected market=%s signal=%s reason=%s status=%s",
                 signal.market_id,
                 signal.signal_id,
                 rejection_reason,
+                result.fill_status,
             )
             self.sqlite_store.save_error(
                 stage="paper_execution",
@@ -272,23 +438,6 @@ class PolymarketStructureArbApp:
                     "error_message": rejection_reason,
                 },
                 now_utc=now,
-            )
-            return
-
-        fills_by_token = {fill.token_id: fill for fill in result.fills}
-        yes_fill = fills_by_token.get(signal.yes_token_id)
-        no_fill = fills_by_token.get(signal.no_token_id)
-        if yes_fill is not None and no_fill is not None:
-            self.exposure.add_position(
-                Position(
-                    market_id=signal.market_id,
-                    signal_id=signal.signal_id,
-                    yes_qty=yes_fill.filled_qty,
-                    no_qty=no_fill.filled_qty,
-                    yes_entry_price=yes_fill.fill_price,
-                    no_entry_price=no_fill.fill_price,
-                    opened_at=now,
-                )
             )
 
         for order in result.orders:
@@ -321,6 +470,10 @@ class PolymarketStructureArbApp:
                     "fill_price": fill.fill_price,
                     "fee": fill.fee,
                     "filled_at": fill.filled_at.isoformat(),
+                    "fill_status": result.fill_status,
+                    "reject_reason": result.rejection_reason,
+                    "partial_fill": result.partial_fill,
+                    "quote_age_ms": result.quote_age_ms,
                 },
                 now_utc=now,
             )
@@ -337,9 +490,12 @@ class PolymarketStructureArbApp:
                 "market_id": signal.market_id,
                 "estimated_final_pnl": result.estimated_final_pnl,
                 "created_at": now.isoformat(),
+                "fill_status": result.fill_status,
+                "reject_reason": result.rejection_reason,
             },
             now_utc=now,
         )
+        return result
 
     def get_subscribed_asset_ids(self) -> list[str]:
         return list(self.token_to_market_side.keys())
@@ -368,13 +524,210 @@ class PolymarketStructureArbApp:
                 now_utc=now,
             )
 
-    async def run(self, once: bool = False) -> None:
+    async def on_ws_connected(self, asset_ids: list[str]) -> None:
+        await self.resync_assets(asset_ids=asset_ids, reason="ws_connected")
+
+    def on_ws_reconnect_required(self, reason: str) -> None:
+        self.logger.warning("WebSocket reconnect requested reason=%s", reason)
+        now = utc_now()
+        self.sqlite_store.save_metric(
+            metric_name="ws_reconnect_required",
+            metric_value=1.0,
+            details=reason,
+            created_at_iso=now.isoformat(),
+        )
+        self.csv_logger.log_metric(
+            {
+                "created_at": now.isoformat(),
+                "metric_name": "ws_reconnect_required",
+                "metric_value": 1.0,
+                "reason": reason,
+            },
+            now_utc=now,
+        )
+
+    async def check_data_freshness_and_resync(self) -> None:
+        now = utc_now()
+        tracked_assets = list(self.token_to_market_side.keys())
+        last_ws_message_at = self.healthcheck.state.last_ws_message_at
+        ws_idle_ms = (
+            max(0.0, (now - last_ws_message_at).total_seconds() * 1000.0)
+            if last_ws_message_at is not None
+            else 0.0
+        )
+        self.sqlite_store.save_metric(
+            metric_name="ws_idle_ms",
+            metric_value=ws_idle_ms,
+            details=f"has_last_ws_message={last_ws_message_at is not None}",
+            created_at_iso=now.isoformat(),
+        )
+        self.csv_logger.log_metric(
+            {
+                "created_at": now.isoformat(),
+                "metric_name": "ws_idle_ms",
+                "metric_value": ws_idle_ms,
+                "has_last_ws_message": last_ws_message_at is not None,
+            },
+            now_utc=now,
+        )
+        stale_assets = self.healthcheck.stale_assets(
+            tracked_assets=tracked_assets,
+            now_utc=now,
+            max_age_ms=self.config.settings.runtime.stale_asset_ms,
+        )
+        self.state.stale_assets = set(stale_assets)
+        self.sqlite_store.save_metric(
+            metric_name="stale_asset_count",
+            metric_value=float(len(stale_assets)),
+            details=f"tracked_assets={len(tracked_assets)}",
+            created_at_iso=now.isoformat(),
+        )
+        self.csv_logger.log_metric(
+            {
+                "created_at": now.isoformat(),
+                "metric_name": "stale_asset_count",
+                "metric_value": len(stale_assets),
+                "tracked_assets": len(tracked_assets),
+            },
+            now_utc=now,
+        )
+        if not stale_assets:
+            self.state.safe_mode_active = False
+        else:
+            stale_ratio = len(stale_assets) / max(1, len(tracked_assets))
+            self.logger.warning(
+                "Stale assets detected count=%s total=%s ratio=%.3f",
+                len(stale_assets),
+                len(tracked_assets),
+                stale_ratio,
+            )
+            self.state.safe_mode_active = False
+            if len(stale_assets) == len(tracked_assets):
+                self.state.safe_mode_active = True
+                self.logger.error(
+                    "All tracked assets are stale. Entering safe mode (signal creation paused)."
+                )
+            await self.resync_assets(asset_ids=stale_assets, reason="stale_asset")
+
+        if self._is_ws_idle(now):
+            self.logger.warning(
+                "WebSocket stream appears idle for over %sms. Triggering full resync.",
+                self.config.settings.runtime.book_resync_idle_ms,
+            )
+            self.state.last_ws_idle_resync_ts = now.timestamp()
+            await self.resync_assets(asset_ids=tracked_assets, reason="ws_idle_gap")
+
+    def _is_ws_idle(self, now_utc: datetime) -> bool:
+        last_ws_message_at = self.healthcheck.state.last_ws_message_at
+        if last_ws_message_at is None:
+            return False
+        age_ms = (now_utc - last_ws_message_at).total_seconds() * 1000.0
+        if age_ms < self.config.settings.runtime.book_resync_idle_ms:
+            return False
+        return (
+            now_utc.timestamp() - self.state.last_ws_idle_resync_ts
+        ) * 1000.0 >= self.config.settings.runtime.book_resync_idle_ms
+
+    async def resync_assets(self, asset_ids: list[str], reason: str) -> None:
+        if not asset_ids:
+            return
+        now = utc_now()
+        batch_size = max(1, self.config.settings.runtime.resync_batch_size)
+        for index in range(0, len(asset_ids), batch_size):
+            batch = asset_ids[index : index + batch_size]
+            for asset_id in batch:
+                try:
+                    summary = await self.book_client.fetch_book_summary(asset_id)
+                    if summary is None:
+                        self.sqlite_store.save_resync_event(
+                            asset_id=asset_id,
+                            reason=reason,
+                            status="no_data",
+                            details="book summary missing",
+                            created_at_iso=now.isoformat(),
+                        )
+                        self.csv_logger.log_resync(
+                            {
+                                "created_at": now.isoformat(),
+                                "asset_id": asset_id,
+                                "resync_reason": reason,
+                                "status": "no_data",
+                                "details": "book summary missing",
+                            },
+                            now_utc=now,
+                        )
+                        continue
+
+                    update = self.quote_manager.apply_book_resync(summary)
+                    self.healthcheck.on_asset_quote_update(asset_id=asset_id, ts=summary.timestamp)
+                    mapping = self.token_to_market_side.get(asset_id)
+                    if mapping is not None:
+                        market_id, side = mapping
+                        quote_age_ms = max(0.0, (now - summary.timestamp).total_seconds() * 1000.0)
+                        self.sqlite_store.save_quote(
+                            market_id=market_id,
+                            side=side,
+                            update=update,
+                            quote_age_ms=quote_age_ms,
+                            tick_size=self.quote_manager.get_tick_size(asset_id),
+                            source="book_resync",
+                            resync_reason=reason,
+                        )
+
+                    self.state.last_resync_reason_by_asset[asset_id] = reason
+                    self.sqlite_store.save_resync_event(
+                        asset_id=asset_id,
+                        reason=reason,
+                        status="ok",
+                        details="resync_applied",
+                        created_at_iso=now.isoformat(),
+                    )
+                    self.csv_logger.log_resync(
+                        {
+                            "created_at": now.isoformat(),
+                            "asset_id": asset_id,
+                            "resync_reason": reason,
+                            "status": "ok",
+                            "best_bid": summary.best_bid,
+                            "best_ask": summary.best_ask,
+                            "best_bid_size": summary.best_bid_size,
+                            "best_ask_size": summary.best_ask_size,
+                        },
+                        now_utc=now,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error_text = f"{type(exc).__name__}: {exc}"
+                    self.sqlite_store.save_resync_event(
+                        asset_id=asset_id,
+                        reason=reason,
+                        status="failed",
+                        details=error_text,
+                        created_at_iso=now.isoformat(),
+                    )
+                    self.csv_logger.log_resync(
+                        {
+                            "created_at": now.isoformat(),
+                            "asset_id": asset_id,
+                            "resync_reason": reason,
+                            "status": "failed",
+                            "details": error_text,
+                        },
+                        now_utc=now,
+                    )
+                    self.logger.exception(
+                        "Resync failed asset=%s reason=%s error=%s", asset_id, reason, error_text
+                    )
+
+    async def run(self, once: bool = False, paper_mode: bool = True, dry_run: bool = False) -> None:
         initial_load_result = await self.load_markets()
         if initial_load_result.market_count == 0:
             self.notifier.error("No eligible binary markets after filters.")
             return
-        if once:
-            self.notifier.info("One-shot mode finished.")
+        if once or dry_run:
+            self.notifier.info("One-shot/dry-run mode finished.")
+            return
+        if not paper_mode:
+            self.notifier.error("Live trading is not implemented. Use --paper mode.")
             return
 
         ws_client = MarketWebSocketClient(
@@ -382,6 +735,8 @@ class PolymarketStructureArbApp:
             asset_ids=[],
             get_asset_ids=self.get_subscribed_asset_ids,
             on_message=self.handle_ws_message,
+            on_connected=self.on_ws_connected,
+            on_reconnect_required=self.on_ws_reconnect_required,
             logger=self.logger,
             reconnect_base_seconds=self.config.settings.runtime.reconnect_base_seconds,
             reconnect_max_seconds=self.config.settings.runtime.reconnect_max_seconds,
@@ -392,6 +747,7 @@ class PolymarketStructureArbApp:
             60.0,
             self.config.settings.runtime.market_refresh_minutes * 60.0,
         )
+        freshness_interval_seconds = max(5.0, self.config.settings.runtime.stale_asset_ms / 2000.0)
         refresh_task = asyncio.create_task(
             run_periodic(
                 task=self.refresh_market_universe,
@@ -399,6 +755,14 @@ class PolymarketStructureArbApp:
                 stop_event=self.stop_event,
             )
         )
+        freshness_task = asyncio.create_task(
+            run_periodic(
+                task=self.check_data_freshness_and_resync,
+                interval_seconds=freshness_interval_seconds,
+                stop_event=self.stop_event,
+            )
+        )
+
         try:
             await ws_client.run_forever(
                 stop_event=self.stop_event,
@@ -407,17 +771,23 @@ class PolymarketStructureArbApp:
         finally:
             self.stop_event.set()
             refresh_task.cancel()
-            await asyncio.gather(refresh_task, return_exceptions=True)
+            freshness_task.cancel()
+            await asyncio.gather(refresh_task, freshness_task, return_exceptions=True)
 
     async def shutdown(self) -> None:
         self.sqlite_store.close()
 
 
-async def run_app(root_dir: Path, once: bool = False) -> None:
+async def run_app(
+    root_dir: Path,
+    once: bool = False,
+    paper_mode: bool = True,
+    dry_run: bool = False,
+) -> None:
     config = load_app_config(root_dir=root_dir)
     logger = setup_logging(config.log_dir)
     app = PolymarketStructureArbApp(config=config, logger=logger)
     try:
-        await app.run(once=once)
+        await app.run(once=once, paper_mode=paper_mode, dry_run=dry_run)
     finally:
         await app.shutdown()

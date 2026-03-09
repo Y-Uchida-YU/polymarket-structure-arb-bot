@@ -1,6 +1,7 @@
 api:
   gamma_base_url: "https://gamma-api.polymarket.com"
   gamma_markets_endpoint: "/markets"
+  clob_base_url: "https://clob.polymarket.com"
   gamma_page_size: 200
   gamma_max_pages: 10
   ws_market_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -11,6 +12,12 @@ strategy:
   max_ask: 0.99
   expiry_block_minutes: 180
   signal_cooldown_seconds: 30
+  enable_quality_guards: true
+  max_spread_per_leg: 0.05
+  min_depth_per_leg: 5.0
+  max_quote_age_ms_for_signal: 3000
+  adjusted_edge_min: 0.0
+  slippage_penalty_ticks: 1.0
 
 risk:
   max_open_positions: 5
@@ -19,6 +26,10 @@ risk:
   max_daily_signals: 200
   min_book_size: 0.0
   stale_quote_ms: 3000
+  fill_latency_ms: 300
+  slip_ticks: 1
+  base_fill_probability: 0.95
+  allow_partial_fills: true
 
 storage:
   sqlite_path: "data/state/state.db"
@@ -31,6 +42,9 @@ runtime:
   websocket_ping_interval_seconds: 20
   websocket_ping_timeout_seconds: 20
   market_refresh_minutes: 60
+  stale_asset_ms: 15000
+  book_resync_idle_ms: 20000
+  resync_batch_size: 100
 
 market_filters:
   exclude_categories:

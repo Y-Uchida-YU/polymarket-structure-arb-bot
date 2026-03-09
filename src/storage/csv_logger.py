@@ -27,6 +27,15 @@ class CsvEventLogger:
     def log_error(self, row: dict[str, Any], now_utc: datetime) -> Path:
         return self._append("errors", row, now_utc)
 
+    def log_tick_size(self, row: dict[str, Any], now_utc: datetime) -> Path:
+        return self._append("tick_sizes", row, now_utc)
+
+    def log_resync(self, row: dict[str, Any], now_utc: datetime) -> Path:
+        return self._append("resync", row, now_utc)
+
+    def log_metric(self, row: dict[str, Any], now_utc: datetime) -> Path:
+        return self._append("metrics", row, now_utc)
+
     def _append(self, name: str, row: dict[str, Any], now_utc: datetime) -> Path:
         file_path = self.export_dir / f"{name}_{now_utc:%Y%m%d}.csv"
         frame = pd.DataFrame([row])

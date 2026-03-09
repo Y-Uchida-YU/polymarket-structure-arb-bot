@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from src.domain.book import TickSizeUpdate
 from src.domain.market import BinaryMarket
 from src.domain.order import FillEvent, PaperOrder
 from src.domain.signal import ArbSignal
@@ -15,6 +16,7 @@ class SQLiteStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._create_tables()
+        self._migrate_tables()
 
     def _create_tables(self) -> None:
         with self.conn:
@@ -38,6 +40,12 @@ class SQLiteStore:
                   side TEXT NOT NULL,
                   best_bid REAL,
                   best_ask REAL,
+                  best_bid_size REAL,
+                  best_ask_size REAL,
+                  quote_age_ms REAL,
+                  tick_size REAL,
+                  source TEXT,
+                  resync_reason TEXT,
                   quote_time TEXT NOT NULL
                 )
                 """)
@@ -50,8 +58,21 @@ class SQLiteStore:
                   ask_no REAL NOT NULL,
                   sum_ask REAL NOT NULL,
                   threshold REAL NOT NULL,
-                  detected_at TEXT NOT NULL,
-                  reason TEXT NOT NULL
+                  reason TEXT NOT NULL,
+                  quote_age_ms REAL,
+                  yes_bid REAL,
+                  no_bid REAL,
+                  yes_size REAL,
+                  no_size REAL,
+                  tick_size_yes REAL,
+                  tick_size_no REAL,
+                  signal_edge_raw REAL,
+                  signal_edge_after_slippage REAL,
+                  adjusted_edge REAL,
+                  fill_status TEXT,
+                  reject_reason TEXT,
+                  resync_reason TEXT,
+                  detected_at TEXT NOT NULL
                 )
                 """)
             self.conn.execute("""
@@ -97,6 +118,64 @@ class SQLiteStore:
                   created_at TEXT NOT NULL
                 )
                 """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS tick_sizes (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  asset_id TEXT NOT NULL,
+                  tick_size REAL NOT NULL,
+                  source TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                )
+                """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS resync_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  asset_id TEXT NOT NULL,
+                  reason TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  details TEXT,
+                  created_at TEXT NOT NULL
+                )
+                """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS metrics (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  metric_name TEXT NOT NULL,
+                  metric_value REAL NOT NULL,
+                  details TEXT,
+                  created_at TEXT NOT NULL
+                )
+                """)
+
+    def _migrate_tables(self) -> None:
+        self._ensure_column("quotes", "best_bid_size", "REAL")
+        self._ensure_column("quotes", "best_ask_size", "REAL")
+        self._ensure_column("quotes", "quote_age_ms", "REAL")
+        self._ensure_column("quotes", "tick_size", "REAL")
+        self._ensure_column("quotes", "source", "TEXT")
+        self._ensure_column("quotes", "resync_reason", "TEXT")
+
+        self._ensure_column("signals", "quote_age_ms", "REAL")
+        self._ensure_column("signals", "yes_bid", "REAL")
+        self._ensure_column("signals", "no_bid", "REAL")
+        self._ensure_column("signals", "yes_size", "REAL")
+        self._ensure_column("signals", "no_size", "REAL")
+        self._ensure_column("signals", "tick_size_yes", "REAL")
+        self._ensure_column("signals", "tick_size_no", "REAL")
+        self._ensure_column("signals", "signal_edge_raw", "REAL")
+        self._ensure_column("signals", "signal_edge_after_slippage", "REAL")
+        self._ensure_column("signals", "adjusted_edge", "REAL")
+        self._ensure_column("signals", "fill_status", "TEXT")
+        self._ensure_column("signals", "reject_reason", "TEXT")
+        self._ensure_column("signals", "resync_reason", "TEXT")
+
+    def _ensure_column(self, table_name: str, column_name: str, column_type: str) -> None:
+        cursor = self.conn.execute(f"PRAGMA table_info({table_name})")
+        existing_columns = {str(row[1]) for row in cursor.fetchall()}
+        if column_name in existing_columns:
+            return
+        with self.conn:
+            self.conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
     def upsert_market(self, market: BinaryMarket, updated_at_iso: str) -> None:
         with self.conn:
@@ -104,14 +183,8 @@ class SQLiteStore:
                 """
                 INSERT INTO markets
                 (
-                  market_id,
-                  slug,
-                  question,
-                  category,
-                  end_time,
-                  yes_token_id,
-                  no_token_id,
-                  updated_at
+                  market_id, slug, question, category, end_time,
+                  yes_token_id, no_token_id, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(market_id) DO UPDATE SET
@@ -140,12 +213,29 @@ class SQLiteStore:
         market_id: str,
         side: str,
         update: BestBidAskUpdate,
+        quote_age_ms: float | None = None,
+        tick_size: float | None = None,
+        source: str | None = None,
+        resync_reason: str | None = None,
     ) -> None:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO quotes (market_id, asset_id, side, best_bid, best_ask, quote_time)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO quotes (
+                  market_id,
+                  asset_id,
+                  side,
+                  best_bid,
+                  best_ask,
+                  best_bid_size,
+                  best_ask_size,
+                  quote_age_ms,
+                  tick_size,
+                  source,
+                  resync_reason,
+                  quote_time
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     market_id,
@@ -153,6 +243,12 @@ class SQLiteStore:
                     side,
                     update.best_bid,
                     update.best_ask,
+                    update.best_bid_size,
+                    update.best_ask_size,
+                    quote_age_ms,
+                    tick_size,
+                    source,
+                    resync_reason,
                     update.timestamp.isoformat(),
                 ),
             )
@@ -161,8 +257,7 @@ class SQLiteStore:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO signals
-                (
+                INSERT INTO signals (
                   signal_id,
                   market_id,
                   slug,
@@ -170,10 +265,23 @@ class SQLiteStore:
                   ask_no,
                   sum_ask,
                   threshold,
-                  detected_at,
-                  reason
+                  reason,
+                  quote_age_ms,
+                  yes_bid,
+                  no_bid,
+                  yes_size,
+                  no_size,
+                  tick_size_yes,
+                  tick_size_no,
+                  signal_edge_raw,
+                  signal_edge_after_slippage,
+                  adjusted_edge,
+                  fill_status,
+                  reject_reason,
+                  resync_reason,
+                  detected_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal.signal_id,
@@ -183,8 +291,21 @@ class SQLiteStore:
                     signal.ask_no,
                     signal.sum_ask,
                     signal.threshold,
-                    signal.detected_at.isoformat(),
                     signal.reason,
+                    signal.quote_age_ms,
+                    signal.bid_yes,
+                    signal.bid_no,
+                    signal.size_yes,
+                    signal.size_no,
+                    signal.tick_size_yes,
+                    signal.tick_size_no,
+                    signal.raw_edge,
+                    signal.signal_edge_after_slippage,
+                    signal.adjusted_edge,
+                    signal.fill_status,
+                    signal.reject_reason,
+                    signal.resync_reason,
+                    signal.detected_at.isoformat(),
                 ),
             )
 
@@ -194,15 +315,8 @@ class SQLiteStore:
                 """
                 INSERT INTO orders
                 (
-                  order_id,
-                  signal_id,
-                  market_id,
-                  token_id,
-                  side,
-                  quantity,
-                  limit_price,
-                  status,
-                  created_at
+                  order_id, signal_id, market_id, token_id, side,
+                  quantity, limit_price, status, created_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -225,15 +339,8 @@ class SQLiteStore:
                 """
                 INSERT INTO fills
                 (
-                  fill_id,
-                  order_id,
-                  signal_id,
-                  market_id,
-                  token_id,
-                  filled_qty,
-                  fill_price,
-                  fee,
-                  filled_at
+                  fill_id, order_id, signal_id, market_id, token_id,
+                  filled_qty, fill_price, fee, filled_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -284,6 +391,101 @@ class SQLiteStore:
                     created_at_iso,
                 ),
             )
+
+    def save_tick_size_update(self, update: TickSizeUpdate) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO tick_sizes (asset_id, tick_size, source, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    update.asset_id,
+                    update.tick_size,
+                    update.source,
+                    update.updated_at.isoformat(),
+                ),
+            )
+
+    def save_resync_event(
+        self,
+        asset_id: str,
+        reason: str,
+        status: str,
+        details: str,
+        created_at_iso: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO resync_events (asset_id, reason, status, details, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    asset_id,
+                    reason,
+                    status,
+                    details,
+                    created_at_iso,
+                ),
+            )
+
+    def save_metric(
+        self,
+        metric_name: str,
+        metric_value: float,
+        details: str,
+        created_at_iso: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO metrics (metric_name, metric_value, details, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    metric_name,
+                    metric_value,
+                    details,
+                    created_at_iso,
+                ),
+            )
+
+    def export_signals_by_date(self, date_prefix: str) -> list[dict[str, object]]:
+        cursor = self.conn.execute(
+            """
+            SELECT
+              signal_id,
+              market_id,
+              slug,
+              ask_yes,
+              ask_no,
+              yes_bid,
+              no_bid,
+              yes_size,
+              no_size,
+              tick_size_yes,
+              tick_size_no,
+              sum_ask,
+              threshold,
+              quote_age_ms,
+              signal_edge_raw,
+              signal_edge_after_slippage,
+              adjusted_edge,
+              fill_status,
+              reject_reason,
+              resync_reason,
+              reason,
+              detected_at
+            FROM signals
+            WHERE substr(detected_at, 1, 10) = ?
+            ORDER BY detected_at ASC
+            """,
+            (date_prefix,),
+        )
+        columns = [description[0] for description in cursor.description]
+        rows = cursor.fetchall()
+        return [dict(zip(columns, row, strict=False)) for row in rows]
 
     def close(self) -> None:
         self.conn.close()

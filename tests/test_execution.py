@@ -161,3 +161,144 @@ def test_paper_order_router_rejects_when_one_leg_missing() -> None:
     result = router.execute_signal(signal=signal, now_utc=now, yes_quote=yes_quote, no_quote=None)
     assert not result.accepted
     assert result.rejection_reason == "missing_one_or_both_quotes"
+
+
+def test_paper_order_router_applies_slippage_ticks_to_fill_price() -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    router = PaperOrderRouter(order_size_usdc=10.0, stale_quote_ms=5000, slip_ticks=2)
+    signal = ArbSignal.new(
+        market_id="market-1",
+        slug="sample",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        ask_yes=0.4,
+        ask_no=0.5,
+        threshold=0.98,
+        detected_at=now,
+        reason="sum_ask_le_threshold",
+    )
+    yes_quote = BestBidAskUpdate(
+        asset_id="yes-token",
+        best_bid=0.39,
+        best_ask=0.4,
+        best_bid_size=10.0,
+        best_ask_size=30.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    no_quote = BestBidAskUpdate(
+        asset_id="no-token",
+        best_bid=0.49,
+        best_ask=0.5,
+        best_bid_size=10.0,
+        best_ask_size=30.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    result = router.execute_signal(
+        signal=signal,
+        now_utc=now,
+        yes_quote=yes_quote,
+        no_quote=no_quote,
+        yes_tick_size=0.01,
+        no_tick_size=0.01,
+    )
+    fill_prices = {fill.token_id: fill.fill_price for fill in result.fills}
+    assert fill_prices["yes-token"] == 0.42
+    assert fill_prices["no-token"] == 0.52
+
+
+def test_paper_order_router_partial_fill_when_partial_enabled() -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    router = PaperOrderRouter(
+        order_size_usdc=10.0,
+        stale_quote_ms=5000,
+        allow_partial_fills=True,
+        base_fill_probability=1.0,
+    )
+    signal = ArbSignal.new(
+        market_id="market-1",
+        slug="sample",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        ask_yes=0.4,
+        ask_no=0.5,
+        threshold=0.98,
+        detected_at=now,
+        reason="sum_ask_le_threshold",
+    )
+    yes_quote = BestBidAskUpdate(
+        asset_id="yes-token",
+        best_bid=0.39,
+        best_ask=0.4,
+        best_bid_size=10.0,
+        best_ask_size=4.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    no_quote = BestBidAskUpdate(
+        asset_id="no-token",
+        best_bid=0.49,
+        best_ask=0.5,
+        best_bid_size=10.0,
+        best_ask_size=5.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    result = router.execute_signal(
+        signal=signal,
+        now_utc=now,
+        yes_quote=yes_quote,
+        no_quote=no_quote,
+    )
+    assert result.accepted
+    assert result.fill_status == "partial_both"
+    assert len(result.fills) == 2
+
+
+def test_paper_order_router_one_leg_only_when_other_leg_depth_zero() -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    router = PaperOrderRouter(
+        order_size_usdc=10.0,
+        stale_quote_ms=5000,
+        allow_partial_fills=True,
+        base_fill_probability=1.0,
+    )
+    signal = ArbSignal.new(
+        market_id="market-1",
+        slug="sample",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        ask_yes=0.4,
+        ask_no=0.5,
+        threshold=0.98,
+        detected_at=now,
+        reason="sum_ask_le_threshold",
+    )
+    yes_quote = BestBidAskUpdate(
+        asset_id="yes-token",
+        best_bid=0.39,
+        best_ask=0.4,
+        best_bid_size=10.0,
+        best_ask_size=5.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    no_quote = BestBidAskUpdate(
+        asset_id="no-token",
+        best_bid=0.49,
+        best_ask=0.5,
+        best_bid_size=10.0,
+        best_ask_size=0.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    result = router.execute_signal(
+        signal=signal,
+        now_utc=now,
+        yes_quote=yes_quote,
+        no_quote=no_quote,
+    )
+    assert not result.accepted
+    assert result.fill_status == "one_leg_yes_only"
+    assert len(result.fills) == 1
