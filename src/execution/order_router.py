@@ -5,6 +5,7 @@ from datetime import datetime
 
 from src.domain.order import FillEvent, PaperOrder
 from src.domain.signal import ArbSignal
+from src.execution.fill_model import FillModelConfig, PaperFillModel
 from src.execution.quote_manager import BestBidAskUpdate
 
 
@@ -15,6 +16,11 @@ class PaperExecutionResult:
     estimated_final_pnl: float
     accepted: bool
     rejection_reason: str | None
+    fill_status: str
+    quote_age_ms: float
+    fill_probability_score: float
+    signal_edge_after_slippage: float
+    partial_fill: bool
 
 
 class PaperOrderRouter:
@@ -23,10 +29,22 @@ class PaperOrderRouter:
         order_size_usdc: float,
         min_book_size: float = 0.0,
         stale_quote_ms: int = 3_000,
+        fill_latency_ms: int = 300,
+        slip_ticks: int = 1,
+        base_fill_probability: float = 0.95,
+        allow_partial_fills: bool = True,
     ) -> None:
         self.order_size_usdc = order_size_usdc
-        self.min_book_size = max(0.0, min_book_size)
-        self.stale_quote_ms = max(0, stale_quote_ms)
+        self.fill_model = PaperFillModel(
+            FillModelConfig(
+                stale_quote_ms=max(0, stale_quote_ms),
+                min_book_size=max(0.0, min_book_size),
+                fill_latency_ms=max(0, fill_latency_ms),
+                slip_ticks=max(0, slip_ticks),
+                base_fill_probability=max(0.0, min(1.0, base_fill_probability)),
+                allow_partial_fills=allow_partial_fills,
+            )
+        )
 
     def execute_signal(
         self,
@@ -34,113 +52,117 @@ class PaperOrderRouter:
         now_utc: datetime,
         yes_quote: BestBidAskUpdate | None = None,
         no_quote: BestBidAskUpdate | None = None,
+        yes_tick_size: float | None = None,
+        no_tick_size: float | None = None,
     ) -> PaperExecutionResult:
         if signal.sum_ask <= 0:
             raise ValueError("sum_ask must be positive")
 
-        if yes_quote is not None or no_quote is not None:
-            quote_validation = self._validate_quotes(
-                yes_quote=yes_quote,
-                no_quote=no_quote,
-                now_utc=now_utc,
+        if yes_quote is None and no_quote is None:
+            yes_quote, no_quote = self._fallback_quotes_from_signal(signal=signal, now_utc=now_utc)
+
+        fill_decision = self.fill_model.evaluate(
+            signal=signal,
+            now_utc=now_utc,
+            yes_quote=yes_quote,
+            no_quote=no_quote,
+            yes_tick_size=yes_tick_size,
+            no_tick_size=no_tick_size,
+            default_order_size_usdc=self.order_size_usdc,
+        )
+
+        orders: list[PaperOrder] = []
+        fills: list[FillEvent] = []
+
+        if fill_decision.yes_leg.filled_qty > 0 and fill_decision.yes_leg.fill_price is not None:
+            yes_order = PaperOrder.new(
+                signal_id=signal.signal_id,
+                market_id=signal.market_id,
+                token_id=signal.yes_token_id,
+                side="BUY",
+                quantity=fill_decision.yes_leg.filled_qty,
+                limit_price=fill_decision.yes_leg.fill_price,
+                created_at=now_utc,
+                status=fill_decision.yes_leg.status,
             )
-            if quote_validation is not None:
-                return PaperExecutionResult(
-                    orders=[],
-                    fills=[],
-                    estimated_final_pnl=0.0,
-                    accepted=False,
-                    rejection_reason=quote_validation,
+            orders.append(yes_order)
+            fills.append(
+                FillEvent.new(
+                    order_id=yes_order.order_id,
+                    signal_id=signal.signal_id,
+                    market_id=signal.market_id,
+                    token_id=signal.yes_token_id,
+                    filled_qty=fill_decision.yes_leg.filled_qty,
+                    fill_price=fill_decision.yes_leg.fill_price,
+                    filled_at=now_utc,
                 )
+            )
 
-        qty = self.order_size_usdc / signal.sum_ask
-        if yes_quote is not None and no_quote is not None:
-            if yes_quote.best_ask_size is None or no_quote.best_ask_size is None:
-                return PaperExecutionResult(
-                    orders=[],
-                    fills=[],
-                    estimated_final_pnl=0.0,
-                    accepted=False,
-                    rejection_reason="missing_book_size",
+        if fill_decision.no_leg.filled_qty > 0 and fill_decision.no_leg.fill_price is not None:
+            no_order = PaperOrder.new(
+                signal_id=signal.signal_id,
+                market_id=signal.market_id,
+                token_id=signal.no_token_id,
+                side="BUY",
+                quantity=fill_decision.no_leg.filled_qty,
+                limit_price=fill_decision.no_leg.fill_price,
+                created_at=now_utc,
+                status=fill_decision.no_leg.status,
+            )
+            orders.append(no_order)
+            fills.append(
+                FillEvent.new(
+                    order_id=no_order.order_id,
+                    signal_id=signal.signal_id,
+                    market_id=signal.market_id,
+                    token_id=signal.no_token_id,
+                    filled_qty=fill_decision.no_leg.filled_qty,
+                    fill_price=fill_decision.no_leg.fill_price,
+                    filled_at=now_utc,
                 )
-            if yes_quote.best_ask_size < qty or no_quote.best_ask_size < qty:
-                return PaperExecutionResult(
-                    orders=[],
-                    fills=[],
-                    estimated_final_pnl=0.0,
-                    accepted=False,
-                    rejection_reason="insufficient_book_size_for_qty",
-                )
+            )
 
-        yes_order = PaperOrder.new(
-            signal_id=signal.signal_id,
-            market_id=signal.market_id,
-            token_id=signal.yes_token_id,
-            side="BUY",
-            quantity=qty,
-            limit_price=signal.ask_yes,
-            created_at=now_utc,
-        )
-        no_order = PaperOrder.new(
-            signal_id=signal.signal_id,
-            market_id=signal.market_id,
-            token_id=signal.no_token_id,
-            side="BUY",
-            quantity=qty,
-            limit_price=signal.ask_no,
-            created_at=now_utc,
-        )
+        matched_qty = min(fill_decision.yes_leg.filled_qty, fill_decision.no_leg.filled_qty)
+        estimated_final_pnl = matched_qty * max(0.0, 1.0 - (signal.ask_yes + signal.ask_no))
 
-        yes_fill = FillEvent.new(
-            order_id=yes_order.order_id,
-            signal_id=signal.signal_id,
-            market_id=signal.market_id,
-            token_id=signal.yes_token_id,
-            filled_qty=qty,
-            fill_price=signal.ask_yes,
-            filled_at=now_utc,
-        )
-        no_fill = FillEvent.new(
-            order_id=no_order.order_id,
-            signal_id=signal.signal_id,
-            market_id=signal.market_id,
-            token_id=signal.no_token_id,
-            filled_qty=qty,
-            fill_price=signal.ask_no,
-            filled_at=now_utc,
-        )
-
-        estimated_final_pnl = qty * (1.0 - signal.sum_ask)
+        quote_age_ms = max(fill_decision.yes_leg.quote_age_ms, fill_decision.no_leg.quote_age_ms)
+        partial_fill = fill_decision.fill_status.startswith("partial")
         return PaperExecutionResult(
-            orders=[yes_order, no_order],
-            fills=[yes_fill, no_fill],
+            orders=orders,
+            fills=fills,
             estimated_final_pnl=estimated_final_pnl,
-            accepted=True,
-            rejection_reason=None,
+            accepted=fill_decision.accepted,
+            rejection_reason=fill_decision.reject_reason,
+            fill_status=fill_decision.fill_status,
+            quote_age_ms=quote_age_ms,
+            fill_probability_score=fill_decision.fill_probability_score,
+            signal_edge_after_slippage=fill_decision.signal_edge_after_slippage,
+            partial_fill=partial_fill,
         )
 
-    def _validate_quotes(
+    def _fallback_quotes_from_signal(
         self,
-        yes_quote: BestBidAskUpdate | None,
-        no_quote: BestBidAskUpdate | None,
+        signal: ArbSignal,
         now_utc: datetime,
-    ) -> str | None:
-        if yes_quote is None or no_quote is None:
-            return "missing_one_or_both_quotes"
-        if yes_quote.best_ask is None or no_quote.best_ask is None:
-            return "missing_best_ask"
-        if self._is_stale(yes_quote, now_utc) or self._is_stale(no_quote, now_utc):
-            return "stale_quote"
-        if self.min_book_size > 0:
-            if yes_quote.best_ask_size is None or no_quote.best_ask_size is None:
-                return "missing_book_size"
-            if (
-                yes_quote.best_ask_size < self.min_book_size
-                or no_quote.best_ask_size < self.min_book_size
-            ):
-                return "min_book_size_not_met"
-        return None
-
-    def _is_stale(self, quote: BestBidAskUpdate, now_utc: datetime) -> bool:
-        quote_age_ms = (now_utc - quote.timestamp).total_seconds() * 1000.0
-        return quote_age_ms > self.stale_quote_ms
+    ) -> tuple[BestBidAskUpdate, BestBidAskUpdate]:
+        # Keep compatibility for unit-tests that execute ArbSignal without quote snapshots.
+        fallback_qty = max(1.0, self.order_size_usdc / max(signal.sum_ask, 1e-9))
+        yes_quote = BestBidAskUpdate(
+            asset_id=signal.yes_token_id,
+            best_bid=signal.bid_yes,
+            best_ask=signal.ask_yes,
+            best_bid_size=signal.size_yes or fallback_qty * 2.0,
+            best_ask_size=signal.size_yes or fallback_qty * 2.0,
+            event_type="fallback_signal_quote",
+            timestamp=now_utc,
+        )
+        no_quote = BestBidAskUpdate(
+            asset_id=signal.no_token_id,
+            best_bid=signal.bid_no,
+            best_ask=signal.ask_no,
+            best_bid_size=signal.size_no or fallback_qty * 2.0,
+            best_ask_size=signal.size_no or fallback_qty * 2.0,
+            event_type="fallback_signal_quote",
+            timestamp=now_utc,
+        )
+        return yes_quote, no_quote

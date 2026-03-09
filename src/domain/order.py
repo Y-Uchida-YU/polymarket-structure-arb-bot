@@ -27,6 +27,7 @@ class PaperOrder:
         quantity: float,
         limit_price: float,
         created_at: datetime,
+        status: str = "filled",
     ) -> PaperOrder:
         return cls(
             order_id=str(uuid4()),
@@ -36,7 +37,7 @@ class PaperOrder:
             side=side,
             quantity=quantity,
             limit_price=limit_price,
-            status="filled",
+            status=status,
             created_at=created_at,
         )
 

@@ -18,6 +18,8 @@ class MarketWebSocketClient:
         on_message: Callable[[str], Awaitable[None]],
         logger: logging.Logger,
         get_asset_ids: Callable[[], list[str]] | None = None,
+        on_connected: Callable[[list[str]], Awaitable[None]] | None = None,
+        on_reconnect_required: Callable[[str], None] | None = None,
         reconnect_base_seconds: float = 2.0,
         reconnect_max_seconds: float = 30.0,
         ping_interval_seconds: int = 20,
@@ -27,6 +29,8 @@ class MarketWebSocketClient:
         self.asset_ids = asset_ids
         self.get_asset_ids = get_asset_ids
         self.on_message = on_message
+        self.on_connected = on_connected
+        self.on_reconnect_required = on_reconnect_required
         self.logger = logger
         self.reconnect_base_seconds = reconnect_base_seconds
         self.reconnect_max_seconds = reconnect_max_seconds
@@ -72,11 +76,15 @@ class MarketWebSocketClient:
         ) as ws:
             self.logger.info("WebSocket connected: %s", self.url)
             await self._subscribe(ws, current_asset_ids)
+            if self.on_connected is not None:
+                await self.on_connected(current_asset_ids)
 
             while not stop_event.is_set():
                 if resubscribe_event is not None and resubscribe_event.is_set():
                     resubscribe_event.clear()
                     self.logger.info("Resubscribe requested, reconnecting websocket.")
+                    if self.on_reconnect_required is not None:
+                        self.on_reconnect_required("asset_universe_changed")
                     return
 
                 try:
@@ -86,9 +94,13 @@ class MarketWebSocketClient:
                     )
                 except TimeoutError:
                     self.logger.warning("WebSocket receive timeout. Reconnecting.")
+                    if self.on_reconnect_required is not None:
+                        self.on_reconnect_required("ws_receive_timeout")
                     return
                 except ConnectionClosed:
                     self.logger.warning("WebSocket closed by remote. Reconnecting.")
+                    if self.on_reconnect_required is not None:
+                        self.on_reconnect_required("ws_closed")
                     return
 
                 if isinstance(raw_message, bytes):

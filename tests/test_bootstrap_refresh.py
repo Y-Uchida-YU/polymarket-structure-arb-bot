@@ -6,6 +6,8 @@ from pathlib import Path
 
 from src.app.bootstrap import PolymarketStructureArbApp
 from src.config.loader import AppConfig, MarketsConfig, Settings
+from src.domain.book import BookSummary, TickSizeUpdate
+from src.utils.clock import utc_now
 
 
 class FakeGammaClient:
@@ -21,6 +23,33 @@ class FakeGammaClient:
         response = self.responses[min(self.index, len(self.responses) - 1)]
         self.index += 1
         return response
+
+
+class FakeTickSizeClient:
+    async def fetch_tick_size(self, token_id: str) -> TickSizeUpdate:
+        return TickSizeUpdate(
+            asset_id=token_id,
+            tick_size=0.01,
+            updated_at=utc_now(),
+            source="test",
+        )
+
+
+class FakeBookClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def fetch_book_summary(self, asset_id: str) -> BookSummary:
+        self.calls.append(asset_id)
+        return BookSummary(
+            asset_id=asset_id,
+            best_bid=0.48,
+            best_ask=0.5,
+            best_bid_size=100.0,
+            best_ask_size=100.0,
+            timestamp=utc_now(),
+            source="test_book",
+        )
 
 
 def make_raw_market(
@@ -70,6 +99,7 @@ def test_market_refresh_updates_internal_market_map(tmp_path: Path) -> None:
 
     config = make_config(tmp_path)
     app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
     app.gamma_client = FakeGammaClient(
         responses=[
             [
@@ -92,5 +122,68 @@ def test_market_refresh_updates_internal_market_map(tmp_path: Path) -> None:
     assert set(app.markets_by_id.keys()) == {"m1", "m2"}
     assert app.token_to_market_side["yes1"] == ("m1", "yes")
     assert app.token_to_market_side["no2"] == ("m2", "no")
+
+    asyncio.run(app.shutdown())
+
+
+def test_ws_connected_triggers_resync(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_resync_on_connect")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    config = make_config(tmp_path)
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    asyncio.run(app.on_ws_connected(["yes1", "no1"]))
+
+    yes_quote, no_quote = app.quote_manager.get_market_quotes("m1")
+    assert yes_quote is not None
+    assert no_quote is not None
+    assert isinstance(app.book_client, FakeBookClient)
+    assert set(app.book_client.calls) == {"yes1", "no1"}
+
+    asyncio.run(app.shutdown())
+
+
+def test_missing_state_triggers_resync_in_freshness_check(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_freshness_resync")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={"market_refresh_minutes": 1, "stale_asset_ms": 1},
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert isinstance(app.book_client, FakeBookClient)
+    assert "yes1" in app.book_client.calls
+    assert "no1" in app.book_client.calls
+    assert app.state.safe_mode_active
 
     asyncio.run(app.shutdown())
