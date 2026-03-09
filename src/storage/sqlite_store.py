@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from src.domain.accounting import InventorySnapshot, PnLSnapshot
 from src.domain.book import TickSizeUpdate
 from src.domain.market import BinaryMarket
 from src.domain.order import FillEvent, PaperOrder
@@ -106,7 +107,31 @@ class SQLiteStore:
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   signal_id TEXT NOT NULL,
                   market_id TEXT NOT NULL,
-                  estimated_final_pnl REAL NOT NULL,
+                  market_slug TEXT NOT NULL DEFAULT '',
+                  estimated_final_pnl REAL NOT NULL DEFAULT 0,
+                  estimated_edge_at_signal REAL NOT NULL DEFAULT 0,
+                  projected_matched_pnl REAL NOT NULL DEFAULT 0,
+                  unmatched_inventory_mtm REAL NOT NULL DEFAULT 0,
+                  total_projected_pnl REAL NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL
+                )
+                """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS inventory_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  signal_id TEXT NOT NULL,
+                  market_id TEXT NOT NULL,
+                  market_slug TEXT NOT NULL,
+                  yes_filled_qty REAL NOT NULL,
+                  no_filled_qty REAL NOT NULL,
+                  matched_qty REAL NOT NULL,
+                  unmatched_yes_qty REAL NOT NULL,
+                  unmatched_no_qty REAL NOT NULL,
+                  avg_fill_price_yes REAL NOT NULL,
+                  avg_fill_price_no REAL NOT NULL,
+                  yes_mark_price REAL NOT NULL,
+                  no_mark_price REAL NOT NULL,
+                  valuation_mode TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 )
                 """)
@@ -168,6 +193,12 @@ class SQLiteStore:
         self._ensure_column("signals", "fill_status", "TEXT")
         self._ensure_column("signals", "reject_reason", "TEXT")
         self._ensure_column("signals", "resync_reason", "TEXT")
+        self._ensure_column("pnl_snapshots", "market_slug", "TEXT DEFAULT ''")
+        self._ensure_column("pnl_snapshots", "estimated_final_pnl", "REAL DEFAULT 0")
+        self._ensure_column("pnl_snapshots", "estimated_edge_at_signal", "REAL DEFAULT 0")
+        self._ensure_column("pnl_snapshots", "projected_matched_pnl", "REAL DEFAULT 0")
+        self._ensure_column("pnl_snapshots", "unmatched_inventory_mtm", "REAL DEFAULT 0")
+        self._ensure_column("pnl_snapshots", "total_projected_pnl", "REAL DEFAULT 0")
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str) -> None:
         cursor = self.conn.execute(f"PRAGMA table_info({table_name})")
@@ -357,24 +388,73 @@ class SQLiteStore:
                 ),
             )
 
-    def save_pnl_snapshot(
-        self,
-        signal_id: str,
-        market_id: str,
-        estimated_final_pnl: float,
-        created_at_iso: str,
-    ) -> None:
+    def save_pnl_snapshot(self, snapshot: PnLSnapshot) -> None:
         with self.conn:
             self.conn.execute(
                 """
-                INSERT INTO pnl_snapshots (signal_id, market_id, estimated_final_pnl, created_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO pnl_snapshots (
+                  signal_id,
+                  market_id,
+                  market_slug,
+                  estimated_final_pnl,
+                  estimated_edge_at_signal,
+                  projected_matched_pnl,
+                  unmatched_inventory_mtm,
+                  total_projected_pnl,
+                  created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    signal_id,
-                    market_id,
-                    estimated_final_pnl,
-                    created_at_iso,
+                    snapshot.signal_id,
+                    snapshot.market_id,
+                    snapshot.market_slug,
+                    snapshot.total_projected_pnl,
+                    snapshot.estimated_edge_at_signal,
+                    snapshot.projected_matched_pnl,
+                    snapshot.unmatched_inventory_mtm,
+                    snapshot.total_projected_pnl,
+                    snapshot.timestamp.isoformat(),
+                ),
+            )
+
+    def save_inventory_snapshot(self, snapshot: InventorySnapshot) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO inventory_snapshots (
+                  signal_id,
+                  market_id,
+                  market_slug,
+                  yes_filled_qty,
+                  no_filled_qty,
+                  matched_qty,
+                  unmatched_yes_qty,
+                  unmatched_no_qty,
+                  avg_fill_price_yes,
+                  avg_fill_price_no,
+                  yes_mark_price,
+                  no_mark_price,
+                  valuation_mode,
+                  created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot.signal_id,
+                    snapshot.market_id,
+                    snapshot.market_slug,
+                    snapshot.yes_filled_qty,
+                    snapshot.no_filled_qty,
+                    snapshot.matched_qty,
+                    snapshot.unmatched_yes_qty,
+                    snapshot.unmatched_no_qty,
+                    snapshot.avg_fill_price_yes,
+                    snapshot.avg_fill_price_no,
+                    snapshot.yes_mark_price,
+                    snapshot.no_mark_price,
+                    snapshot.valuation_mode,
+                    snapshot.timestamp.isoformat(),
                 ),
             )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.domain.accounting import InventorySnapshot, PnLSnapshot
 from src.domain.signal import ArbSignal
 from src.storage.csv_logger import CsvEventLogger
 from src.storage.sqlite_store import SQLiteStore
@@ -106,3 +107,105 @@ def test_sqlite_signal_store_persists_v3_columns(tmp_path: Path) -> None:
     assert row[11] == "ws_connected"
 
     store.close()
+
+
+def test_pnl_and_inventory_snapshots_are_persisted(tmp_path: Path) -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    store = SQLiteStore(db_path=tmp_path / "state.db")
+    pnl_snapshot = PnLSnapshot(
+        signal_id="sig-1",
+        market_id="m1",
+        market_slug="market-1",
+        timestamp=now,
+        estimated_edge_at_signal=0.02,
+        projected_matched_pnl=1.5,
+        unmatched_inventory_mtm=-0.4,
+        total_projected_pnl=1.1,
+    )
+    inventory_snapshot = InventorySnapshot(
+        signal_id="sig-1",
+        market_id="m1",
+        market_slug="market-1",
+        timestamp=now,
+        yes_filled_qty=5.0,
+        no_filled_qty=4.0,
+        matched_qty=4.0,
+        unmatched_yes_qty=1.0,
+        unmatched_no_qty=0.0,
+        avg_fill_price_yes=0.46,
+        avg_fill_price_no=0.5,
+        yes_mark_price=0.43,
+        no_mark_price=0.49,
+        valuation_mode="best_bid",
+    )
+    store.save_pnl_snapshot(pnl_snapshot)
+    store.save_inventory_snapshot(inventory_snapshot)
+
+    pnl_row = store.conn.execute(
+        """
+        SELECT
+          estimated_edge_at_signal,
+          projected_matched_pnl,
+          unmatched_inventory_mtm,
+          total_projected_pnl
+        FROM pnl_snapshots
+        WHERE signal_id = ?
+        """,
+        ("sig-1",),
+    ).fetchone()
+    inventory_row = store.conn.execute(
+        """
+        SELECT matched_qty, unmatched_yes_qty, unmatched_no_qty, avg_fill_price_yes, valuation_mode
+        FROM inventory_snapshots
+        WHERE signal_id = ?
+        """,
+        ("sig-1",),
+    ).fetchone()
+    assert pnl_row is not None
+    assert pnl_row[0] == 0.02
+    assert pnl_row[3] == 1.1
+    assert inventory_row is not None
+    assert inventory_row[0] == 4.0
+    assert inventory_row[1] == 1.0
+    assert inventory_row[4] == "best_bid"
+
+    store.close()
+
+
+def test_csv_logger_writes_inventory_and_pnl_breakdown_columns(tmp_path: Path) -> None:
+    logger = CsvEventLogger(export_dir=tmp_path)
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    logger.log_inventory(
+        {
+            "signal_id": "sig-1",
+            "market_id": "m1",
+            "market_slug": "market-1",
+            "timestamp": now.isoformat(),
+            "matched_qty": 4.0,
+            "unmatched_yes_qty": 1.0,
+            "unmatched_no_qty": 0.0,
+        },
+        now_utc=now,
+    )
+    logger.log_pnl(
+        {
+            "signal_id": "sig-1",
+            "market_id": "m1",
+            "estimated_edge_at_signal": 0.02,
+            "projected_matched_pnl": 1.5,
+            "unmatched_inventory_mtm": -0.4,
+            "total_projected_pnl": 1.1,
+        },
+        now_utc=now,
+    )
+
+    inventory_file = list(tmp_path.glob("inventory_*.csv"))[0]
+    pnl_file = list(tmp_path.glob("pnl_*.csv"))[0]
+    inventory_header = inventory_file.read_text(encoding="utf-8").splitlines()[0]
+    pnl_header = pnl_file.read_text(encoding="utf-8").splitlines()[0]
+    assert "matched_qty" in inventory_header
+    assert "unmatched_yes_qty" in inventory_header
+    assert "estimated_edge_at_signal" in pnl_header
+    assert "projected_matched_pnl" in pnl_header
+    assert "unmatched_inventory_mtm" in pnl_header
+    assert "total_projected_pnl" in pnl_header
