@@ -149,6 +149,10 @@ python -m src.main report --last-hours 24 --run-id <run_id>
   - strategy thresholds / risk limits
   - stale thresholds / refresh interval
   - output directories
+- 起動直後の warm-up 保護
+  - `runtime.initial_market_data_grace_ms` の間は stale guard を保留
+  - WebSocket 未接続時は `all_assets_stale` による safe mode を発動しない
+  - 初回 quote 未受信 asset は warm-up 中として扱い、grace 経過後に stale 判定へ移行
 - 定期 snapshot を保存
 - guardrail 異常時は safe mode（新規 signal 停止）へ移行
 

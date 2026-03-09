@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from src.app.bootstrap import PolymarketStructureArbApp
@@ -150,6 +151,8 @@ def test_ws_connected_triggers_resync(tmp_path: Path) -> None:
     yes_quote, no_quote = app.quote_manager.get_market_quotes("m1")
     assert yes_quote is not None
     assert no_quote is not None
+    assert app.state.ws_connected_at is not None
+    assert app.state.subscription_started_at is not None
     assert isinstance(app.book_client, FakeBookClient)
     assert set(app.book_client.calls) == {"yes1", "no1"}
 
@@ -164,7 +167,53 @@ def test_missing_state_triggers_resync_in_freshness_check(tmp_path: Path) -> Non
 
     settings = Settings(
         storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
-        runtime={"market_refresh_minutes": 1, "stale_asset_ms": 1},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    app.state.ws_connected_at = datetime.now(tz=UTC)
+    app.state.subscription_started_at = datetime.now(tz=UTC) - timedelta(milliseconds=5)
+    app.state.first_quote_received_at = None
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert isinstance(app.book_client, FakeBookClient)
+    assert "yes1" in app.book_client.calls
+    assert "no1" in app.book_client.calls
+    assert app.state.safe_mode_active
+
+    asyncio.run(app.shutdown())
+
+
+def test_startup_without_ws_connection_does_not_enter_all_assets_stale_safe_mode(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_warmup_without_ws")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 60_000,
+        },
     )
     config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
     app = PolymarketStructureArbApp(config=config, logger=logger)
@@ -182,8 +231,50 @@ def test_missing_state_triggers_resync_in_freshness_check(tmp_path: Path) -> Non
     asyncio.run(app.check_data_freshness_and_resync())
 
     assert isinstance(app.book_client, FakeBookClient)
-    assert "yes1" in app.book_client.calls
-    assert "no1" in app.book_client.calls
-    assert app.state.safe_mode_active
+    assert app.book_client.calls == []
+    assert app.state.safe_mode_active is False
+    assert app.state.safe_mode_reason is None
+    assert app.state.stale_assets == set()
+
+    asyncio.run(app.shutdown())
+
+
+def test_ws_connected_within_grace_does_not_enter_safe_mode(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_warmup_with_grace")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    app.state.ws_connected_at = datetime.now(tz=UTC)
+    app.state.subscription_started_at = datetime.now(tz=UTC)
+    app.state.first_quote_received_at = None
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert isinstance(app.book_client, FakeBookClient)
+    assert app.book_client.calls == []
+    assert app.state.safe_mode_active is False
+    assert app.state.safe_mode_reason is None
+    assert app.state.stale_assets == set()
 
     asyncio.run(app.shutdown())

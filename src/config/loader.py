@@ -63,6 +63,7 @@ class RuntimeSettings(BaseModel):
     websocket_ping_timeout_seconds: int = 20
     market_refresh_minutes: int = 60
     stale_asset_ms: int = 15_000
+    initial_market_data_grace_ms: int = 30_000
     book_resync_idle_ms: int = 20_000
     resync_batch_size: int = 100
     snapshot_interval_minutes: int = 60

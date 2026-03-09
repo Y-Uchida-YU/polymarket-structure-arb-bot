@@ -71,6 +71,9 @@ class AppState:
     safe_mode_reason: str | None = None
     safe_mode_entered_at: datetime | None = None
     safe_mode_count: int = 0
+    ws_connected_at: datetime | None = None
+    subscription_started_at: datetime | None = None
+    first_quote_received_at: datetime | None = None
     last_ws_idle_resync_ts: float = 0.0
     run_id: str = field(default_factory=lambda: uuid4().hex)
     run_started_at: datetime = field(default_factory=utc_now)
@@ -229,6 +232,8 @@ class PolymarketStructureArbApp:
 
             if not updates:
                 return
+            if self.state.first_quote_received_at is None:
+                self.state.first_quote_received_at = now
 
             for update in updates:
                 self.healthcheck.on_ws_message(now)
@@ -638,7 +643,27 @@ class PolymarketStructureArbApp:
             self._evaluate_guardrails(now_utc=now, stale_asset_rate=self._stale_asset_rate())
 
     async def on_ws_connected(self, asset_ids: list[str]) -> None:
+        now = utc_now()
+        self.state.ws_connected_at = now
+        self.state.subscription_started_at = now
         await self.resync_assets(asset_ids=asset_ids, reason="ws_connected")
+
+    def _market_data_warmup_state(self, now_utc: datetime) -> tuple[bool, str]:
+        if self.state.ws_connected_at is None:
+            return True, "ws_not_connected"
+        if self.state.first_quote_received_at is not None:
+            return False, "ready"
+        if self.state.subscription_started_at is None:
+            return True, "waiting_subscription_start"
+
+        grace_ms = max(0, self.config.settings.runtime.initial_market_data_grace_ms)
+        elapsed_ms = max(
+            0.0,
+            (now_utc - self.state.subscription_started_at).total_seconds() * 1000.0,
+        )
+        if elapsed_ms < grace_ms:
+            return True, "waiting_initial_market_data_grace"
+        return False, "grace_elapsed"
 
     def on_ws_reconnect_required(self, reason: str) -> None:
         self.logger.warning("WebSocket reconnect requested reason=%s", reason)
@@ -687,6 +712,36 @@ class PolymarketStructureArbApp:
             },
             now_utc=now,
         )
+        is_warming_up, warmup_reason = self._market_data_warmup_state(now)
+        if is_warming_up:
+            warming_up_assets = [
+                asset_id
+                for asset_id in tracked_assets
+                if asset_id not in self.healthcheck.state.asset_last_update_at
+            ]
+            self.state.stale_assets = set()
+            self.sqlite_store.save_metric(
+                metric_name="warming_up_asset_count",
+                metric_value=float(len(warming_up_assets)),
+                details=warmup_reason,
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": "warming_up_asset_count",
+                    "metric_value": len(warming_up_assets),
+                    "warmup_reason": warmup_reason,
+                },
+                now_utc=now,
+            )
+            if self.state.safe_mode_reason == "all_assets_stale":
+                self._maybe_exit_safe_mode(now)
+            self._evaluate_guardrails(now_utc=now, stale_asset_rate=0.0)
+            return
+
         stale_assets = self.healthcheck.stale_assets(
             tracked_assets=tracked_assets,
             now_utc=now,

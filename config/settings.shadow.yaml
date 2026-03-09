@@ -43,6 +43,7 @@ runtime:
   websocket_ping_timeout_seconds: 20
   market_refresh_minutes: 30
   stale_asset_ms: 12000
+  initial_market_data_grace_ms: 45000
   book_resync_idle_ms: 20000
   resync_batch_size: 80
   snapshot_interval_minutes: 60
