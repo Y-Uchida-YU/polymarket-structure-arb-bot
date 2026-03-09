@@ -7,6 +7,7 @@ from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+from src.app.scheduler import run_periodic
 from src.clients.gamma_client import GammaClient
 from src.clients.ws_client import MarketWebSocketClient
 from src.config.loader import AppConfig, load_app_config
@@ -59,6 +60,12 @@ class AppState:
     last_signal_at_by_market: dict[str, float]
 
 
+@dataclass(slots=True)
+class MarketLoadResult:
+    market_count: int
+    asset_ids_changed: bool
+
+
 class PolymarketStructureArbApp:
     def __init__(self, config: AppConfig, logger: logging.Logger) -> None:
         self.config = config
@@ -81,7 +88,11 @@ class PolymarketStructureArbApp:
             max_daily_signals=config.settings.risk.max_daily_signals,
             expiry_block_minutes=config.settings.strategy.expiry_block_minutes,
         )
-        self.order_router = PaperOrderRouter(order_size_usdc=config.settings.risk.paper_order_size_usdc)
+        self.order_router = PaperOrderRouter(
+            order_size_usdc=config.settings.risk.paper_order_size_usdc,
+            min_book_size=config.settings.risk.min_book_size,
+            stale_quote_ms=config.settings.risk.stale_quote_ms,
+        )
         self.csv_logger = CsvEventLogger(export_dir=config.export_dir)
         self.sqlite_store = SQLiteStore(db_path=config.sqlite_path)
         self.exposure = ExposureManager()
@@ -94,8 +105,10 @@ class PolymarketStructureArbApp:
         self.quote_manager = QuoteManager(token_to_market_side={})
         self.state = AppState(last_signal_at_by_market={})
         self.stop_event = asyncio.Event()
+        self.resubscribe_event = asyncio.Event()
 
-    async def load_markets(self) -> int:
+    async def load_markets(self) -> MarketLoadResult:
+        previous_asset_ids = set(self.token_to_market_side.keys())
         raw_markets = await self.gamma_client.fetch_active_markets(
             page_size=self.config.settings.api.gamma_page_size,
             max_pages=self.config.settings.api.gamma_max_pages,
@@ -114,14 +127,20 @@ class PolymarketStructureArbApp:
             self.sqlite_store.upsert_market(market, updated_at_iso=utc_now().isoformat())
 
         self.token_to_market_side = token_to_market_side
-        self.quote_manager = QuoteManager(token_to_market_side=token_to_market_side)
+        self.quote_manager.update_token_mapping(token_to_market_side)
+        current_asset_ids = set(token_to_market_side.keys())
+        asset_ids_changed = bool(previous_asset_ids) and previous_asset_ids != current_asset_ids
         self.logger.info(
-            "Loaded raw_markets=%s binary_markets=%s subscribed_assets=%s",
+            "Loaded raw_markets=%s binary_markets=%s subscribed_assets=%s changed=%s",
             len(raw_markets),
             len(binary_markets),
             len(token_to_market_side),
+            asset_ids_changed,
         )
-        return len(binary_markets)
+        return MarketLoadResult(
+            market_count=len(binary_markets),
+            asset_ids_changed=asset_ids_changed,
+        )
 
     async def handle_ws_message(self, raw_message: str) -> None:
         now = utc_now()
@@ -173,7 +192,11 @@ class PolymarketStructureArbApp:
             self.healthcheck.on_error(now)
             error_text = f"{type(exc).__name__}: {exc}"
             self.logger.exception("Failed to process ws message: %s", error_text)
-            self.sqlite_store.save_error(stage="ws_message", error_message=error_text, created_at_iso=now.isoformat())
+            self.sqlite_store.save_error(
+                stage="ws_message",
+                error_message=error_text,
+                created_at_iso=now.isoformat(),
+            )
             self.csv_logger.log_error(
                 {
                     "created_at": now.isoformat(),
@@ -222,7 +245,36 @@ class PolymarketStructureArbApp:
         )
 
     def _execute_paper_trade(self, signal: ArbSignal, now: datetime) -> None:
-        result = self.order_router.execute_signal(signal=signal, now_utc=now)
+        yes_quote, no_quote = self.quote_manager.get_market_quotes(signal.market_id)
+        result = self.order_router.execute_signal(
+            signal=signal,
+            now_utc=now,
+            yes_quote=yes_quote,
+            no_quote=no_quote,
+        )
+        if not result.accepted:
+            rejection_reason = result.rejection_reason or "unknown_rejection"
+            self.logger.info(
+                "Paper trade rejected market=%s signal=%s reason=%s",
+                signal.market_id,
+                signal.signal_id,
+                rejection_reason,
+            )
+            self.sqlite_store.save_error(
+                stage="paper_execution",
+                error_message=rejection_reason,
+                created_at_iso=now.isoformat(),
+            )
+            self.csv_logger.log_error(
+                {
+                    "created_at": now.isoformat(),
+                    "stage": "paper_execution",
+                    "error_message": rejection_reason,
+                },
+                now_utc=now,
+            )
+            return
+
         fills_by_token = {fill.token_id: fill for fill in result.fills}
         yes_fill = fills_by_token.get(signal.yes_token_id)
         no_fill = fills_by_token.get(signal.no_token_id)
@@ -289,9 +341,36 @@ class PolymarketStructureArbApp:
             now_utc=now,
         )
 
+    def get_subscribed_asset_ids(self) -> list[str]:
+        return list(self.token_to_market_side.keys())
+
+    async def refresh_market_universe(self) -> None:
+        try:
+            result = await self.load_markets()
+            if result.asset_ids_changed:
+                self.logger.info("Market universe changed; requesting websocket resubscribe.")
+                self.resubscribe_event.set()
+        except Exception as exc:  # noqa: BLE001
+            now = utc_now()
+            error_text = f"{type(exc).__name__}: {exc}"
+            self.logger.exception("Market refresh failed: %s", error_text)
+            self.sqlite_store.save_error(
+                stage="market_refresh",
+                error_message=error_text,
+                created_at_iso=now.isoformat(),
+            )
+            self.csv_logger.log_error(
+                {
+                    "created_at": now.isoformat(),
+                    "stage": "market_refresh",
+                    "error_message": error_text,
+                },
+                now_utc=now,
+            )
+
     async def run(self, once: bool = False) -> None:
-        market_count = await self.load_markets()
-        if market_count == 0:
+        initial_load_result = await self.load_markets()
+        if initial_load_result.market_count == 0:
             self.notifier.error("No eligible binary markets after filters.")
             return
         if once:
@@ -300,7 +379,8 @@ class PolymarketStructureArbApp:
 
         ws_client = MarketWebSocketClient(
             url=self.config.settings.api.ws_market_url,
-            asset_ids=list(self.token_to_market_side.keys()),
+            asset_ids=[],
+            get_asset_ids=self.get_subscribed_asset_ids,
             on_message=self.handle_ws_message,
             logger=self.logger,
             reconnect_base_seconds=self.config.settings.runtime.reconnect_base_seconds,
@@ -308,7 +388,26 @@ class PolymarketStructureArbApp:
             ping_interval_seconds=self.config.settings.runtime.websocket_ping_interval_seconds,
             ping_timeout_seconds=self.config.settings.runtime.websocket_ping_timeout_seconds,
         )
-        await ws_client.run_forever(stop_event=self.stop_event)
+        refresh_interval_seconds = max(
+            60.0,
+            self.config.settings.runtime.market_refresh_minutes * 60.0,
+        )
+        refresh_task = asyncio.create_task(
+            run_periodic(
+                task=self.refresh_market_universe,
+                interval_seconds=refresh_interval_seconds,
+                stop_event=self.stop_event,
+            )
+        )
+        try:
+            await ws_client.run_forever(
+                stop_event=self.stop_event,
+                resubscribe_event=self.resubscribe_event,
+            )
+        finally:
+            self.stop_event.set()
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
 
     async def shutdown(self) -> None:
         self.sqlite_store.close()

@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
-
-T = TypeVar("T")
 
 
-async def retry_async(
+async def retry_async[T](
     action: Callable[[], Awaitable[T]],
     retries: int = 3,
     base_delay_seconds: float = 0.5,

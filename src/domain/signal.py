@@ -31,7 +31,7 @@ class ArbSignal:
         threshold: float,
         detected_at: datetime,
         reason: str,
-    ) -> "ArbSignal":
+    ) -> ArbSignal:
         return cls(
             signal_id=str(uuid4()),
             market_id=market_id,

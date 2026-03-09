@@ -38,6 +38,31 @@ def parse_json_array_field(value: object) -> list[str]:
     return []
 
 
+def normalize_outcome_label(value: str) -> str:
+    return value.strip().lower()
+
+
+def is_order_book_enabled(raw: dict[str, Any]) -> bool:
+    """
+    Safe-by-default:
+    If `enableOrderBook` is missing, treat the market as not eligible.
+    """
+    if "enableOrderBook" not in raw:
+        return False
+    return parse_bool_field(raw.get("enableOrderBook"))
+
+
+def _parse_yes_no_indices(outcomes: list[str]) -> tuple[int, int] | None:
+    normalized = [normalize_outcome_label(item) for item in outcomes]
+    if len(normalized) != 2:
+        return None
+    yes_indexes = [index for index, outcome in enumerate(normalized) if outcome == "yes"]
+    no_indexes = [index for index, outcome in enumerate(normalized) if outcome == "no"]
+    if len(yes_indexes) != 1 or len(no_indexes) != 1:
+        return None
+    return yes_indexes[0], no_indexes[0]
+
+
 def parse_end_time(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -52,20 +77,20 @@ def parse_end_time(value: object) -> datetime | None:
 
 
 def is_binary_yes_no_market(raw: dict[str, Any]) -> bool:
-    outcomes = [item.strip().lower() for item in parse_json_array_field(raw.get("outcomes"))]
+    outcomes = parse_json_array_field(raw.get("outcomes"))
     token_ids = parse_json_array_field(raw.get("clobTokenIds"))
-    return len(outcomes) == 2 and len(token_ids) == 2 and set(outcomes) == {"yes", "no"}
+    return _parse_yes_no_indices(outcomes) is not None and len(token_ids) == 2
 
 
 def _extract_yes_no_token_ids(raw: dict[str, Any]) -> tuple[str, str] | None:
-    outcomes = [item.strip().lower() for item in parse_json_array_field(raw.get("outcomes"))]
+    outcomes = parse_json_array_field(raw.get("outcomes"))
     token_ids = parse_json_array_field(raw.get("clobTokenIds"))
-    if len(outcomes) != 2 or len(token_ids) != 2:
+    yes_no_indices = _parse_yes_no_indices(outcomes)
+    if yes_no_indices is None or len(token_ids) != 2:
         return None
-    if "yes" not in outcomes or "no" not in outcomes:
-        return None
-    yes_index = outcomes.index("yes")
-    no_index = outcomes.index("no")
+    # Assumption from Gamma market data:
+    # clobTokenIds index order corresponds to outcomes index order.
+    yes_index, no_index = yes_no_indices
     return token_ids[yes_index], token_ids[no_index]
 
 
@@ -136,9 +161,15 @@ def extract_binary_markets(
     for raw in raw_markets:
         if not is_open_market(raw):
             continue
+        if not is_order_book_enabled(raw):
+            continue
         if not is_binary_yes_no_market(raw):
             continue
-        if is_excluded_by_filters(raw, market_filters=market_filters, markets_config=markets_config):
+        if is_excluded_by_filters(
+            raw,
+            market_filters=market_filters,
+            markets_config=markets_config,
+        ):
             continue
 
         token_pair = _extract_yes_no_token_ids(raw)

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from src.domain.signal import ArbSignal
 from src.execution.order_router import PaperOrderRouter
-from src.execution.quote_manager import QuoteManager
+from src.execution.quote_manager import BestBidAskUpdate, QuoteManager
 
 
 def test_quote_manager_ingests_best_bid_ask() -> None:
@@ -42,6 +42,122 @@ def test_paper_order_router_executes_two_leg_fill() -> None:
         reason="sum_ask_le_threshold",
     )
     result = router.execute_signal(signal=signal, now_utc=datetime(2026, 3, 1, tzinfo=UTC))
+    assert result.accepted
     assert len(result.orders) == 2
     assert len(result.fills) == 2
     assert result.estimated_final_pnl > 0
+
+
+def test_paper_order_router_rejects_for_insufficient_book_size() -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    router = PaperOrderRouter(order_size_usdc=10.0, min_book_size=1.0, stale_quote_ms=5000)
+    signal = ArbSignal.new(
+        market_id="market-1",
+        slug="sample",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        ask_yes=0.4,
+        ask_no=0.5,
+        threshold=0.98,
+        detected_at=now,
+        reason="sum_ask_le_threshold",
+    )
+    yes_quote = BestBidAskUpdate(
+        asset_id="yes-token",
+        best_bid=0.39,
+        best_ask=0.4,
+        best_bid_size=10.0,
+        best_ask_size=0.5,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    no_quote = BestBidAskUpdate(
+        asset_id="no-token",
+        best_bid=0.49,
+        best_ask=0.5,
+        best_bid_size=10.0,
+        best_ask_size=2.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    result = router.execute_signal(
+        signal=signal,
+        now_utc=now,
+        yes_quote=yes_quote,
+        no_quote=no_quote,
+    )
+    assert not result.accepted
+    assert result.rejection_reason in {"min_book_size_not_met", "insufficient_book_size_for_qty"}
+    assert not result.orders
+    assert not result.fills
+
+
+def test_paper_order_router_rejects_for_stale_quote() -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    router = PaperOrderRouter(order_size_usdc=10.0, stale_quote_ms=1000)
+    signal = ArbSignal.new(
+        market_id="market-1",
+        slug="sample",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        ask_yes=0.4,
+        ask_no=0.5,
+        threshold=0.98,
+        detected_at=now,
+        reason="sum_ask_le_threshold",
+    )
+    stale_timestamp = now - timedelta(seconds=2)
+    yes_quote = BestBidAskUpdate(
+        asset_id="yes-token",
+        best_bid=0.39,
+        best_ask=0.4,
+        best_bid_size=10.0,
+        best_ask_size=30.0,
+        event_type="best_bid_ask",
+        timestamp=stale_timestamp,
+    )
+    no_quote = BestBidAskUpdate(
+        asset_id="no-token",
+        best_bid=0.49,
+        best_ask=0.5,
+        best_bid_size=10.0,
+        best_ask_size=30.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    result = router.execute_signal(
+        signal=signal,
+        now_utc=now,
+        yes_quote=yes_quote,
+        no_quote=no_quote,
+    )
+    assert not result.accepted
+    assert result.rejection_reason == "stale_quote"
+
+
+def test_paper_order_router_rejects_when_one_leg_missing() -> None:
+    now = datetime(2026, 3, 1, tzinfo=UTC)
+    router = PaperOrderRouter(order_size_usdc=10.0, stale_quote_ms=1000)
+    signal = ArbSignal.new(
+        market_id="market-1",
+        slug="sample",
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        ask_yes=0.4,
+        ask_no=0.5,
+        threshold=0.98,
+        detected_at=now,
+        reason="sum_ask_le_threshold",
+    )
+    yes_quote = BestBidAskUpdate(
+        asset_id="yes-token",
+        best_bid=0.39,
+        best_ask=0.4,
+        best_bid_size=10.0,
+        best_ask_size=30.0,
+        event_type="best_bid_ask",
+        timestamp=now,
+    )
+    result = router.execute_signal(signal=signal, now_utc=now, yes_quote=yes_quote, no_quote=None)
+    assert not result.accepted
+    assert result.rejection_reason == "missing_one_or_both_quotes"

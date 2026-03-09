@@ -27,7 +27,7 @@ class PaperOrder:
         quantity: float,
         limit_price: float,
         created_at: datetime,
-    ) -> "PaperOrder":
+    ) -> PaperOrder:
         return cls(
             order_id=str(uuid4()),
             signal_id=signal_id,
@@ -64,7 +64,7 @@ class FillEvent:
         fill_price: float,
         filled_at: datetime,
         fee: float = 0.0,
-    ) -> "FillEvent":
+    ) -> FillEvent:
         return cls(
             fill_id=str(uuid4()),
             order_id=order_id,

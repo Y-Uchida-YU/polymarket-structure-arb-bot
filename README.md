@@ -1,22 +1,51 @@
-# Polymarket Structure Arb Bot (MVP, Paper Trading)
+# Polymarket Structure Arb Bot (Paper Trading MVP v2)
 
-Polymarket の binary market で、YES/NO の best ask 非整合 (`ask_yes + ask_no`) を監視し、
-しきい値以下ならシグナルを出す MVP です。  
-この版は **paper trading のみ** で、live order は送信しません。
+This project monitors Polymarket binary markets and emits a paper-trading signal when:
 
-## Features (MVP)
+`ask_yes + ask_no <= entry_threshold_sum_ask`
 
-- Gamma API から market 一覧取得
-- binary market 抽出（Yes/No の `clobTokenIds` を保持）
-- market channel WebSocket に接続
-- `asset_id` ごとの `best_bid_ask` 受信
-- 同一市場の YES/NO ask を保持してシグナル検出
-- signal/order/fill/pnl/error を CSV 保存
-- SQLite に状態保存（markets / quotes / signals / orders / fills / pnl / errors）
-- WebSocket 自動再接続 + 再購読
-- 日次ローテーションログ
+The bot is intentionally **paper trading only** in this phase. Live order placement is not implemented.
 
-## Directory
+## Important Scope
+
+- This version is focused on observation quality and safer paper execution.
+- Live trading is out of scope in this phase.
+- Existing layered architecture is preserved: strategy / execution / risk / storage.
+
+## What It Can Do
+
+- Fetch active and open markets from Gamma API.
+- Filter only eligible binary markets with strict conditions:
+  - `active == true`
+  - `closed == false`
+  - `archived == false`
+  - exactly 2 outcomes
+  - exactly 2 `clobTokenIds`
+  - `enableOrderBook == true` (missing value is excluded)
+- Map YES/NO token ids robustly from normalized outcome labels.
+- Subscribe to CLOB market websocket and request custom feature stream with:
+  - `custom_feature_enabled: true`
+- Maintain latest best bid/ask state by `asset_id`.
+- Detect structure-arb signals from latest yes/no asks.
+- Run paper execution with basic realism guards:
+  - reject stale quotes
+  - reject if one side is missing
+  - reject if ask size is missing/insufficient
+- Persist events:
+  - CSV: signal / order / fill / pnl / error
+  - SQLite: markets / quotes / signals / orders / fills / pnl / errors
+- Rotate app logs daily.
+- Refresh market universe periodically via `market_refresh_minutes`.
+- Trigger websocket resubscribe when subscribed asset ids change.
+
+## What It Cannot Do (Yet)
+
+- No live order placement.
+- No CLOB authenticated flow (L1/L2 auth, POLY_* headers) yet.
+- No real geoblock provider integration yet.
+- No real balance checks / cancel-reprice loop / inventory management yet.
+
+## Repository Layout
 
 ```text
 polymarket-structure-arb-bot/
@@ -69,37 +98,42 @@ polymarket-structure-arb-bot/
 │     ├─ math_ext.py
 │     └─ retry.py
 └─ tests/
-   ├─ test_strategy.py
-   ├─ test_risk.py
-   └─ test_execution.py
 ```
 
-## Win11 Setup
+## Windows 11 Setup
 
-1. Python 3.12 をインストール（`py --version` で確認）
-2. プロジェクトへ移動
-   ```powershell
-   cd C:\MyProjects\polymarket-structure-arb-bot
-   ```
-3. 仮想環境作成と有効化
-   ```powershell
-   py -3.12 -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-4. 依存インストール
-   ```powershell
-   pip install -U pip
-   pip install -e .[dev]
-   ```
-5. `.env` を作成
-   ```powershell
-   copy .env.example .env
-   ```
-6. `config/settings.yaml` と `config/markets.yaml` を必要に応じて編集
+1. Install Python 3.12.
+2. Open PowerShell and move to project:
 
-## `.env` 編集
+```powershell
+cd C:\MyProjects\polymarket-structure-arb-bot
+```
 
-`POLYMARKET_*` は将来の live execution 用です。MVP paper trading では未使用でも起動可能です。
+3. Create and activate virtual environment:
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+4. Install dependencies:
+
+```powershell
+pip install -U pip
+pip install -e .[dev]
+```
+
+5. Create local env file:
+
+```powershell
+copy .env.example .env
+```
+
+## Configuration
+
+### `.env`
+
+Current phase does not use live credentials, but keep keys for future integration:
 
 ```env
 POLYMARKET_PRIVATE_KEY=
@@ -108,39 +142,44 @@ POLYMARKET_API_SECRET=
 POLYMARKET_PASSPHRASE=
 ```
 
-## `settings.yaml` 編集ポイント
+### `config/settings.yaml` (key values)
 
-- `strategy.entry_threshold_sum_ask`: シグナル発火しきい値（例: `0.985`）
-- `strategy.expiry_block_minutes`: 満期直前ブロック分数（例: `180`）
-- `risk.max_open_positions`: 同時保有上限
-- `risk.max_positions_per_market`: 市場ごとの上限
-- `market_filters.exclude_categories`: 除外カテゴリ
+- `strategy.entry_threshold_sum_ask`: signal threshold
+- `strategy.expiry_block_minutes`: block new signals near expiry
+- `risk.max_open_positions`: global cap
+- `risk.max_positions_per_market`: per-market cap
+- `risk.paper_order_size_usdc`: paper notional
+- `risk.min_book_size`: minimum required visible ask size per leg
+- `risk.stale_quote_ms`: max quote age to accept paper fill
+- `runtime.market_refresh_minutes`: periodic market-universe refresh interval
 
-## `markets.yaml` 編集ポイント
+### `config/markets.yaml`
 
-- `include_slugs`: 空なら全許可、値を入れるとその slug のみ許可
-- `exclude_slugs`: 個別 market を除外
-- `exclude_categories` / `exclude_keywords`: `settings.yaml` 側フィルタに追加で除外
+- `include_slugs`: allow-list (if empty, no allow-list restriction)
+- `exclude_slugs`: explicit deny-list
+- `exclude_categories` / `exclude_keywords`: extra exclusion filters
 
 ## Run
+
+Normal run:
 
 ```powershell
 python -m src.main
 ```
 
-または:
+or:
 
 ```powershell
 python src/main.py
 ```
 
-### One-shot dry run (WS接続せず市場抽出のみ)
+One-shot mode (fetch/filter only, no websocket loop):
 
 ```powershell
 python -m src.main --once
 ```
 
-## Test / Lint / Format
+## Quality Commands
 
 ```powershell
 pytest -q
@@ -148,8 +187,8 @@ ruff check .
 black --check .
 ```
 
-## Notes
+## Placeholder Notes
 
-- 外部 API 仕様は変わる可能性があるため、`src/clients/` は薄いラッパーにしています。
-- WebSocket payload はフィールドゆらぎを吸収する実装にしてあります。
-- 本実装は投資助言ではありません。live order は未実装です。
+- `ClobClient` is a paper-trading placeholder only.
+- `GeoBlockClient` is a paper-trading placeholder only.
+- Do not treat this repository as live-ready in the current phase.

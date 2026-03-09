@@ -5,7 +5,11 @@ from datetime import UTC, datetime
 import pytest
 
 from src.domain.market import BinaryMarket
-from src.strategy.complement_arb import ComplementArbConfig, ComplementArbStrategy, should_emit_signal
+from src.strategy.complement_arb import (
+    ComplementArbConfig,
+    ComplementArbStrategy,
+    should_emit_signal,
+)
 
 
 def make_market() -> BinaryMarket:
