@@ -91,11 +91,35 @@ class DashboardDataLoader:
                 window=window,
                 run_id=run_id,
             )
-            safe_mode_count = self._count_metric(
+            global_safe_mode_count = self._count_metric(
                 conn=conn,
                 window=window,
                 run_id=run_id,
                 name="safe_mode_entered",
+            )
+            market_block_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="safe_mode_market_block_started",
+            )
+            market_block_active_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="safe_mode_market_block_active",
+            )
+            market_block_cleared_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="safe_mode_market_block_cleared",
+            )
+            asset_block_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="safe_mode_asset_blocked",
             )
             resync_count = self._count(
                 conn=conn,
@@ -118,7 +142,15 @@ class DashboardDataLoader:
             "total_fills": float(total_fills),
             "fill_rate": fill_rate,
             "matched_fill_rate": matched_fill_rate,
-            "safe_mode_count": float(safe_mode_count),
+            "safe_mode_count": float(global_safe_mode_count),
+            "global_safe_mode_count": float(global_safe_mode_count),
+            "market_block_count": float(market_block_count),
+            "market_block_active_count": float(market_block_active_count),
+            "market_block_cleared_count": float(market_block_cleared_count),
+            "asset_block_count": float(asset_block_count),
+            "total_block_events": float(
+                global_safe_mode_count + market_block_count + asset_block_count
+            ),
             "resync_count": float(resync_count),
             "projected_matched_pnl": projected_matched_pnl,
             "unmatched_inventory_mtm": unmatched_inventory_mtm,
@@ -261,6 +293,135 @@ class DashboardDataLoader:
             )
             + " ORDER BY created_at ASC",
             params=self._window_params(window=window, run_id=run_id),
+        )
+
+    def load_resync_timeseries(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+        bucket_minutes: int = 10,
+    ) -> pd.DataFrame:
+        frame = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT created_at, reason
+                FROM resync_events
+                WHERE created_at >= ? AND created_at < ?
+                """,
+                run_id=run_id,
+            ),
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "reason", "count"])
+        return self._bucket_categorical_counts(
+            frame=frame,
+            time_column="created_at",
+            category_column="reason",
+            bucket_minutes=bucket_minutes,
+        )
+
+    def load_block_timeseries(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+        bucket_minutes: int = 10,
+    ) -> pd.DataFrame:
+        frame = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT created_at, metric_name, metric_value
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name IN (
+                    'safe_mode_entered',
+                    'safe_mode_market_block_started',
+                    'safe_mode_asset_blocked'
+                  )
+                """,
+                run_id=run_id,
+            ),
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "block_type", "count"])
+        mapped = frame.copy()
+        block_type_map = {
+            "safe_mode_entered": "global_safe_mode",
+            "safe_mode_market_block_started": "market_block",
+            "safe_mode_asset_blocked": "asset_block",
+        }
+        mapped["block_type"] = mapped["metric_name"].map(block_type_map).fillna("other")
+        return self._bucket_categorical_counts(
+            frame=mapped,
+            time_column="created_at",
+            category_column="block_type",
+            value_column="metric_value",
+            bucket_minutes=bucket_minutes,
+        )
+
+    def load_no_signal_reason_timeseries(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+        bucket_minutes: int = 10,
+    ) -> pd.DataFrame:
+        frame = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT created_at, metric_name, metric_value
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name LIKE 'no_signal_reason:%'
+                """,
+                run_id=run_id,
+            ),
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "reason", "count"])
+        mapped = frame.copy()
+        mapped["reason"] = mapped["metric_name"].astype(str).str.split(":", n=1).str[-1]
+        return self._bucket_categorical_counts(
+            frame=mapped,
+            time_column="created_at",
+            category_column="reason",
+            value_column="metric_value",
+            bucket_minutes=bucket_minutes,
+        )
+
+    def load_missing_book_reason_timeseries(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+        bucket_minutes: int = 10,
+    ) -> pd.DataFrame:
+        frame = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT created_at, metric_name, metric_value
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name LIKE 'missing_book_state_reason:%'
+                """,
+                run_id=run_id,
+            ),
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "reason", "count"])
+        mapped = frame.copy()
+        mapped["reason"] = mapped["metric_name"].astype(str).str.split(":", n=1).str[-1]
+        return self._bucket_categorical_counts(
+            frame=mapped,
+            time_column="created_at",
+            category_column="reason",
+            value_column="metric_value",
+            bucket_minutes=bucket_minutes,
         )
 
     def load_market_diagnostics(
@@ -474,6 +635,41 @@ class DashboardDataLoader:
                 )
             ]
         )
+
+    @staticmethod
+    def _bucket_categorical_counts(
+        *,
+        frame: pd.DataFrame,
+        time_column: str,
+        category_column: str,
+        bucket_minutes: int,
+        value_column: str | None = None,
+    ) -> pd.DataFrame:
+        working = frame.copy()
+        working["timestamp"] = pd.to_datetime(working[time_column], utc=True, errors="coerce")
+        working = working.dropna(subset=["timestamp"])
+        if working.empty:
+            category_name = "reason" if category_column == "metric_name" else category_column
+            return pd.DataFrame(columns=["timestamp", category_name, "count"])
+        bucket_size = max(1, int(bucket_minutes))
+        working["timestamp"] = working["timestamp"].dt.floor(f"{bucket_size}min")
+        category_name = category_column
+        if value_column is None:
+            grouped = (
+                working.groupby(["timestamp", category_column], dropna=False)
+                .size()
+                .reset_index(name="count")
+            )
+        else:
+            grouped = (
+                working.groupby(["timestamp", category_column], dropna=False)[value_column]
+                .sum()
+                .reset_index(name="count")
+            )
+        grouped = grouped.rename(columns={category_column: category_name})
+        grouped["count"] = grouped["count"].astype(float)
+        grouped = grouped.sort_values(["timestamp", "count"], ascending=[True, False])
+        return grouped.reset_index(drop=True)
 
     def _count(
         self,
@@ -716,6 +912,10 @@ class DashboardDataLoader:
             "fill_rate": 0.0,
             "matched_fill_rate": 0.0,
             "safe_mode_count": 0.0,
+            "global_safe_mode_count": 0.0,
+            "market_block_count": 0.0,
+            "asset_block_count": 0.0,
+            "total_block_events": 0.0,
             "resync_count": 0.0,
             "projected_matched_pnl": 0.0,
             "unmatched_inventory_mtm": 0.0,

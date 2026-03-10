@@ -179,6 +179,10 @@ def test_dashboard_loader_core_metrics_with_run_id_filter(tmp_path: Path) -> Non
     assert overview["total_fills"] == 1.0
     assert overview["fill_rate"] == 1.0
     assert overview["safe_mode_count"] == 1.0
+    assert overview["global_safe_mode_count"] == 1.0
+    assert overview["market_block_count"] == 0.0
+    assert overview["asset_block_count"] == 0.0
+    assert overview["total_block_events"] == 1.0
     assert overview["watched_markets_current"] == 5.0
     assert overview["subscribed_assets_current"] == 10.0
 
@@ -195,3 +199,29 @@ def test_dashboard_loader_core_metrics_with_run_id_filter(tmp_path: Path) -> Non
     asset_diag = loader.load_asset_diagnostics(window=window, run_id="run-1")
     assert not asset_diag.empty
     assert str(asset_diag.iloc[0]["asset_id"]) == "yes1"
+
+    resync_ts = loader.load_resync_timeseries(window=window, run_id="run-1", bucket_minutes=5)
+    assert not resync_ts.empty
+    assert "reason" in resync_ts.columns
+
+    block_ts = loader.load_block_timeseries(window=window, run_id="run-1", bucket_minutes=5)
+    assert not block_ts.empty
+    assert "block_type" in block_ts.columns
+
+
+def test_resolve_window_last_hours_is_relative_to_now(monkeypatch) -> None:
+    fixed_now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object | None = None) -> datetime:
+            if tz is None:
+                return fixed_now.replace(tzinfo=None)
+            return fixed_now.astimezone(tz)
+
+    monkeypatch.setattr("src.dashboard.data_loader.datetime", FixedDateTime)
+    window = resolve_window(last_hours=6)
+    start = datetime.fromisoformat(window.start_iso)
+    end = datetime.fromisoformat(window.end_iso)
+    delta = end - start
+    assert delta == timedelta(hours=6)

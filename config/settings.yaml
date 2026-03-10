@@ -42,10 +42,15 @@ runtime:
   websocket_ping_interval_seconds: 20
   websocket_ping_timeout_seconds: 20
   market_refresh_minutes: 60
+  market_universe_change_confirmations: 2
+  market_universe_change_min_asset_delta: 4
   stale_asset_ms: 15000
   initial_market_data_grace_ms: 30000
   per_asset_book_grace_ms: 45000
   resync_recovery_grace_ms: 180000
+  no_data_resync_cooldown_ms: 240000
+  quote_missing_after_resync_delay_ms: 240000
+  market_block_min_consecutive_unhealthy_cycles: 2
   book_resync_idle_ms: 20000
   resync_cooldown_ms: 60000
   same_reason_resync_cooldown_ms: 120000
