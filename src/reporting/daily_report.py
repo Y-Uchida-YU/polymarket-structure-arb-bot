@@ -42,12 +42,37 @@ class DailyReportGenerator:
             )
             depth_reject_count = self._count_depth_reject(conn, window, run_id=run_id)
             resync_count = self._count(conn, "resync_events", "created_at", window, run_id=run_id)
-            safe_mode_count = self._count_metric(
+            global_safe_mode_count = self._count_metric(
                 conn,
                 window,
                 run_id=run_id,
                 name="safe_mode_entered",
             )
+            market_block_count = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="safe_mode_market_block_started",
+            )
+            market_block_active_count = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="safe_mode_market_block_active",
+            )
+            market_block_cleared_count = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="safe_mode_market_block_cleared",
+            )
+            asset_block_count = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="safe_mode_asset_blocked",
+            )
+            total_block_events = global_safe_mode_count + market_block_count + asset_block_count
 
             pnl_sums = self._sum_pnl(conn, window, run_id=run_id)
             top_markets_by_signal = self._top_markets_by_signal(conn, window, run_id=run_id)
@@ -99,10 +124,14 @@ class DailyReportGenerator:
             warnings.append("high_one_leg_rate")
         if stale_reject_rate > 0.3:
             warnings.append("high_stale_reject_rate")
-        if safe_mode_count > 0 or safe_mode_blocked_total > 0:
-            warnings.append("safe_mode_triggered")
+        if global_safe_mode_count > 0:
+            warnings.append("global_safe_mode_triggered")
+        if market_block_count > 0:
+            warnings.append("market_blocks_triggered")
+        if asset_block_count > 0:
+            warnings.append("asset_blocks_triggered")
         if safe_mode_blocked_total >= max(10, int(no_signal_total * 0.5)):
-            warnings.append("safe_mode_dominates_run")
+            warnings.append("blocking_dominates_run")
         if resync_count >= 1_000:
             warnings.append("resync_storm_detected")
         if total_signals == 0 and resync_count >= 100:
@@ -137,7 +166,13 @@ class DailyReportGenerator:
                 "depth_reject_count": depth_reject_count,
                 "depth_reject_rate": depth_reject_rate,
                 "resync_count": resync_count,
-                "safe_mode_count": safe_mode_count,
+                "safe_mode_count": global_safe_mode_count,
+                "global_safe_mode_count": global_safe_mode_count,
+                "market_block_count": market_block_count,
+                "market_block_active_count": market_block_active_count,
+                "market_block_cleared_count": market_block_cleared_count,
+                "asset_block_count": asset_block_count,
+                "total_block_events": total_block_events,
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
@@ -200,7 +235,12 @@ class DailyReportGenerator:
             f"stale_reject_count/rate: {stale_reject_text}",
             f"depth_reject_count/rate: {depth_reject_text}",
             f"resync_count: {totals['resync_count']}",
-            f"safe_mode_count: {totals['safe_mode_count']}",
+            f"global_safe_mode_count: {totals['global_safe_mode_count']}",
+            f"market_block_count: {totals['market_block_count']}",
+            f"market_block_active_count: {totals['market_block_active_count']}",
+            f"market_block_cleared_count: {totals['market_block_cleared_count']}",
+            f"asset_block_count: {totals['asset_block_count']}",
+            f"total_block_events: {totals['total_block_events']}",
             (
                 "watched_markets(current/cumulative): "
                 f"{universe.get('current_watched_markets', 0)} / "
@@ -407,6 +447,30 @@ class DailyReportGenerator:
           AND metric_name = ?
         """
         params: list[object] = [window.start_iso, window.end_iso, name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_metrics(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        names: list[str],
+    ) -> int:
+        if not names:
+            return 0
+        placeholders = ",".join("?" for _ in names)
+        query = f"""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name IN ({placeholders})
+        """
+        params: list[object] = [window.start_iso, window.end_iso, *names]
         if run_id is not None:
             query += " AND run_id = ?"
             params.append(run_id)

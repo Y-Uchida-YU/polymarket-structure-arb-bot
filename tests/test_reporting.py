@@ -202,6 +202,27 @@ def test_daily_report_v7_breakdowns_and_warnings(tmp_path: Path) -> None:
             ),
             (
                 "run-1",
+                "safe_mode_market_block_started",
+                2.0,
+                "scope=market;event=started;reason=book_state_unhealthy;active_markets=2",
+                now,
+            ),
+            (
+                "run-1",
+                "safe_mode_market_block_active",
+                2.0,
+                "scope=market;event=active;reason=book_state_unhealthy;blocked_markets=2",
+                now,
+            ),
+            (
+                "run-1",
+                "safe_mode_market_block_cleared",
+                1.0,
+                "scope=market;event=cleared;reason=book_state_unhealthy;active_markets=0",
+                now,
+            ),
+            (
+                "run-1",
                 "safe_mode_asset_blocked",
                 3.0,
                 "scope=asset;reason=book_state_unhealthy;blocked_assets=3",
@@ -259,8 +280,17 @@ def test_daily_report_v7_breakdowns_and_warnings(tmp_path: Path) -> None:
     assert missing_reasons["no_initial_book"] == 7
     assert missing_reasons["quote_missing_after_resync"] == 4
 
-    assert "safe_mode_triggered" in report["warnings"]
-    assert "safe_mode_dominates_run" in report["warnings"]
+    assert report["totals"]["global_safe_mode_count"] == 1
+    assert report["totals"]["market_block_count"] == 1
+    assert report["totals"]["market_block_active_count"] == 1
+    assert report["totals"]["market_block_cleared_count"] == 1
+    assert report["totals"]["asset_block_count"] == 1
+    assert report["totals"]["total_block_events"] == 3
+
+    assert "global_safe_mode_triggered" in report["warnings"]
+    assert "market_blocks_triggered" in report["warnings"]
+    assert "asset_blocks_triggered" in report["warnings"]
+    assert "blocking_dominates_run" in report["warnings"]
     assert "book_state_unhealthy" in report["warnings"]
     assert "data_not_ready_for_evaluation" in report["warnings"]
 

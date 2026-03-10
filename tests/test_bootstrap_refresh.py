@@ -485,6 +485,7 @@ def test_market_scope_block_applies_without_global_stop(tmp_path: Path) -> None:
             "stale_asset_ms": 1000,
             "initial_market_data_grace_ms": 1,
             "per_asset_book_grace_ms": 1,
+            "market_block_min_consecutive_unhealthy_cycles": 1,
         },
         guardrails={
             "global_unhealthy_consecutive_count": 3,
@@ -523,6 +524,201 @@ def test_market_scope_block_applies_without_global_stop(tmp_path: Path) -> None:
         WHERE metric_name = 'safe_mode_market_blocked'
         """).fetchone()
     assert int(metric_row[0] if metric_row else 0) >= 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_refresh_market_universe_order_only_change_does_not_resubscribe(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_universe_order_only_change")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_universe_change_confirmations": 2,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")],
+            [make_raw_market("m2", "yes2", "no2"), make_raw_market("m1", "yes1", "no1")],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    asyncio.run(app.refresh_market_universe())
+
+    assert app.resubscribe_event.is_set() is False
+    assert app.state.pending_universe_signature is None
+    assert app.state.pending_universe_confirmation_count == 0
+    changed_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'market_universe_changed'
+        """).fetchone()
+    assert int(changed_row[0] if changed_row else 0) == 0
+
+    asyncio.run(app.shutdown())
+
+
+def test_refresh_market_universe_requires_confirmation_before_apply(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_universe_change_confirmation")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_universe_change_confirmations": 2,
+            "market_universe_change_min_asset_delta": 99,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [make_raw_market("m1", "yes1", "no1")],
+            [make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")],
+            [make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    asyncio.run(app.refresh_market_universe())
+
+    assert app.resubscribe_event.is_set() is False
+    assert set(app.markets_by_id.keys()) == {"m1"}
+    assert app.state.pending_universe_confirmation_count == 1
+
+    asyncio.run(app.refresh_market_universe())
+
+    assert app.resubscribe_event.is_set() is True
+    assert set(app.markets_by_id.keys()) == {"m1", "m2"}
+    assert app.state.pending_universe_signature is None
+    assert app.state.pending_universe_confirmation_count == 0
+    changed_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'market_universe_changed'
+        """).fetchone()
+    assert int(changed_row[0] if changed_row else 0) == 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_market_block_clears_after_market_recovery(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_market_block_clear")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1000,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "market_block_min_consecutive_unhealthy_cycles": 1,
+        },
+        guardrails={
+            "global_unhealthy_consecutive_count": 3,
+            "global_unhealthy_min_duration_seconds": 9999,
+            "global_unhealthy_min_asset_ratio": 1.0,
+            "global_ws_unhealthy_min_asset_ratio": 1.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[[make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")]]
+    )
+
+    asyncio.run(app.load_markets())
+    asyncio.run(app.on_ws_connected(["yes1", "no1", "yes2", "no2"]))
+    app.state.first_quote_received_at = datetime.now(tz=UTC)
+    old = datetime.now(tz=UTC) - timedelta(seconds=5)
+    now = datetime.now(tz=UTC)
+    app.healthcheck.on_asset_quote_update("yes1", old)
+    app.healthcheck.on_asset_quote_update("no1", old)
+    app.healthcheck.on_asset_quote_update("yes2", now)
+    app.healthcheck.on_asset_quote_update("no2", now)
+
+    asyncio.run(app.check_data_freshness_and_resync())
+    assert "m1" in app.state.safe_mode_blocked_markets
+    assert app.state.safe_mode_scope == "market"
+
+    recovered = datetime.now(tz=UTC)
+    app.healthcheck.on_asset_quote_update("yes1", recovered)
+    app.healthcheck.on_asset_quote_update("no1", recovered)
+
+    asyncio.run(app.check_data_freshness_and_resync())
+    assert "m1" not in app.state.safe_mode_blocked_markets
+    assert app.state.safe_mode_scope is None
+    cleared_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'safe_mode_market_block_cleared'
+        """).fetchone()
+    assert int(cleared_row[0] if cleared_row else 0) >= 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_no_data_resync_cooldown_blocks_repeat_loop_after_recovery(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_no_data_resync_cooldown")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "resync_recovery_grace_ms": 1,
+            "resync_cooldown_ms": 0,
+            "same_reason_resync_cooldown_ms": 0,
+            "missing_book_resync_cooldown_ms": 0,
+            "quote_missing_after_resync_delay_ms": 0,
+            "no_data_resync_cooldown_ms": 120_000,
+            "max_resync_assets_per_cycle": 10,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    app.state.ws_connected_at = datetime.now(tz=UTC)
+    app.state.subscription_started_at = datetime.now(tz=UTC) - timedelta(seconds=2)
+    app.state.first_quote_received_at = datetime.now(tz=UTC)
+
+    asyncio.run(app.check_data_freshness_and_resync())
+    first_call_count = len(app.book_client.calls)
+    assert first_call_count >= 2
+
+    app.state.asset_recovering_until["yes1"] = datetime.now(tz=UTC) - timedelta(seconds=1)
+    app.state.asset_recovering_until["no1"] = datetime.now(tz=UTC) - timedelta(seconds=1)
+    asyncio.run(app.check_data_freshness_and_resync())
+    second_call_count = len(app.book_client.calls)
+
+    assert second_call_count == first_call_count
 
     asyncio.run(app.shutdown())
 

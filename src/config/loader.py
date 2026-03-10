@@ -62,10 +62,15 @@ class RuntimeSettings(BaseModel):
     websocket_ping_interval_seconds: int = 20
     websocket_ping_timeout_seconds: int = 20
     market_refresh_minutes: int = 60
+    market_universe_change_confirmations: int = 2
+    market_universe_change_min_asset_delta: int = 4
     stale_asset_ms: int = 15_000
     initial_market_data_grace_ms: int = 30_000
     per_asset_book_grace_ms: int = 60_000
     resync_recovery_grace_ms: int = 180_000
+    no_data_resync_cooldown_ms: int = 240_000
+    quote_missing_after_resync_delay_ms: int = 240_000
+    market_block_min_consecutive_unhealthy_cycles: int = 2
     book_resync_idle_ms: int = 20_000
     resync_cooldown_ms: int = 60_000
     same_reason_resync_cooldown_ms: int = 120_000
