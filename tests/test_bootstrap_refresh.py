@@ -278,3 +278,47 @@ def test_ws_connected_within_grace_does_not_enter_safe_mode(tmp_path: Path) -> N
     assert app.state.stale_assets == set()
 
     asyncio.run(app.shutdown())
+
+
+def test_resync_cooldown_suppresses_storm_on_repeated_stale_checks(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_resync_cooldown")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "resync_cooldown_ms": 60_000,
+            "max_resync_assets_per_cycle": 10,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    app.state.ws_connected_at = datetime.now(tz=UTC)
+    app.state.subscription_started_at = datetime.now(tz=UTC) - timedelta(seconds=2)
+    app.state.first_quote_received_at = None
+
+    asyncio.run(app.check_data_freshness_and_resync())
+    first_call_count = len(app.book_client.calls)
+    asyncio.run(app.check_data_freshness_and_resync())
+    second_call_count = len(app.book_client.calls)
+
+    assert first_call_count >= 2
+    assert second_call_count == first_call_count
+
+    asyncio.run(app.shutdown())

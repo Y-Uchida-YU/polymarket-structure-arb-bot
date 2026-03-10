@@ -65,6 +65,9 @@ class RuntimeSettings(BaseModel):
     stale_asset_ms: int = 15_000
     initial_market_data_grace_ms: int = 30_000
     book_resync_idle_ms: int = 20_000
+    resync_cooldown_ms: int = 60_000
+    full_resync_cooldown_ms: int = 120_000
+    max_resync_assets_per_cycle: int = 50
     resync_batch_size: int = 100
     snapshot_interval_minutes: int = 60
     report_export_interval_minutes: int = 1_440
@@ -88,6 +91,14 @@ class GuardrailSettings(BaseModel):
 class MarketFilterSettings(BaseModel):
     exclude_categories: list[str] = Field(default_factory=list)
     exclude_keywords: list[str] = Field(default_factory=list)
+    require_orderbook_enabled: bool = True
+    max_markets_to_watch: int | None = 100
+    min_days_to_expiry: float | None = None
+    max_days_to_expiry: float | None = None
+    min_recent_activity: float | None = None
+    min_liquidity_proxy: float | None = None
+    min_volume_24h_proxy: float | None = None
+    require_recent_trade_within_minutes: int | None = None
 
 
 class SecretSettings(BaseModel):

@@ -1,11 +1,24 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.config.loader import MarketFilterSettings, MarketsConfig
 from src.domain.market import BinaryMarket
+from src.utils.math_ext import safe_float
+
+
+@dataclass(slots=True)
+class MarketExtractionResult:
+    markets: list[BinaryMarket]
+    excluded_counts: dict[str, int]
+    raw_market_count: int
+
+
+def parse_float_field(value: object) -> float | None:
+    return safe_float(value)
 
 
 def parse_bool_field(value: object) -> bool:
@@ -74,6 +87,36 @@ def parse_end_time(value: object) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def parse_recent_trade_time(raw: dict[str, Any]) -> datetime | None:
+    for key in (
+        "lastTradeTime",
+        "last_trade_time",
+        "lastTradeTimestamp",
+        "last_trade_timestamp",
+        "lastTrade",
+    ):
+        parsed = parse_end_time(raw.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def parse_volume_proxy(raw: dict[str, Any]) -> float:
+    for key in ("volume24hr", "volume24h", "volume", "volumeNum"):
+        parsed = parse_float_field(raw.get(key))
+        if parsed is not None:
+            return max(0.0, parsed)
+    return 0.0
+
+
+def parse_liquidity_proxy(raw: dict[str, Any]) -> float:
+    for key in ("liquidity", "liquidityNum"):
+        parsed = parse_float_field(raw.get(key))
+        if parsed is not None:
+            return max(0.0, parsed)
+    return 0.0
 
 
 def is_binary_yes_no_market(raw: dict[str, Any]) -> bool:
@@ -151,33 +194,104 @@ def is_within_expiry_block(
     return end_time - now_utc <= timedelta(minutes=expiry_block_minutes)
 
 
-def extract_binary_markets(
+def _exclude_reason(
+    *,
+    raw: dict[str, Any],
+    market_filters: MarketFilterSettings,
+    markets_config: MarketsConfig,
+    now_utc: datetime,
+) -> str | None:
+    if not is_open_market(raw):
+        return "not_open_market"
+    if market_filters.require_orderbook_enabled and not is_order_book_enabled(raw):
+        return "orderbook_disabled"
+    if not is_binary_yes_no_market(raw):
+        return "not_binary_yes_no"
+    if is_excluded_by_filters(
+        raw,
+        market_filters=market_filters,
+        markets_config=markets_config,
+    ):
+        return "market_filtered_out"
+
+    end_time = parse_end_time(raw.get("endDate"))
+    if market_filters.min_days_to_expiry is not None:
+        if end_time is None:
+            return "missing_end_time"
+        days_to_expiry = (end_time - now_utc).total_seconds() / 86_400.0
+        if days_to_expiry < float(market_filters.min_days_to_expiry):
+            return "expiry_too_soon"
+    if market_filters.max_days_to_expiry is not None:
+        if end_time is None:
+            return "missing_end_time"
+        days_to_expiry = (end_time - now_utc).total_seconds() / 86_400.0
+        if days_to_expiry > float(market_filters.max_days_to_expiry):
+            return "expiry_too_far"
+
+    volume_proxy = parse_volume_proxy(raw)
+    liquidity_proxy = parse_liquidity_proxy(raw)
+    recent_activity = max(volume_proxy, liquidity_proxy)
+    if market_filters.min_recent_activity is not None and recent_activity < float(
+        market_filters.min_recent_activity
+    ):
+        return "recent_activity_too_low"
+    if market_filters.min_liquidity_proxy is not None and liquidity_proxy < float(
+        market_filters.min_liquidity_proxy
+    ):
+        return "liquidity_too_low"
+    if market_filters.min_volume_24h_proxy is not None and volume_proxy < float(
+        market_filters.min_volume_24h_proxy
+    ):
+        return "volume_too_low"
+
+    if market_filters.require_recent_trade_within_minutes is not None:
+        last_trade = parse_recent_trade_time(raw)
+        if last_trade is None:
+            return "missing_recent_trade"
+        age_minutes = max(0.0, (now_utc - last_trade).total_seconds() / 60.0)
+        if age_minutes > float(market_filters.require_recent_trade_within_minutes):
+            return "recent_trade_too_old"
+
+    token_pair = _extract_yes_no_token_ids(raw)
+    if token_pair is None:
+        return "invalid_yes_no_mapping"
+    return None
+
+
+def _market_score(raw: dict[str, Any]) -> float:
+    return parse_liquidity_proxy(raw) + parse_volume_proxy(raw)
+
+
+def extract_binary_markets_with_stats(
     raw_markets: list[dict[str, Any]],
     market_filters: MarketFilterSettings,
     markets_config: MarketsConfig,
-) -> list[BinaryMarket]:
-    binary_markets: list[BinaryMarket] = []
+    now_utc: datetime | None = None,
+) -> MarketExtractionResult:
+    reference_now = now_utc or datetime.now(tz=UTC)
+    candidates: list[BinaryMarket] = []
+    excluded_counts: dict[str, int] = {}
 
     for raw in raw_markets:
-        if not is_open_market(raw):
-            continue
-        if not is_order_book_enabled(raw):
-            continue
-        if not is_binary_yes_no_market(raw):
-            continue
-        if is_excluded_by_filters(
-            raw,
+        reason = _exclude_reason(
+            raw=raw,
             market_filters=market_filters,
             markets_config=markets_config,
-        ):
+            now_utc=reference_now,
+        )
+        if reason is not None:
+            excluded_counts[reason] = excluded_counts.get(reason, 0) + 1
             continue
 
         token_pair = _extract_yes_no_token_ids(raw)
         if token_pair is None:
+            excluded_counts["invalid_yes_no_mapping"] = (
+                excluded_counts.get("invalid_yes_no_mapping", 0) + 1
+            )
             continue
         yes_token_id, no_token_id = token_pair
 
-        binary_markets.append(
+        candidates.append(
             BinaryMarket(
                 market_id=str(raw.get("id", "")),
                 question=str(raw.get("question", "")),
@@ -190,4 +304,34 @@ def extract_binary_markets(
                 raw=raw,
             )
         )
-    return binary_markets
+
+    max_markets = market_filters.max_markets_to_watch
+    if max_markets is not None and max_markets > 0 and len(candidates) > max_markets:
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda market: (_market_score(market.raw), market.slug),
+            reverse=True,
+        )
+        kept = sorted_candidates[:max_markets]
+        excluded_counts["max_markets_to_watch"] = excluded_counts.get("max_markets_to_watch", 0) + (
+            len(candidates) - len(kept)
+        )
+        candidates = kept
+
+    return MarketExtractionResult(
+        markets=candidates,
+        excluded_counts=excluded_counts,
+        raw_market_count=len(raw_markets),
+    )
+
+
+def extract_binary_markets(
+    raw_markets: list[dict[str, Any]],
+    market_filters: MarketFilterSettings,
+    markets_config: MarketsConfig,
+) -> list[BinaryMarket]:
+    return extract_binary_markets_with_stats(
+        raw_markets=raw_markets,
+        market_filters=market_filters,
+        markets_config=markets_config,
+    ).markets

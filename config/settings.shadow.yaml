@@ -42,9 +42,12 @@ runtime:
   websocket_ping_interval_seconds: 20
   websocket_ping_timeout_seconds: 20
   market_refresh_minutes: 30
-  stale_asset_ms: 12000
+  stale_asset_ms: 90000
   initial_market_data_grace_ms: 45000
-  book_resync_idle_ms: 20000
+  book_resync_idle_ms: 120000
+  resync_cooldown_ms: 180000
+  full_resync_cooldown_ms: 300000
+  max_resync_assets_per_cycle: 25
   resync_batch_size: 80
   snapshot_interval_minutes: 60
   report_export_interval_minutes: 1440
@@ -58,7 +61,7 @@ guardrails:
   max_one_leg_rate: 0.30
   max_unmatched_rate: 0.35
   max_stale_asset_rate: 0.70
-  max_resync_rate_per_min: 25.0
+  max_resync_rate_per_min: 8.0
   max_exception_rate_per_min: 6.0
   hard_stop_on_exception_spike: false
   hard_stop_exception_rate_per_min: 15.0
@@ -70,3 +73,11 @@ market_filters:
     - death
     - celebrity
   exclude_keywords: []
+  require_orderbook_enabled: true
+  max_markets_to_watch: 40
+  min_days_to_expiry: 1.0
+  max_days_to_expiry: 90.0
+  min_recent_activity: 5000.0
+  min_liquidity_proxy: 2500.0
+  min_volume_24h_proxy: 1500.0
+  require_recent_trade_within_minutes:

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import src.main as main_module
-from src.config.loader import AppConfig, MarketsConfig, Settings
+from src.config.loader import AppConfig, MarketsConfig, Settings, load_app_config
 
 
 @pytest.fixture
@@ -180,3 +180,10 @@ def test_run_report_prints_paths(
     assert "ok-report" in output
     assert "saved_json:" in output
     assert "saved_csv:" in output
+
+
+def test_shadow_settings_shrink_universe_limit() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    config = load_app_config(root_dir=repo_root, settings_path="config/settings.shadow.yaml")
+    assert config.settings.market_filters.max_markets_to_watch is not None
+    assert config.settings.market_filters.max_markets_to_watch <= 50

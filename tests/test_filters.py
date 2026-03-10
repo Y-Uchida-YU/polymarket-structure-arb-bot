@@ -105,3 +105,67 @@ def test_extract_binary_markets_excludes_non_yes_no_outcomes() -> None:
         markets_config=MarketsConfig(),
     )
     assert result == []
+
+
+def test_extract_binary_markets_respects_max_markets_to_watch() -> None:
+    markets = [
+        {
+            **make_raw_market("1", enable_order_book=True),
+            "liquidity": "1000",
+            "volume24hr": "10",
+        },
+        {
+            **make_raw_market("2", enable_order_book=True),
+            "liquidity": "3000",
+            "volume24hr": "10",
+        },
+        {
+            **make_raw_market("3", enable_order_book=True),
+            "liquidity": "2000",
+            "volume24hr": "10",
+        },
+    ]
+    filters = MarketFilterSettings(
+        max_markets_to_watch=2,
+        min_recent_activity=0.0,
+        min_liquidity_proxy=0.0,
+        min_volume_24h_proxy=0.0,
+        min_days_to_expiry=0.0,
+        max_days_to_expiry=3650.0,
+    )
+    result = extract_binary_markets(
+        raw_markets=markets,
+        market_filters=filters,
+        markets_config=MarketsConfig(),
+    )
+    assert len(result) == 2
+    assert {market.market_id for market in result} == {"2", "3"}
+
+
+def test_extract_binary_markets_applies_recent_activity_proxy_filter() -> None:
+    markets = [
+        {
+            **make_raw_market("low", enable_order_book=True),
+            "liquidity": "50",
+            "volume24hr": "25",
+        },
+        {
+            **make_raw_market("high", enable_order_book=True),
+            "liquidity": "5000",
+            "volume24hr": "3000",
+        },
+    ]
+    filters = MarketFilterSettings(
+        min_recent_activity=1000.0,
+        min_liquidity_proxy=0.0,
+        min_volume_24h_proxy=0.0,
+        min_days_to_expiry=0.0,
+        max_days_to_expiry=3650.0,
+    )
+    result = extract_binary_markets(
+        raw_markets=markets,
+        market_filters=filters,
+        markets_config=MarketsConfig(),
+    )
+    assert len(result) == 1
+    assert result[0].market_id == "high"

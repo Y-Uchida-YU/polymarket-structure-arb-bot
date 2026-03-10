@@ -53,6 +53,10 @@ class DailyReportGenerator:
             top_markets_by_signal = self._top_markets_by_signal(conn, window, run_id=run_id)
             top_markets_by_pnl = self._top_markets_by_pnl(conn, window, run_id=run_id)
             top_reject_reasons = self._top_reject_reasons(conn, window, run_id=run_id)
+            resync_by_reason = self._resync_by_reason(conn, window, run_id=run_id)
+            no_signal_reasons = self._no_signal_reasons(conn, window, run_id=run_id)
+            universe = self._universe_overview(conn, window, run_id=run_id)
+            warmup = self._warmup_overview(conn, window, run_id=run_id)
 
         fill_rate = signals_with_fill / total_signals if total_signals > 0 else 0.0
         matched_fill_rate = matched_fill_signals / total_signals if total_signals > 0 else 0.0
@@ -71,6 +75,12 @@ class DailyReportGenerator:
             warnings.append("high_stale_reject_rate")
         if safe_mode_count > 0:
             warnings.append("safe_mode_triggered")
+        if resync_count >= 1_000:
+            warnings.append("resync_storm_detected")
+        if total_signals == 0 and resync_count >= 100:
+            warnings.append("no_signals_but_high_resync")
+        if universe["watched_markets"] > 150 or universe["subscribed_assets"] > 300:
+            warnings.append("universe_too_large")
 
         report = {
             "window": {
@@ -96,6 +106,10 @@ class DailyReportGenerator:
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
             },
+            "universe": universe,
+            "warmup": warmup,
+            "resyncs_by_reason": resync_by_reason,
+            "no_signal_reasons": no_signal_reasons,
             "top_markets_by_signal_count": top_markets_by_signal,
             "top_markets_by_pnl": top_markets_by_pnl,
             "top_reject_reasons": top_reject_reasons,
@@ -127,6 +141,8 @@ class DailyReportGenerator:
     @staticmethod
     def format_console(report: dict[str, Any]) -> str:
         totals = report["totals"]
+        universe = report.get("universe", {})
+        warmup = report.get("warmup", {})
         one_leg_text = (
             f"{totals['one_leg_occurrence_count']} / {totals['one_leg_occurrence_rate']:.3f}"
         )
@@ -145,10 +161,28 @@ class DailyReportGenerator:
             f"depth_reject_count/rate: {depth_reject_text}",
             f"resync_count: {totals['resync_count']}",
             f"safe_mode_count: {totals['safe_mode_count']}",
+            (
+                "watched_markets/subscribed_assets: "
+                f"{universe.get('watched_markets', 0)} / {universe.get('subscribed_assets', 0)}"
+            ),
+            (
+                "warmup_events/latest_warming_up_assets: "
+                f"{warmup.get('warmup_events', 0)} / {warmup.get('latest_warming_up_assets', 0)}"
+            ),
             f"projected_matched_pnl: {totals['projected_matched_pnl']:.6f}",
             f"unmatched_inventory_mtm: {totals['unmatched_inventory_mtm']:.6f}",
             f"total_projected_pnl: {totals['total_projected_pnl']:.6f}",
         ]
+        if report.get("resyncs_by_reason"):
+            reason_summary = ", ".join(
+                f"{item['reason']}={item['count']}" for item in report["resyncs_by_reason"][:5]
+            )
+            lines.append(f"top_resync_reasons: {reason_summary}")
+        if report.get("no_signal_reasons"):
+            no_signal_summary = ", ".join(
+                f"{item['reason']}={item['count']}" for item in report["no_signal_reasons"][:5]
+            )
+            lines.append(f"top_no_signal_reasons: {no_signal_summary}")
         if report.get("warnings"):
             lines.append("warnings: " + ", ".join(report["warnings"]))
         return "\n".join(lines)
@@ -403,3 +437,127 @@ class DailyReportGenerator:
         query += " GROUP BY reject_reason ORDER BY COUNT(*) DESC LIMIT 5"
         rows = conn.execute(query, params).fetchall()
         return [{"reject_reason": row[0], "count": int(row[1])} for row in rows]
+
+    def _resync_by_reason(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT reason, COUNT(*)
+        FROM resync_events
+        WHERE created_at >= ? AND created_at < ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY reason ORDER BY COUNT(*) DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [{"reason": str(row[0]), "count": int(row[1])} for row in rows]
+
+    def _no_signal_reasons(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT metric_name, COUNT(*)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE 'no_signal_reason:%'
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY metric_name ORDER BY COUNT(*) DESC"
+        rows = conn.execute(query, params).fetchall()
+        results: list[dict[str, Any]] = []
+        for name, count in rows:
+            metric_name = str(name)
+            _, _, reason = metric_name.partition(":")
+            results.append({"reason": reason or metric_name, "count": int(count)})
+        return results
+
+    def _universe_overview(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> dict[str, int]:
+        watched_markets_row = conn.execute("SELECT COUNT(*) FROM markets").fetchone()
+        watched_markets = int(watched_markets_row[0] if watched_markets_row else 0)
+
+        query = """
+        SELECT COUNT(DISTINCT asset_id)
+        FROM quotes
+        WHERE quote_time >= ? AND quote_time < ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        subscribed_row = conn.execute(query, params).fetchone()
+        subscribed_assets = int(subscribed_row[0] if subscribed_row else 0)
+        if subscribed_assets == 0:
+            fallback_query = """
+            SELECT COUNT(DISTINCT asset_id)
+            FROM resync_events
+            WHERE created_at >= ? AND created_at < ?
+            """
+            fallback_params: list[object] = [window.start_iso, window.end_iso]
+            if run_id is not None:
+                fallback_query += " AND run_id = ?"
+                fallback_params.append(run_id)
+            fallback_row = conn.execute(fallback_query, fallback_params).fetchone()
+            subscribed_assets = int(fallback_row[0] if fallback_row else 0)
+        return {
+            "watched_markets": watched_markets,
+            "subscribed_assets": subscribed_assets,
+        }
+
+    def _warmup_overview(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> dict[str, Any]:
+        count_query = """
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = 'warming_up_asset_count'
+          AND metric_value > 0
+        """
+        count_params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            count_query += " AND run_id = ?"
+            count_params.append(run_id)
+        row = conn.execute(count_query, count_params).fetchone()
+        warmup_events = int(row[0] if row else 0)
+
+        latest_query = """
+        SELECT metric_value, details, created_at
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = 'warming_up_asset_count'
+        """
+        latest_params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            latest_query += " AND run_id = ?"
+            latest_params.append(run_id)
+        latest_query += " ORDER BY created_at DESC LIMIT 1"
+        latest_row = conn.execute(latest_query, latest_params).fetchone()
+        return {
+            "warmup_events": warmup_events,
+            "latest_warming_up_assets": float(latest_row[0]) if latest_row else 0.0,
+            "latest_warmup_reason": str(latest_row[1]) if latest_row and latest_row[1] else "",
+            "latest_warmup_at": str(latest_row[2]) if latest_row and latest_row[2] else "",
+        }

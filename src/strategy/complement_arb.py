@@ -65,7 +65,7 @@ class ComplementArbStrategy:
         tick_size_no: float | None,
         order_size_usdc: float,
     ) -> ArbSignal | None:
-        diagnostics = self._build_diagnostics(
+        diagnostics = self.diagnose_with_quotes(
             yes_quote=yes_quote,
             no_quote=no_quote,
             now_utc=now_utc,
@@ -74,6 +74,28 @@ class ComplementArbStrategy:
         )
         if not diagnostics.signal_ok:
             return None
+        return self.build_signal_from_diagnostics(
+            market=market,
+            yes_quote=yes_quote,
+            no_quote=no_quote,
+            now_utc=now_utc,
+            tick_size_yes=tick_size_yes,
+            tick_size_no=tick_size_no,
+            order_size_usdc=order_size_usdc,
+            diagnostics=diagnostics,
+        )
+
+    def build_signal_from_diagnostics(
+        self,
+        market: BinaryMarket,
+        yes_quote: BestBidAskUpdate | None,
+        no_quote: BestBidAskUpdate | None,
+        now_utc: datetime,
+        tick_size_yes: float | None,
+        tick_size_no: float | None,
+        order_size_usdc: float,
+        diagnostics: SignalDiagnostics,
+    ) -> ArbSignal:
         assert yes_quote is not None and no_quote is not None
         assert yes_quote.best_ask is not None and no_quote.best_ask is not None
         return ArbSignal.new(
@@ -96,6 +118,22 @@ class ComplementArbStrategy:
             order_size_usdc=order_size_usdc,
             detected_at=now_utc,
             reason=diagnostics.reason,
+        )
+
+    def diagnose_with_quotes(
+        self,
+        yes_quote: BestBidAskUpdate | None,
+        no_quote: BestBidAskUpdate | None,
+        now_utc: datetime,
+        tick_size_yes: float | None,
+        tick_size_no: float | None,
+    ) -> SignalDiagnostics:
+        return self._build_diagnostics(
+            yes_quote=yes_quote,
+            no_quote=no_quote,
+            now_utc=now_utc,
+            tick_size_yes=tick_size_yes,
+            tick_size_no=tick_size_no,
         )
 
     def _build_diagnostics(

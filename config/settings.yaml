@@ -45,6 +45,9 @@ runtime:
   stale_asset_ms: 15000
   initial_market_data_grace_ms: 30000
   book_resync_idle_ms: 20000
+  resync_cooldown_ms: 60000
+  full_resync_cooldown_ms: 120000
+  max_resync_assets_per_cycle: 50
   resync_batch_size: 100
   snapshot_interval_minutes: 60
   report_export_interval_minutes: 1440
@@ -70,3 +73,11 @@ market_filters:
     - death
     - celebrity
   exclude_keywords: []
+  require_orderbook_enabled: true
+  max_markets_to_watch: 120
+  min_days_to_expiry: 0.5
+  max_days_to_expiry: 180
+  min_recent_activity: 0.0
+  min_liquidity_proxy: 0.0
+  min_volume_24h_proxy: 0.0
+  require_recent_trade_within_minutes:
