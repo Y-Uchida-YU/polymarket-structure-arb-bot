@@ -1,103 +1,66 @@
-﻿# Polymarket Structure Arb Bot (Shadow Paper Run v7)
+# Polymarket Structure Arb Bot (Shadow Paper Run v8)
 
-This repository runs a **paper-only** complement YES/NO structure strategy for Polymarket.
+This repository provides a **paper-only** Polymarket YES/NO complement structure bot for long-running shadow evaluation.
 
 ## Important: Still Not Live-Ready
 
 - Live order routing is not implemented.
-- Auth/signing, balances, and cancel-replace are not implemented.
-- Use `--paper` or `--shadow-paper` only.
+- CLOB auth/signing (L1/L2), balances, and cancel-replace are not implemented.
+- Use for `paper` / `shadow-paper` validation only.
 
-## v7 Goal
+## v8 Focus
 
-v7 is focused on observability, stability, and accounting validity.
+v8 prioritizes **observability and data-readiness** over trade frequency.
 
-- Do not loosen thresholds just to increase signal count.
-- Reduce false global safe mode blocks.
-- Reduce missing book state noise.
-- Make no-signal reasons and universe size metrics reliable enough for strategy evaluation.
+- Reduce over-triggered global safe mode.
+- Reduce `book_missing_after_resync`-type no-signal failures.
+- Keep unhealthy scope localized (`asset` / `market`) whenever possible.
+- Add a read-only local dashboard for run diagnosis.
 
-## What Changed in v7
+## Core Behavior
 
-- Safe mode is now reasoned and scoped:
-  - global reasons: `all_assets_stale`, `ws_unhealthy`, `resync_storm`, `exception_rate_exceeded`, `book_state_unhealthy`
-  - asset-scope blocking is used for partial unhealthy assets
-- Missing book state is classified:
-  - `book_not_ready`
-  - `no_initial_book`
-  - `book_evicted`
-  - `book_not_resynced_yet`
-  - `quote_missing_after_resync`
-- Market readiness is explicit:
-  - an asset is ready only when both bid and ask exist
-  - a market is ready only when both YES and NO assets are ready
-- Resync suppression was tightened:
-  - per-asset cooldown
-  - same-reason cooldown
-  - reason-specific cooldowns for stale and missing book state
-  - stale resync is skipped for assets that are not ready yet
-- Reporting now includes:
-  - `safe_mode_reasons`
-  - `missing_book_state_reasons`
-  - current/cumulative universe counts
-  - stronger warnings for data quality
+### Safe mode scope
 
-## Universe Metrics Definitions
+- `scope=asset`: only unhealthy assets are blocked.
+- `scope=market`: market blocked when both legs are unhealthy.
+- `scope=global`: enabled only when unhealthy conditions persist and cross configured global thresholds.
 
-- `current_watched_markets`:
-  Number of markets currently watched after filtering.
-- `cumulative_watched_markets`:
-  Unique watched markets seen during the run window.
-- `current_subscribed_assets`:
-  Number of assets currently subscribed (typically 2 per binary market).
-- `cumulative_subscribed_assets`:
-  Unique subscribed assets seen during the run window.
+Global scope now uses persistence gates:
 
-Startup logs and report output use the same meaning:
+- `guardrails.global_unhealthy_consecutive_count`
+- `guardrails.global_unhealthy_min_duration_seconds`
+- `guardrails.global_unhealthy_min_asset_ratio`
+- `guardrails.global_ws_unhealthy_min_asset_ratio`
 
-- `watched_markets(current/cumulative)`
-- `subscribed_assets(current/cumulative)`
+### Book recovery and warm-up
 
-## How to Read Safe Mode / Missing Book / Resync
+- After startup/resubscribe/resync, assets can be treated as `book_recovering`.
+- Recovery grace uses `runtime.resync_recovery_grace_ms`.
+- During warm-up/recovery, no-signal accounting records readiness reasons instead of over-counting hard missing-book states.
 
-- `safe_mode_blocked_global` high:
-  Usually a run-quality issue. Check `safe_mode_reasons` first.
-- `safe_mode_blocked_asset` high:
-  Partial universe quality issue, not necessarily full-run failure.
-- `missing_book_state_reason:no_initial_book` high:
-  New subscriptions are not getting initial books quickly enough.
-- `missing_book_state_reason:quote_missing_after_resync` high:
-  Resync is not restoring quotes reliably for some assets.
-- `resyncs_by_reason:stale_asset` high:
-  Freshness is unstable or resync suppression is too weak.
+### Universe control
 
-## Warning Meanings
+Shadow runs should stay intentionally small and stable.
 
-- `no_signals_in_window`: no signals in the report window.
-- `safe_mode_triggered`: global safe mode or safe-mode no-signal blocks occurred.
-- `safe_mode_dominates_run`: safe-mode no-signal reasons dominate no-signal accounting.
-- `no_signals_but_high_resync`: no signals but frequent resync activity.
-- `book_state_unhealthy`: no-signal reasons indicate book readiness problems.
-- `data_not_ready_for_evaluation`: run likely invalid for strategy evaluation due to data readiness/safe-mode domination.
-- `universe_too_large`: current universe may be too large for stable monitoring.
-- `resync_storm_detected`: excessive resync rate.
+- `market_filters.max_markets_to_watch`
+- `market_filters.require_orderbook_enabled`
+- liquidity/activity proxies and expiry filters in `market_filters`
 
-## Shadow Paper Run Validity Checklist
+## Metric Definitions (Report and Dashboard)
 
-Treat the run as **evaluation-ready** only when most of the following hold:
+The CLI report (`python -m src.main report ...`) and dashboard use the same definitions:
 
-- `safe_mode_blocked_global` is low and not dominant.
-- `missing_book_state_reasons` are low, especially `no_initial_book` and `quote_missing_after_resync`.
-- `stale_asset` resync reason is controlled and not dominating.
-- Warnings do not include `data_not_ready_for_evaluation`.
-- Universe size is intentional and stable (`current` counts are within expected ops limits).
-
-Treat the run as **invalid for strategy evaluation** when one or more of these are true:
-
-- Global safe mode dominates no-signal accounting.
-- Missing book state reasons dominate no-signal accounting.
-- Frequent resync storms mask normal strategy behavior.
-- Universe is too large for current data pipeline capacity.
+- `total_signals`: rows in `signals` within window (`detected_at`)
+- `total_fills`: rows in `fills` within window (`filled_at`)
+- `fill_rate`: distinct `fills.signal_id` / `total_signals`
+- `matched_fill_rate`: `execution_events.matched_qty > 0` / `total_signals`
+- `safe_mode_count`: metric count where `metric_name = safe_mode_entered`
+- `resync_count`: rows in `resync_events` within window
+- `watched_markets current/cumulative`: latest universe metrics in `metrics`
+- `subscribed_assets current/cumulative`: latest universe metrics in `metrics`
+- `safe_mode_scope_reasons`: parsed from `metrics.details` on safe-mode metrics
+- `no_signal_reasons`: `metrics` where `metric_name like no_signal_reason:%`
+- `missing_book_state_reasons`: `metrics` where `metric_name like missing_book_state_reason:%`
 
 ## Quick Start (Windows 11)
 
@@ -105,24 +68,24 @@ Treat the run as **invalid for strategy evaluation** when one or more of these a
 cd C:\MyProjects\polymarket-structure-arb-bot
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -U pip
-pip install -e .[dev]
+python -m pip install -U pip
+python -m pip install -e .[dev,dashboard]
 copy .env.example .env
 ```
 
-Validate config:
+### Validate config
 
 ```powershell
 python -m src.main run --validate-config --settings-path config/settings.shadow.yaml
 ```
 
-Run shadow paper:
+### Start shadow paper run
 
 ```powershell
 python -m src.main run --shadow-paper
 ```
 
-Generate report:
+### Generate report
 
 ```powershell
 python -m src.main report --last-hours 1
@@ -130,15 +93,54 @@ python -m src.main report --last-hours 24
 python -m src.main report --last-hours 24 --run-id <run_id>
 ```
 
-## Config Files
+### Launch local dashboard (read-only)
+
+```powershell
+python -m streamlit run src/dashboard_app.py -- --db-path data/state/state.db
+```
+
+## Dashboard Views
+
+- `Overview`: signals/fills/fill rates/safe mode/resync/pnl/universe/warm-up
+- `Run Detail`: per-run summary (`run_id`, uptime, counts, warnings)
+- `Diagnostics`: top resync reasons, safe-mode scope reasons, no-signal reasons, missing-book reasons
+- `PnL / Inventory`: projected PnL and unmatched inventory time series
+- `Market / Asset View`: market-level signal/fill/pnl diagnostics and asset-level resync trends
+
+Dashboard is local/read-only and does not modify SQLite.
+
+## Output Locations
+
+- Logs: `data/logs/`
+- SQLite state DB: `data/state/state.db`
+- CSV/JSON exports: `data/exports/`
+
+## Shadow Evaluation Guidance
+
+Treat run as **not ready for strategy evaluation** when:
+
+- `safe_mode_blocked_global` dominates no-signal reasons
+- missing-book reasons dominate (`no_initial_book`, `book_not_resynced_yet`, `quote_missing_after_resync`)
+- `resync_storm_detected` appears repeatedly
+- report warning includes `data_not_ready_for_evaluation`
+
+Treat run as **evaluation-ready** when:
+
+- global safe mode is rare and short-lived
+- no-signal reasons are mostly strategy-side (`edge_below_threshold`, quality guards) instead of data-readiness failures
+- resync reason mix is stable and non-storm
+- universe size remains within intended shadow limits
+
+## Config Profiles
 
 - Base: `config/settings.yaml`
-- Shadow paper profile: `config/settings.shadow.yaml`
+- Shadow-paper profile: `config/settings.shadow.yaml`
 
 ## Quality Checks
 
 ```powershell
-pytest -q
-ruff check .
-black --check .
+python -m pytest -q
+python -m ruff check .
+python -m black --check .
 ```
+

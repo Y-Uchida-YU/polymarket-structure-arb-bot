@@ -111,13 +111,10 @@ class GuardrailMonitor:
             set_safe_mode("high_unmatched_rate")
         if book_state_unhealthy:
             warnings.append("book_state_unhealthy")
-            set_safe_mode("book_state_unhealthy")
         if stale_asset_rate > self.settings.max_stale_asset_rate:
             warnings.append("high_stale_asset_rate")
-            set_safe_mode("book_state_unhealthy")
         if ws_unhealthy:
             warnings.append("ws_unhealthy")
-            set_safe_mode("ws_unhealthy")
         if resync_rate > self.settings.max_resync_rate_per_min:
             warnings.append("high_resync_rate")
             set_safe_mode("resync_storm")

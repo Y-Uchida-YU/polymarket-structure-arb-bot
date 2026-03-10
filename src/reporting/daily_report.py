@@ -56,6 +56,8 @@ class DailyReportGenerator:
             resync_by_reason = self._resync_by_reason(conn, window, run_id=run_id)
             no_signal_reasons = self._no_signal_reasons(conn, window, run_id=run_id)
             safe_mode_reasons = self._safe_mode_reasons(conn, window, run_id=run_id)
+            safe_mode_scope_reasons = self._safe_mode_scope_reasons(conn, window, run_id=run_id)
+            safe_mode_by_scope = self._safe_mode_by_scope(conn, window, run_id=run_id)
             missing_book_state_reasons = self._missing_book_state_reasons(
                 conn, window, run_id=run_id
             )
@@ -79,6 +81,7 @@ class DailyReportGenerator:
             if str(item.get("reason", ""))
             in {
                 "book_not_ready",
+                "book_recovering",
                 "book_missing_after_resync",
                 "book_not_resynced_yet",
                 "book_evicted",
@@ -143,6 +146,8 @@ class DailyReportGenerator:
             "warmup": warmup,
             "resyncs_by_reason": resync_by_reason,
             "safe_mode_reasons": safe_mode_reasons,
+            "safe_mode_scope_reasons": safe_mode_scope_reasons,
+            "safe_mode_by_scope": safe_mode_by_scope,
             "no_signal_reasons": no_signal_reasons,
             "missing_book_state_reasons": missing_book_state_reasons,
             "top_markets_by_signal_count": top_markets_by_signal,
@@ -224,6 +229,12 @@ class DailyReportGenerator:
                 f"{item['reason']}={item['count']}" for item in report["safe_mode_reasons"][:5]
             )
             lines.append(f"top_safe_mode_reasons: {safe_mode_summary}")
+        if report.get("safe_mode_scope_reasons"):
+            scope_reason_summary = ", ".join(
+                f"{item['scope']}:{item['reason']}={item['count']}"
+                for item in report["safe_mode_scope_reasons"][:5]
+            )
+            lines.append(f"top_safe_mode_scope_reasons: {scope_reason_summary}")
         if report.get("no_signal_reasons"):
             no_signal_summary = ", ".join(
                 f"{item['reason']}={item['count']}" for item in report["no_signal_reasons"][:5]
@@ -607,7 +618,11 @@ class DailyReportGenerator:
         SELECT details
         FROM metrics
         WHERE created_at >= ? AND created_at < ?
-          AND metric_name IN ('safe_mode_entered', 'safe_mode_asset_blocked')
+          AND metric_name IN (
+            'safe_mode_entered',
+            'safe_mode_asset_blocked',
+            'safe_mode_market_blocked'
+          )
         """
         params: list[object] = [window.start_iso, window.end_iso]
         if run_id is not None:
@@ -622,6 +637,60 @@ class DailyReportGenerator:
         return [
             {"reason": reason, "count": count}
             for reason, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        ]
+
+    def _safe_mode_scope_reasons(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT details
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name IN (
+            'safe_mode_entered',
+            'safe_mode_asset_blocked',
+            'safe_mode_market_blocked'
+          )
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[tuple[str, str], int] = {}
+        for row in rows:
+            details = str(row[0] or "")
+            scope = self._extract_kv_from_details(details, "scope") or "unknown"
+            reason = self._extract_kv_from_details(details, "reason") or "unknown"
+            key = (scope, reason)
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {"scope": scope, "reason": reason, "count": count}
+            for (scope, reason), count in sorted(
+                counts.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+
+    def _safe_mode_by_scope(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        scope_reason_rows = self._safe_mode_scope_reasons(conn, window, run_id=run_id)
+        counts: dict[str, int] = {}
+        for row in scope_reason_rows:
+            scope = str(row.get("scope", "unknown"))
+            count = int(row.get("count", 0))
+            counts[scope] = counts.get(scope, 0) + count
+        return [
+            {"scope": scope, "count": count}
+            for scope, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
         ]
 
     def _missing_book_state_reasons(

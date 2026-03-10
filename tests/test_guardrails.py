@@ -49,8 +49,9 @@ def test_high_stale_asset_rate_triggers_safe_mode_decision() -> None:
         safe_mode_active=False,
         safe_mode_entered_at=None,
     )
-    assert decision.enter_safe_mode_reason == "book_state_unhealthy"
-    assert decision.enter_safe_mode_scope == "global"
+    assert "high_stale_asset_rate" in decision.warnings
+    assert decision.enter_safe_mode_reason is None
+    assert decision.enter_safe_mode_scope is None
 
 
 def test_high_resync_rate_triggers_warning_only() -> None:
@@ -100,7 +101,8 @@ def test_ws_unhealthy_triggers_safe_mode_reason() -> None:
         safe_mode_active=False,
         safe_mode_entered_at=None,
     )
-    assert decision.enter_safe_mode_reason == "ws_unhealthy"
+    assert "ws_unhealthy" in decision.warnings
+    assert decision.enter_safe_mode_reason is None
 
 
 def test_safe_mode_can_exit_after_cooldown() -> None:

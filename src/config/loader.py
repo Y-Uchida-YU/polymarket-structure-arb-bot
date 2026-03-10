@@ -65,6 +65,7 @@ class RuntimeSettings(BaseModel):
     stale_asset_ms: int = 15_000
     initial_market_data_grace_ms: int = 30_000
     per_asset_book_grace_ms: int = 60_000
+    resync_recovery_grace_ms: int = 180_000
     book_resync_idle_ms: int = 20_000
     resync_cooldown_ms: int = 60_000
     same_reason_resync_cooldown_ms: int = 120_000
@@ -88,6 +89,10 @@ class GuardrailSettings(BaseModel):
     max_stale_asset_rate: float = 0.80
     max_resync_rate_per_min: float = 40.0
     max_exception_rate_per_min: float = 8.0
+    global_unhealthy_consecutive_count: int = 3
+    global_unhealthy_min_duration_seconds: int = 180
+    global_unhealthy_min_asset_ratio: float = 0.95
+    global_ws_unhealthy_min_asset_ratio: float = 0.95
     hard_stop_on_exception_spike: bool = False
     hard_stop_exception_rate_per_min: float = 20.0
 

@@ -246,6 +246,12 @@ def test_daily_report_v7_breakdowns_and_warnings(tmp_path: Path) -> None:
     safe_mode_reasons = {item["reason"]: item["count"] for item in report["safe_mode_reasons"]}
     assert safe_mode_reasons["all_assets_stale"] >= 1
     assert safe_mode_reasons["book_state_unhealthy"] >= 1
+    safe_mode_scope_reasons = {
+        f"{item['scope']}:{item['reason']}": item["count"]
+        for item in report["safe_mode_scope_reasons"]
+    }
+    assert safe_mode_scope_reasons["global:all_assets_stale"] >= 1
+    assert safe_mode_scope_reasons["asset:book_state_unhealthy"] >= 1
 
     missing_reasons = {
         item["reason"]: item["count"] for item in report["missing_book_state_reasons"]

@@ -124,18 +124,15 @@ class QuoteManager:
         latest = self.best_quotes_by_asset.get(asset_id)
         if latest is None:
             return False
-        return latest.best_bid is not None and latest.best_ask is not None
+        # Readiness for signal evaluation depends on ask availability.
+        # Bid can be missing on thin books, but that should not force a hard not-ready state.
+        return latest.best_ask is not None
 
     def is_market_ready(self, market_id: str) -> bool:
         yes_quote, no_quote = self.get_market_quotes(market_id)
         if yes_quote is None or no_quote is None:
             return False
-        return (
-            yes_quote.best_bid is not None
-            and yes_quote.best_ask is not None
-            and no_quote.best_bid is not None
-            and no_quote.best_ask is not None
-        )
+        return yes_quote.best_ask is not None and no_quote.best_ask is not None
 
     def is_asset_stale(self, asset_id: str, now_utc: datetime, max_age_ms: int) -> bool:
         latest = self.best_quotes_by_asset.get(asset_id)
