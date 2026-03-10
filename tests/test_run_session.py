@@ -152,3 +152,25 @@ def test_non_stale_safe_mode_reason_is_not_auto_cleared(tmp_path: Path) -> None:
     assert app.state.safe_mode_active is True
     assert app.state.safe_mode_reason == "high_signal_rate"
     asyncio.run(app.shutdown())
+
+
+def test_no_signal_reason_metric_is_persisted(tmp_path: Path) -> None:
+    app = _make_app(tmp_path)
+    now = datetime(2026, 3, 10, tzinfo=UTC)
+    app._record_no_signal_reason("edge_below_threshold", now_utc=now, market_id="m1")
+
+    row = app.sqlite_store.conn.execute(
+        """
+        SELECT metric_name, metric_value, details
+        FROM metrics
+        WHERE run_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (app.state.run_id,),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "no_signal_reason:edge_below_threshold"
+    assert row[1] == 1.0
+    assert row[2] == "market_id=m1"
+    asyncio.run(app.shutdown())

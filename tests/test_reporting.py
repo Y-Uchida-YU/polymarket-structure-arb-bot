@@ -92,10 +92,24 @@ def _seed_report_data(db_path: Path) -> None:
         )
         store.conn.execute(
             """
+            INSERT INTO resync_events (run_id, asset_id, reason, status, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("run-1", "no1", "idle_timeout", "ok", "resync_applied", ts),
+        )
+        store.conn.execute(
+            """
             INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
             ("run-1", "safe_mode_entered", 1.0, "high_reject_rate", ts),
+        )
+        store.conn.execute(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("run-1", "no_signal_reason:edge_below_threshold", 1.0, "market_id=m1", ts),
         )
     store.close()
 
@@ -112,6 +126,10 @@ def test_daily_report_generator_outputs_core_metrics(tmp_path: Path) -> None:
     assert report["totals"]["safe_mode_count"] == 1
     assert "top_markets_by_signal_count" in report
     assert "top_reject_reasons" in report
+    assert "resyncs_by_reason" in report
+    assert report["resyncs_by_reason"][0]["count"] >= 1
+    assert "no_signal_reasons" in report
+    assert report["no_signal_reasons"][0]["reason"] == "edge_below_threshold"
 
 
 def test_daily_report_generator_writes_json_and_csv(tmp_path: Path) -> None:

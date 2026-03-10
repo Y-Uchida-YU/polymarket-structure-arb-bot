@@ -1,43 +1,51 @@
-# Polymarket Structure Arb Bot (Paper Trading v5)
+# Polymarket Structure Arb Bot (Shadow Paper Run v6)
 
-Polymarket の binary market を監視し、YES/NO の価格非整合シグナルを検出する paper bot です。  
-v5 は「実市場で 24時間〜7日間の Shadow Paper Run を安全に回して評価する」ための改善版です。
+Polymarket の binary YES/NO 市場を監視し、構造的な価格非整合を検出する paper-trading bot です。  
+v6 は「戦略の高度化」ではなく、Shadow Paper Run の観測品質改善に集中しています。
 
-## Important: Live Trading Status
+## Important: Not Live-Ready
 
-- このリポジトリは **still not live-ready** です。
+- 本リポジトリは **paper trading 専用** です。
 - live order / auth / signing / balances / cancel-replace は未実装です。
-- 現在は **paper trading 専用** です。
+- `--paper` / `--shadow-paper` でのみ利用してください。
 
-## v5 でできること
+## v6 の主な改善
 
-- Gamma API から active markets を取得し、binary market を抽出
-- `enableOrderBook=true` を含む厳格フィルタを通過した市場のみ監視
-- WebSocket + 自動再接続 + 再購読
-- tick size 管理（初期取得 + `tick_size_change` 追随）
-- orderbook summary resync（接続直後 / stale検知 / ws idle）
-- conservative な paper fill（stale/depth/partial/one-leg/slippage）
-- signal / fill / inventory / pnl の責務分離
-- run_id 付きの構造化ログ保存（CSV + SQLite）
-- guardrail による異常監視（warning / safe mode / optional hard stop）
-- 定期 snapshot（run 中の状態記録）
-- 日次/直近時間の report 生成 CLI
+- resync reason を分類して保存  
+  `ws_connected`, `ws_reconnect`, `idle_timeout`, `missing_book_state`, `stale_asset`, `market_universe_changed`
+- resync storm 抑制  
+  - per-asset resync cooldown
+  - full-resync cooldown
+  - 1サイクルあたりの resync 対象上限
+- 監視ユニバース縮小  
+  - `max_markets_to_watch`
+  - activity proxy (`min_recent_activity`, `min_liquidity_proxy`, `min_volume_24h_proxy`)
+  - expiry window (`min_days_to_expiry`, `max_days_to_expiry`)
+- no-signal reason を記録・集計  
+  例: `edge_below_threshold`, `spread_too_wide`, `depth_too_low`, `quote_too_old`, `asset_not_ready`, `safe_mode_blocked`
+- report を強化  
+  - resyncs by reason
+  - no-signal reasons
+  - watched/subscribed universe 概況
+  - warm-up 概況
 
-## v5 の主眼
+## できること / できないこと
 
-- Shadow Paper Run 中の長時間安定性
-- 暴走検知（signal/fill/stale/resync/exception）
-- 「なぜこの PnL になったか」を後追いできる記録
-- 見かけの勝率より保守的な評価
+### できること
 
-## まだ未対応
+- Gamma API から active markets を取得し binary 市場を抽出
+- market channel websocket で `best_bid_ask` を受信
+- YES/NO の ask 合計によるシグナル判定
+- conservative な paper fill（stale/depth/slippage/partial/one-leg を考慮）
+- CSV + SQLite 保存
+- run/session 単位の summary と日次 report 出力
 
-- live order placement
-- CLOB 認証（L1/L2, POLY_* headers）
-- signing
-- balance / allowance
-- cancel / replace
-- 取引所レベルの完全な queue/matching 再現
+### できないこと
+
+- 実注文
+- CLOB 認証・署名
+- 資産残高の実取得
+- cancel/replace 実装
 
 ## ディレクトリ
 
@@ -51,82 +59,133 @@ polymarket-structure-arb-bot/
 
 ## Windows 11 Runbook (手動運用)
 
-1. 作業ディレクトリへ移動
+1. リポジトリに移動
 
 ```powershell
 cd C:\MyProjects\polymarket-structure-arb-bot
 ```
 
-2. Python 3.12 仮想環境を作成
+2. Python 3.12 仮想環境
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-3. 依存関係をインストール
+3. 依存インストール
 
 ```powershell
 pip install -U pip
 pip install -e .[dev]
 ```
 
-4. `.env` を準備
+4. `.env` 準備
 
 ```powershell
 copy .env.example .env
 ```
 
-5. 設定ファイルを選ぶ
+5. 設定ファイルを選択
 
 - 通常: `config/settings.yaml`
 - Shadow Paper Run 推奨: `config/settings.shadow.yaml`
 
-6. 起動前チェック
+6. 設定検証
 
 ```powershell
 python -m src.main run --validate-config --settings-path config/settings.shadow.yaml
 ```
 
-7. Shadow Paper Run 起動（推奨）
+7. Shadow Paper Run 起動
 
 ```powershell
 python -m src.main run --shadow-paper
 ```
 
-8. 停止方法
+8. 停止
 
-- 実行中ターミナルで `Ctrl + C`
-- 停止時に run summary が保存されます
-
-9. ログ確認場所
-
-- CSV: `data/exports/`
-- SQLite: `data/state/state.db`
-- 実行ログ: `data/logs/bot.log`（日次ローテーション）
-
-Notes:
-- 現時点は手動起動前提です。
-- Windows タスクスケジューラ常駐化は本READMEでは扱いません。
+- `Ctrl + C`
+- 停止時に run summary を出力
 
 ## 実行モード
-
-### Run
 
 ```powershell
 python -m src.main run [options]
 ```
 
-主要オプション:
-
-- `--paper / --no-paper` (live は未実装)
+- `--paper / --no-paper` (`--no-paper` は live 未実装のため非推奨)
 - `--shadow-paper` (長時間観測向け)
-- `--once` (市場ロードのみで終了)
-- `--dry-run` (起動パス検証して終了)
-- `--validate-config` (設定検証のみ)
-- `--settings-path config/settings.yaml`
+- `--once`
+- `--dry-run`
+- `--validate-config`
+- `--settings-path <path>`
 
-### Report
+## Warm-up 挙動
+
+起動直後の race を避けるため、以下の条件を満たすまでは stale guard を抑制します。
+
+- `ws_connected_at` が未設定なら stale 判定しない
+- subscribe 直後は `runtime.initial_market_data_grace_ms` の間 warming-up 扱い
+- `all_assets_stale` safe mode は warm-up 解除後のみ評価
+
+## Shadow Paper 設定の考え方 (v6)
+
+`config/settings.shadow.yaml` は「高頻度反応」ではなく「安定観測」重視です。
+
+- 監視市場を強く絞る (`max_markets_to_watch`)
+- `stale_asset_ms` / `book_resync_idle_ms` は長め
+- resync cooldown を導入して連打を抑制
+
+## 主要設定
+
+### market_filters
+
+- `max_markets_to_watch`
+- `require_orderbook_enabled`
+- `min_days_to_expiry`, `max_days_to_expiry`
+- `min_recent_activity`
+- `min_liquidity_proxy`
+- `min_volume_24h_proxy`
+- `require_recent_trade_within_minutes` (必要時のみ利用)
+
+### runtime
+
+- `stale_asset_ms`
+- `book_resync_idle_ms`
+- `resync_cooldown_ms`
+- `full_resync_cooldown_ms`
+- `max_resync_assets_per_cycle`
+- `market_refresh_minutes`
+
+## 出力
+
+### SQLite
+
+`data/state/state.db` に保存します。主テーブル:
+
+- `signals`, `orders`, `fills`
+- `execution_events`
+- `inventory_snapshots`, `pnl_snapshots`
+- `resync_events`, `metrics`, `tick_sizes`, `errors`
+- `run_snapshots`, `run_summaries`
+
+### CSV
+
+`data/exports/` に日次ファイルを保存します。主ファイル:
+
+- `signals_YYYYMMDD.csv`
+- `fills_YYYYMMDD.csv`
+- `execution_events_YYYYMMDD.csv`
+- `inventory_YYYYMMDD.csv`
+- `pnl_YYYYMMDD.csv`
+- `metrics_YYYYMMDD.csv`
+- `resync_YYYYMMDD.csv`
+- `run_snapshots_YYYYMMDD.csv`
+- `run_summaries_YYYYMMDD.csv`
+
+## Report
+
+日次/時間窓レポート:
 
 ```powershell
 python -m src.main report --date 2026-03-10
@@ -134,104 +193,15 @@ python -m src.main report --last-hours 24
 python -m src.main report --last-hours 24 --run-id <run_id>
 ```
 
-出力:
+`data/exports/` に JSON/CSV を保存します。
 
-- コンソールにサマリー表示
-- `data/exports/` へ JSON + CSV を保存
+### v6 で見るべき項目
 
-## Shadow Paper Run 専用ポイント
-
-- `--shadow-paper` 起動時、既定で `config/settings.shadow.yaml` を優先
-  - ただし `--settings-path` を明示した場合はその値を優先
-- 起動サマリーに以下を表示
-  - mode / runtime environment
-  - paper only / live not implemented
-  - strategy thresholds / risk limits
-  - stale thresholds / refresh interval
-  - output directories
-- 起動直後の warm-up 保護
-  - `runtime.initial_market_data_grace_ms` の間は stale guard を保留
-  - WebSocket 未接続時は `all_assets_stale` による safe mode を発動しない
-  - 初回 quote 未受信 asset は warm-up 中として扱い、grace 経過後に stale 判定へ移行
-- 定期 snapshot を保存
-- guardrail 異常時は safe mode（新規 signal 停止）へ移行
-
-## Guardrail / Safe Mode
-
-監視対象（設定値は `settings*.yaml` の `guardrails`）:
-
-- signal rate
-- fill reject rate
-- one-leg rate
-- unmatched inventory rate
-- stale asset rate
-- resync rate
-- exception rate
-
-段階:
-
-- warning: `metrics` + log に記録
-- safe mode: 新規 signal を停止
-- hard stop: 例外スパイク時のみ設定で有効化可能
-
-safe mode 発動理由は CSV/SQLite に保存され、run summary にも集計されます。
-
-## PnL 会計（v4/v5）
-
-- signal は観測値、PnL は **actual fill** と inventory から計算
-- matched/unmatched を分離
-- 主な指標:
-  - `estimated_edge_at_signal`
-  - `projected_matched_pnl`
-  - `unmatched_inventory_mtm`
-  - `total_projected_pnl`
-
-## 保存データ
-
-### SQLite (`data/state/state.db`)
-
-主要テーブル:
-
-- `signals`, `orders`, `fills`
-- `inventory_snapshots`, `pnl_snapshots`
-- `execution_events`
-- `resync_events`, `tick_sizes`, `metrics`, `errors`
-- `run_snapshots`, `run_summaries`
-
-### CSV (`data/exports/`)
-
-主要ファイル:
-
-- `signals_YYYYMMDD.csv`
-- `fills_YYYYMMDD.csv`
-- `execution_events_YYYYMMDD.csv`
-- `inventory_YYYYMMDD.csv`
-- `pnl_YYYYMMDD.csv`
-- `run_snapshots_YYYYMMDD.csv`
-- `run_summaries_YYYYMMDD.csv`
-- `metrics_YYYYMMDD.csv`, `resync_YYYYMMDD.csv`, `errors_YYYYMMDD.csv`
-- `daily_report_*.json`, `daily_report_*.csv`
-
-## 日次レポートの読み方
-
-`report` コマンドは最低限以下を集計します:
-
-- total signals / fills / fill rate
-- matched fill rate
-- one-leg count/rate
-- stale reject count/rate
-- depth reject count/rate
-- resync count
-- safe mode count
-- projected matched pnl
-- unmatched inventory mtm
-- total projected pnl
-- top markets by signal count
-- top markets by pnl
-- top reject reasons
-
-`warnings` セクションに異常兆候（例: `low_fill_rate`, `high_one_leg_rate`）が出ます。  
-この warning を見て、設定や市場フィルタの見直しを行ってください。
+- `resync_count` と `resyncs_by_reason`
+- `no_signal_reasons`
+- `watched_markets` / `subscribed_assets`
+- warnings  
+  例: `resync_storm_detected`, `no_signals_but_high_resync`, `universe_too_large`
 
 ## 品質チェック
 
@@ -243,11 +213,6 @@ black --check .
 
 ## 既知の制約
 
-- paper fill は簡易モデルであり、実際の queue priority を完全再現しません
-- unmatched valuation は保守的 MTM だが、流動性断絶時の完全再現ではありません
-- network/API 障害時は保守動作するが、収益性評価には十分な観測期間が必要です
-
-## 今後のフェーズ（別途）
-
-この v5 は「観測Bot + signal bot + 現実寄り paper bot」までです。  
-live readiness（auth/signing/order/cancel/balance）は次フェーズで実装します。
+- paper fill は保守的だが、取引所マッチングの完全再現ではない
+- queue priority の厳密シミュレーションは未実装
+- live readiness は別フェーズ

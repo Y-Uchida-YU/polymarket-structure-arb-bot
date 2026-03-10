@@ -209,3 +209,27 @@ def test_csv_logger_writes_inventory_and_pnl_breakdown_columns(tmp_path: Path) -
     assert "projected_matched_pnl" in pnl_header
     assert "unmatched_inventory_mtm" in pnl_header
     assert "total_projected_pnl" in pnl_header
+
+
+def test_sqlite_resync_event_persists_reason(tmp_path: Path) -> None:
+    store = SQLiteStore(db_path=tmp_path / "state.db")
+    store.save_resync_event(
+        asset_id="yes1",
+        reason="idle_timeout",
+        status="ok",
+        details="resync_applied",
+        created_at_iso="2026-03-10T00:00:00+00:00",
+        run_id="run-1",
+    )
+    row = store.conn.execute("""
+        SELECT run_id, asset_id, reason, status
+        FROM resync_events
+        ORDER BY id DESC
+        LIMIT 1
+        """).fetchone()
+    assert row is not None
+    assert row[0] == "run-1"
+    assert row[1] == "yes1"
+    assert row[2] == "idle_timeout"
+    assert row[3] == "ok"
+    store.close()
