@@ -1,218 +1,146 @@
-# Polymarket Structure Arb Bot (Shadow Paper Run v6)
+# Polymarket Structure Arb Bot (Shadow Paper Run v8)
 
-Polymarket の binary YES/NO 市場を監視し、構造的な価格非整合を検出する paper-trading bot です。  
-v6 は「戦略の高度化」ではなく、Shadow Paper Run の観測品質改善に集中しています。
+This repository provides a **paper-only** Polymarket YES/NO complement structure bot for long-running shadow evaluation.
 
-## Important: Not Live-Ready
+## Important: Still Not Live-Ready
 
-- 本リポジトリは **paper trading 専用** です。
-- live order / auth / signing / balances / cancel-replace は未実装です。
-- `--paper` / `--shadow-paper` でのみ利用してください。
+- Live order routing is not implemented.
+- CLOB auth/signing (L1/L2), balances, and cancel-replace are not implemented.
+- Use for `paper` / `shadow-paper` validation only.
 
-## v6 の主な改善
+## v8 Focus
 
-- resync reason を分類して保存  
-  `ws_connected`, `ws_reconnect`, `idle_timeout`, `missing_book_state`, `stale_asset`, `market_universe_changed`
-- resync storm 抑制  
-  - per-asset resync cooldown
-  - full-resync cooldown
-  - 1サイクルあたりの resync 対象上限
-- 監視ユニバース縮小  
-  - `max_markets_to_watch`
-  - activity proxy (`min_recent_activity`, `min_liquidity_proxy`, `min_volume_24h_proxy`)
-  - expiry window (`min_days_to_expiry`, `max_days_to_expiry`)
-- no-signal reason を記録・集計  
-  例: `edge_below_threshold`, `spread_too_wide`, `depth_too_low`, `quote_too_old`, `asset_not_ready`, `safe_mode_blocked`
-- report を強化  
-  - resyncs by reason
-  - no-signal reasons
-  - watched/subscribed universe 概況
-  - warm-up 概況
+v8 prioritizes **observability and data-readiness** over trade frequency.
 
-## できること / できないこと
+- Reduce over-triggered global safe mode.
+- Reduce `book_missing_after_resync`-type no-signal failures.
+- Keep unhealthy scope localized (`asset` / `market`) whenever possible.
+- Add a read-only local dashboard for run diagnosis.
 
-### できること
+## Core Behavior
 
-- Gamma API から active markets を取得し binary 市場を抽出
-- market channel websocket で `best_bid_ask` を受信
-- YES/NO の ask 合計によるシグナル判定
-- conservative な paper fill（stale/depth/slippage/partial/one-leg を考慮）
-- CSV + SQLite 保存
-- run/session 単位の summary と日次 report 出力
+### Safe mode scope
 
-### できないこと
+- `scope=asset`: only unhealthy assets are blocked.
+- `scope=market`: market blocked when both legs are unhealthy.
+- `scope=global`: enabled only when unhealthy conditions persist and cross configured global thresholds.
 
-- 実注文
-- CLOB 認証・署名
-- 資産残高の実取得
-- cancel/replace 実装
+Global scope now uses persistence gates:
 
-## ディレクトリ
+- `guardrails.global_unhealthy_consecutive_count`
+- `guardrails.global_unhealthy_min_duration_seconds`
+- `guardrails.global_unhealthy_min_asset_ratio`
+- `guardrails.global_ws_unhealthy_min_asset_ratio`
 
-```text
-polymarket-structure-arb-bot/
-├─ config/
-├─ data/
-├─ src/
-└─ tests/
-```
+### Book recovery and warm-up
 
-## Windows 11 Runbook (手動運用)
+- After startup/resubscribe/resync, assets can be treated as `book_recovering`.
+- Recovery grace uses `runtime.resync_recovery_grace_ms`.
+- During warm-up/recovery, no-signal accounting records readiness reasons instead of over-counting hard missing-book states.
 
-1. リポジトリに移動
+### Universe control
+
+Shadow runs should stay intentionally small and stable.
+
+- `market_filters.max_markets_to_watch`
+- `market_filters.require_orderbook_enabled`
+- liquidity/activity proxies and expiry filters in `market_filters`
+
+## Metric Definitions (Report and Dashboard)
+
+The CLI report (`python -m src.main report ...`) and dashboard use the same definitions:
+
+- `total_signals`: rows in `signals` within window (`detected_at`)
+- `total_fills`: rows in `fills` within window (`filled_at`)
+- `fill_rate`: distinct `fills.signal_id` / `total_signals`
+- `matched_fill_rate`: `execution_events.matched_qty > 0` / `total_signals`
+- `safe_mode_count`: metric count where `metric_name = safe_mode_entered`
+- `resync_count`: rows in `resync_events` within window
+- `watched_markets current/cumulative`: latest universe metrics in `metrics`
+- `subscribed_assets current/cumulative`: latest universe metrics in `metrics`
+- `safe_mode_scope_reasons`: parsed from `metrics.details` on safe-mode metrics
+- `no_signal_reasons`: `metrics` where `metric_name like no_signal_reason:%`
+- `missing_book_state_reasons`: `metrics` where `metric_name like missing_book_state_reason:%`
+
+## Quick Start (Windows 11)
 
 ```powershell
 cd C:\MyProjects\polymarket-structure-arb-bot
-```
-
-2. Python 3.12 仮想環境
-
-```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-3. 依存インストール
-
-```powershell
-pip install -U pip
-pip install -e .[dev]
-```
-
-4. `.env` 準備
-
-```powershell
+python -m pip install -U pip
+python -m pip install -e .[dev,dashboard]
 copy .env.example .env
 ```
 
-5. 設定ファイルを選択
-
-- 通常: `config/settings.yaml`
-- Shadow Paper Run 推奨: `config/settings.shadow.yaml`
-
-6. 設定検証
+### Validate config
 
 ```powershell
 python -m src.main run --validate-config --settings-path config/settings.shadow.yaml
 ```
 
-7. Shadow Paper Run 起動
+### Start shadow paper run
 
 ```powershell
 python -m src.main run --shadow-paper
 ```
 
-8. 停止
-
-- `Ctrl + C`
-- 停止時に run summary を出力
-
-## 実行モード
+### Generate report
 
 ```powershell
-python -m src.main run [options]
-```
-
-- `--paper / --no-paper` (`--no-paper` は live 未実装のため非推奨)
-- `--shadow-paper` (長時間観測向け)
-- `--once`
-- `--dry-run`
-- `--validate-config`
-- `--settings-path <path>`
-
-## Warm-up 挙動
-
-起動直後の race を避けるため、以下の条件を満たすまでは stale guard を抑制します。
-
-- `ws_connected_at` が未設定なら stale 判定しない
-- subscribe 直後は `runtime.initial_market_data_grace_ms` の間 warming-up 扱い
-- `all_assets_stale` safe mode は warm-up 解除後のみ評価
-
-## Shadow Paper 設定の考え方 (v6)
-
-`config/settings.shadow.yaml` は「高頻度反応」ではなく「安定観測」重視です。
-
-- 監視市場を強く絞る (`max_markets_to_watch`)
-- `stale_asset_ms` / `book_resync_idle_ms` は長め
-- resync cooldown を導入して連打を抑制
-
-## 主要設定
-
-### market_filters
-
-- `max_markets_to_watch`
-- `require_orderbook_enabled`
-- `min_days_to_expiry`, `max_days_to_expiry`
-- `min_recent_activity`
-- `min_liquidity_proxy`
-- `min_volume_24h_proxy`
-- `require_recent_trade_within_minutes` (必要時のみ利用)
-
-### runtime
-
-- `stale_asset_ms`
-- `book_resync_idle_ms`
-- `resync_cooldown_ms`
-- `full_resync_cooldown_ms`
-- `max_resync_assets_per_cycle`
-- `market_refresh_minutes`
-
-## 出力
-
-### SQLite
-
-`data/state/state.db` に保存します。主テーブル:
-
-- `signals`, `orders`, `fills`
-- `execution_events`
-- `inventory_snapshots`, `pnl_snapshots`
-- `resync_events`, `metrics`, `tick_sizes`, `errors`
-- `run_snapshots`, `run_summaries`
-
-### CSV
-
-`data/exports/` に日次ファイルを保存します。主ファイル:
-
-- `signals_YYYYMMDD.csv`
-- `fills_YYYYMMDD.csv`
-- `execution_events_YYYYMMDD.csv`
-- `inventory_YYYYMMDD.csv`
-- `pnl_YYYYMMDD.csv`
-- `metrics_YYYYMMDD.csv`
-- `resync_YYYYMMDD.csv`
-- `run_snapshots_YYYYMMDD.csv`
-- `run_summaries_YYYYMMDD.csv`
-
-## Report
-
-日次/時間窓レポート:
-
-```powershell
-python -m src.main report --date 2026-03-10
+python -m src.main report --last-hours 1
 python -m src.main report --last-hours 24
 python -m src.main report --last-hours 24 --run-id <run_id>
 ```
 
-`data/exports/` に JSON/CSV を保存します。
-
-### v6 で見るべき項目
-
-- `resync_count` と `resyncs_by_reason`
-- `no_signal_reasons`
-- `watched_markets` / `subscribed_assets`
-- warnings  
-  例: `resync_storm_detected`, `no_signals_but_high_resync`, `universe_too_large`
-
-## 品質チェック
+### Launch local dashboard (read-only)
 
 ```powershell
-pytest -q
-ruff check .
-black --check .
+python -m streamlit run src/dashboard_app.py -- --db-path data/state/state.db
 ```
 
-## 既知の制約
+## Dashboard Views
 
-- paper fill は保守的だが、取引所マッチングの完全再現ではない
-- queue priority の厳密シミュレーションは未実装
-- live readiness は別フェーズ
+- `Overview`: signals/fills/fill rates/safe mode/resync/pnl/universe/warm-up
+- `Run Detail`: per-run summary (`run_id`, uptime, counts, warnings)
+- `Diagnostics`: top resync reasons, safe-mode scope reasons, no-signal reasons, missing-book reasons
+- `PnL / Inventory`: projected PnL and unmatched inventory time series
+- `Market / Asset View`: market-level signal/fill/pnl diagnostics and asset-level resync trends
+
+Dashboard is local/read-only and does not modify SQLite.
+
+## Output Locations
+
+- Logs: `data/logs/`
+- SQLite state DB: `data/state/state.db`
+- CSV/JSON exports: `data/exports/`
+
+## Shadow Evaluation Guidance
+
+Treat run as **not ready for strategy evaluation** when:
+
+- `safe_mode_blocked_global` dominates no-signal reasons
+- missing-book reasons dominate (`no_initial_book`, `book_not_resynced_yet`, `quote_missing_after_resync`)
+- `resync_storm_detected` appears repeatedly
+- report warning includes `data_not_ready_for_evaluation`
+
+Treat run as **evaluation-ready** when:
+
+- global safe mode is rare and short-lived
+- no-signal reasons are mostly strategy-side (`edge_below_threshold`, quality guards) instead of data-readiness failures
+- resync reason mix is stable and non-storm
+- universe size remains within intended shadow limits
+
+## Config Profiles
+
+- Base: `config/settings.yaml`
+- Shadow-paper profile: `config/settings.shadow.yaml`
+
+## Quality Checks
+
+```powershell
+python -m pytest -q
+python -m ruff check .
+python -m black --check .
+```
+

@@ -55,6 +55,12 @@ class DailyReportGenerator:
             top_reject_reasons = self._top_reject_reasons(conn, window, run_id=run_id)
             resync_by_reason = self._resync_by_reason(conn, window, run_id=run_id)
             no_signal_reasons = self._no_signal_reasons(conn, window, run_id=run_id)
+            safe_mode_reasons = self._safe_mode_reasons(conn, window, run_id=run_id)
+            safe_mode_scope_reasons = self._safe_mode_scope_reasons(conn, window, run_id=run_id)
+            safe_mode_by_scope = self._safe_mode_by_scope(conn, window, run_id=run_id)
+            missing_book_state_reasons = self._missing_book_state_reasons(
+                conn, window, run_id=run_id
+            )
             universe = self._universe_overview(conn, window, run_id=run_id)
             warmup = self._warmup_overview(conn, window, run_id=run_id)
 
@@ -63,6 +69,26 @@ class DailyReportGenerator:
         one_leg_rate = one_leg_count / total_signals if total_signals > 0 else 0.0
         stale_reject_rate = stale_reject_count / total_signals if total_signals > 0 else 0.0
         depth_reject_rate = depth_reject_count / total_signals if total_signals > 0 else 0.0
+        no_signal_total = sum(int(item.get("count", 0)) for item in no_signal_reasons)
+        safe_mode_blocked_total = sum(
+            int(item.get("count", 0))
+            for item in no_signal_reasons
+            if str(item.get("reason", "")).startswith("safe_mode_blocked_")
+        )
+        book_no_signal_total = sum(
+            int(item.get("count", 0))
+            for item in no_signal_reasons
+            if str(item.get("reason", ""))
+            in {
+                "book_not_ready",
+                "book_recovering",
+                "book_missing_after_resync",
+                "book_not_resynced_yet",
+                "book_evicted",
+                "no_initial_book",
+            }
+        )
+        missing_book_total = sum(int(item.get("count", 0)) for item in missing_book_state_reasons)
 
         warnings: list[str] = []
         if total_signals == 0:
@@ -73,13 +99,23 @@ class DailyReportGenerator:
             warnings.append("high_one_leg_rate")
         if stale_reject_rate > 0.3:
             warnings.append("high_stale_reject_rate")
-        if safe_mode_count > 0:
+        if safe_mode_count > 0 or safe_mode_blocked_total > 0:
             warnings.append("safe_mode_triggered")
+        if safe_mode_blocked_total >= max(10, int(no_signal_total * 0.5)):
+            warnings.append("safe_mode_dominates_run")
         if resync_count >= 1_000:
             warnings.append("resync_storm_detected")
         if total_signals == 0 and resync_count >= 100:
             warnings.append("no_signals_but_high_resync")
-        if universe["watched_markets"] > 150 or universe["subscribed_assets"] > 300:
+        if book_no_signal_total > 0 or missing_book_total > 0:
+            warnings.append("book_state_unhealthy")
+        if total_signals == 0 and (
+            safe_mode_blocked_total > 0
+            or missing_book_total > 0
+            or warmup.get("warmup_events", 0) > 0
+        ):
+            warnings.append("data_not_ready_for_evaluation")
+        if universe["current_watched_markets"] > 150 or universe["current_subscribed_assets"] > 300:
             warnings.append("universe_too_large")
 
         report = {
@@ -109,7 +145,11 @@ class DailyReportGenerator:
             "universe": universe,
             "warmup": warmup,
             "resyncs_by_reason": resync_by_reason,
+            "safe_mode_reasons": safe_mode_reasons,
+            "safe_mode_scope_reasons": safe_mode_scope_reasons,
+            "safe_mode_by_scope": safe_mode_by_scope,
             "no_signal_reasons": no_signal_reasons,
+            "missing_book_state_reasons": missing_book_state_reasons,
             "top_markets_by_signal_count": top_markets_by_signal,
             "top_markets_by_pnl": top_markets_by_pnl,
             "top_reject_reasons": top_reject_reasons,
@@ -162,8 +202,14 @@ class DailyReportGenerator:
             f"resync_count: {totals['resync_count']}",
             f"safe_mode_count: {totals['safe_mode_count']}",
             (
-                "watched_markets/subscribed_assets: "
-                f"{universe.get('watched_markets', 0)} / {universe.get('subscribed_assets', 0)}"
+                "watched_markets(current/cumulative): "
+                f"{universe.get('current_watched_markets', 0)} / "
+                f"{universe.get('cumulative_watched_markets', 0)}"
+            ),
+            (
+                "subscribed_assets(current/cumulative): "
+                f"{universe.get('current_subscribed_assets', 0)} / "
+                f"{universe.get('cumulative_subscribed_assets', 0)}"
             ),
             (
                 "warmup_events/latest_warming_up_assets: "
@@ -178,11 +224,28 @@ class DailyReportGenerator:
                 f"{item['reason']}={item['count']}" for item in report["resyncs_by_reason"][:5]
             )
             lines.append(f"top_resync_reasons: {reason_summary}")
+        if report.get("safe_mode_reasons"):
+            safe_mode_summary = ", ".join(
+                f"{item['reason']}={item['count']}" for item in report["safe_mode_reasons"][:5]
+            )
+            lines.append(f"top_safe_mode_reasons: {safe_mode_summary}")
+        if report.get("safe_mode_scope_reasons"):
+            scope_reason_summary = ", ".join(
+                f"{item['scope']}:{item['reason']}={item['count']}"
+                for item in report["safe_mode_scope_reasons"][:5]
+            )
+            lines.append(f"top_safe_mode_scope_reasons: {scope_reason_summary}")
         if report.get("no_signal_reasons"):
             no_signal_summary = ", ".join(
                 f"{item['reason']}={item['count']}" for item in report["no_signal_reasons"][:5]
             )
             lines.append(f"top_no_signal_reasons: {no_signal_summary}")
+        if report.get("missing_book_state_reasons"):
+            missing_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in report["missing_book_state_reasons"][:5]
+            )
+            lines.append(f"top_missing_book_state_reasons: {missing_summary}")
         if report.get("warnings"):
             lines.append("warnings: " + ", ".join(report["warnings"]))
         return "\n".join(lines)
@@ -491,36 +554,217 @@ class DailyReportGenerator:
         *,
         run_id: str | None,
     ) -> dict[str, int]:
-        watched_markets_row = conn.execute("SELECT COUNT(*) FROM markets").fetchone()
-        watched_markets = int(watched_markets_row[0] if watched_markets_row else 0)
+        current_watched_markets = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="universe_current_watched_markets",
+        )
+        current_subscribed_assets = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="universe_current_subscribed_assets",
+        )
+        cumulative_watched_markets = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="universe_cumulative_watched_markets",
+        )
+        cumulative_subscribed_assets = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="universe_cumulative_subscribed_assets",
+        )
+        if cumulative_watched_markets == 0:
+            watched_row = conn.execute("SELECT COUNT(*) FROM markets").fetchone()
+            cumulative_watched_markets = int(watched_row[0] if watched_row else 0)
+        if cumulative_subscribed_assets == 0:
+            cumulative_query = """
+            SELECT COUNT(DISTINCT asset_id)
+            FROM quotes
+            WHERE quote_time >= ? AND quote_time < ?
+            """
+            cumulative_params: list[object] = [window.start_iso, window.end_iso]
+            if run_id is not None:
+                cumulative_query += " AND run_id = ?"
+                cumulative_params.append(run_id)
+            cumulative_row = conn.execute(cumulative_query, cumulative_params).fetchone()
+            cumulative_subscribed_assets = int(cumulative_row[0] if cumulative_row else 0)
+        if current_watched_markets == 0:
+            current_watched_markets = cumulative_watched_markets
+        if current_subscribed_assets == 0:
+            current_subscribed_assets = cumulative_subscribed_assets
 
+        return {
+            "watched_markets": current_watched_markets,
+            "subscribed_assets": current_subscribed_assets,
+            "current_watched_markets": current_watched_markets,
+            "current_subscribed_assets": current_subscribed_assets,
+            "cumulative_watched_markets": cumulative_watched_markets,
+            "cumulative_subscribed_assets": cumulative_subscribed_assets,
+        }
+
+    def _safe_mode_reasons(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
         query = """
-        SELECT COUNT(DISTINCT asset_id)
-        FROM quotes
-        WHERE quote_time >= ? AND quote_time < ?
+        SELECT details
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name IN (
+            'safe_mode_entered',
+            'safe_mode_asset_blocked',
+            'safe_mode_market_blocked'
+          )
         """
         params: list[object] = [window.start_iso, window.end_iso]
         if run_id is not None:
             query += " AND run_id = ?"
             params.append(run_id)
-        subscribed_row = conn.execute(query, params).fetchone()
-        subscribed_assets = int(subscribed_row[0] if subscribed_row else 0)
-        if subscribed_assets == 0:
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            details = str(row[0] or "")
+            reason = self._extract_kv_from_details(details, "reason") or "unknown"
+            counts[reason] = counts.get(reason, 0) + 1
+        return [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        ]
+
+    def _safe_mode_scope_reasons(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT details
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name IN (
+            'safe_mode_entered',
+            'safe_mode_asset_blocked',
+            'safe_mode_market_blocked'
+          )
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[tuple[str, str], int] = {}
+        for row in rows:
+            details = str(row[0] or "")
+            scope = self._extract_kv_from_details(details, "scope") or "unknown"
+            reason = self._extract_kv_from_details(details, "reason") or "unknown"
+            key = (scope, reason)
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {"scope": scope, "reason": reason, "count": count}
+            for (scope, reason), count in sorted(
+                counts.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+
+    def _safe_mode_by_scope(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        scope_reason_rows = self._safe_mode_scope_reasons(conn, window, run_id=run_id)
+        counts: dict[str, int] = {}
+        for row in scope_reason_rows:
+            scope = str(row.get("scope", "unknown"))
+            count = int(row.get("count", 0))
+            counts[scope] = counts.get(scope, 0) + count
+        return [
+            {"scope": scope, "count": count}
+            for scope, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        ]
+
+    def _missing_book_state_reasons(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT metric_name, SUM(metric_value)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE 'missing_book_state_reason:%'
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY metric_name ORDER BY SUM(metric_value) DESC"
+        rows = conn.execute(query, params).fetchall()
+        results: list[dict[str, Any]] = []
+        for name, total in rows:
+            metric_name = str(name or "")
+            _, _, reason = metric_name.partition(":")
+            results.append({"reason": reason or metric_name, "count": int(float(total or 0.0))})
+        return results
+
+    def _latest_metric_value(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+    ) -> int:
+        query = """
+        SELECT metric_value
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, metric_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        if row is None:
             fallback_query = """
-            SELECT COUNT(DISTINCT asset_id)
-            FROM resync_events
-            WHERE created_at >= ? AND created_at < ?
+            SELECT metric_value
+            FROM metrics
+            WHERE metric_name = ?
             """
-            fallback_params: list[object] = [window.start_iso, window.end_iso]
+            fallback_params: list[object] = [metric_name]
             if run_id is not None:
                 fallback_query += " AND run_id = ?"
                 fallback_params.append(run_id)
-            fallback_row = conn.execute(fallback_query, fallback_params).fetchone()
-            subscribed_assets = int(fallback_row[0] if fallback_row else 0)
-        return {
-            "watched_markets": watched_markets,
-            "subscribed_assets": subscribed_assets,
-        }
+            fallback_query += " ORDER BY created_at DESC LIMIT 1"
+            row = conn.execute(fallback_query, fallback_params).fetchone()
+        return int(float(row[0])) if row and row[0] is not None else 0
+
+    @staticmethod
+    def _extract_kv_from_details(details: str, key: str) -> str | None:
+        compact = details.strip()
+        if key == "reason" and compact and "=" not in compact:
+            return compact
+        prefix = f"{key}="
+        for token in details.split(";"):
+            token = token.strip()
+            if token.startswith(prefix):
+                value = token[len(prefix) :].strip()
+                return value or None
+        return None
 
     def _warmup_overview(
         self,

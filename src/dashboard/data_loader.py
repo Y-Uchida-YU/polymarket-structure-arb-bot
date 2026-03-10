@@ -1,0 +1,727 @@
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+
+
+@dataclass(slots=True)
+class DashboardWindow:
+    start_iso: str
+    end_iso: str
+
+
+def resolve_window(
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    last_hours: int = 24,
+) -> DashboardWindow:
+    resolved_end = end or datetime.now(tz=UTC)
+    if resolved_end.tzinfo is None:
+        resolved_end = resolved_end.replace(tzinfo=UTC)
+    resolved_end = resolved_end.astimezone(UTC) + timedelta(microseconds=1)
+
+    if start is None:
+        start = resolved_end - timedelta(hours=max(1, int(last_hours)))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    start = start.astimezone(UTC)
+    return DashboardWindow(start_iso=start.isoformat(), end_iso=resolved_end.isoformat())
+
+
+class DashboardDataLoader:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+
+    def has_database(self) -> bool:
+        return self.db_path.exists()
+
+    def load_run_ids(self) -> list[str]:
+        if not self.has_database():
+            return []
+        query = """
+        SELECT DISTINCT run_id
+        FROM (
+          SELECT run_id FROM run_summaries
+          UNION ALL
+          SELECT run_id FROM metrics
+          UNION ALL
+          SELECT run_id FROM signals
+        )
+        WHERE run_id IS NOT NULL AND run_id != ''
+        ORDER BY run_id DESC
+        """
+        with self._connect() as conn:
+            if conn is None:
+                return []
+            rows = conn.execute(query).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def load_overview(self, *, window: DashboardWindow, run_id: str | None) -> dict[str, float]:
+        if not self.has_database():
+            return self._empty_overview()
+        with self._connect() as conn:
+            if conn is None:
+                return self._empty_overview()
+            total_signals = self._count(
+                conn=conn,
+                table="signals",
+                time_column="detected_at",
+                window=window,
+                run_id=run_id,
+            )
+            total_fills = self._count(
+                conn=conn,
+                table="fills",
+                time_column="filled_at",
+                window=window,
+                run_id=run_id,
+            )
+            signals_with_fill = self._count_distinct_signal_with_fill(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+            )
+            matched_fill_signals = self._count_matched_fill_signals(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+            )
+            safe_mode_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="safe_mode_entered",
+            )
+            resync_count = self._count(
+                conn=conn,
+                table="resync_events",
+                time_column="created_at",
+                window=window,
+                run_id=run_id,
+            )
+            projected_matched_pnl, unmatched_inventory_mtm, total_projected_pnl = self._sum_pnl(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+            )
+            universe = self._universe_overview(conn=conn, window=window, run_id=run_id)
+
+        fill_rate = signals_with_fill / total_signals if total_signals > 0 else 0.0
+        matched_fill_rate = matched_fill_signals / total_signals if total_signals > 0 else 0.0
+        return {
+            "total_signals": float(total_signals),
+            "total_fills": float(total_fills),
+            "fill_rate": fill_rate,
+            "matched_fill_rate": matched_fill_rate,
+            "safe_mode_count": float(safe_mode_count),
+            "resync_count": float(resync_count),
+            "projected_matched_pnl": projected_matched_pnl,
+            "unmatched_inventory_mtm": unmatched_inventory_mtm,
+            "total_projected_pnl": total_projected_pnl,
+            "watched_markets_current": float(universe["current_watched_markets"]),
+            "watched_markets_cumulative": float(universe["cumulative_watched_markets"]),
+            "subscribed_assets_current": float(universe["current_subscribed_assets"]),
+            "subscribed_assets_cumulative": float(universe["cumulative_subscribed_assets"]),
+        }
+
+    def load_run_summaries(self, *, window: DashboardWindow, run_id: str | None) -> pd.DataFrame:
+        if not self.has_database():
+            return pd.DataFrame()
+        query = """
+        SELECT
+          run_id,
+          mode,
+          started_at,
+          ended_at,
+          uptime_seconds,
+          total_signals,
+          total_fills,
+          total_projected_pnl,
+          safe_mode_count,
+          exception_count,
+          stale_events,
+          resync_events
+        FROM run_summaries
+        WHERE ended_at >= ? AND started_at < ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY ended_at DESC"
+        return self._query_df(query=query, params=params)
+
+    def load_reason_breakdowns(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> dict[str, pd.DataFrame]:
+        no_signal_reasons = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT metric_name, COUNT(*) AS count
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name LIKE 'no_signal_reason:%'
+                """,
+                run_id=run_id,
+            )
+            + " GROUP BY metric_name ORDER BY count DESC",
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if no_signal_reasons.empty:
+            no_signal_reasons["reason"] = pd.Series(dtype="string")
+        else:
+            no_signal_reasons["reason"] = (
+                no_signal_reasons["metric_name"].astype(str).str.split(":", n=1).str[-1]
+            )
+
+        missing_book_reasons = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT metric_name, SUM(metric_value) AS count
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name LIKE 'missing_book_state_reason:%'
+                """,
+                run_id=run_id,
+            )
+            + " GROUP BY metric_name ORDER BY count DESC",
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if missing_book_reasons.empty:
+            missing_book_reasons["reason"] = pd.Series(dtype="string")
+        else:
+            missing_book_reasons["reason"] = (
+                missing_book_reasons["metric_name"].astype(str).str.split(":", n=1).str[-1]
+            )
+
+        return {
+            "resyncs_by_reason": self._query_df(
+                query=self._apply_run_filter(
+                    """
+                    SELECT reason, COUNT(*) AS count
+                    FROM resync_events
+                    WHERE created_at >= ? AND created_at < ?
+                    """,
+                    run_id=run_id,
+                )
+                + " GROUP BY reason ORDER BY count DESC",
+                params=self._window_params(window=window, run_id=run_id),
+            ),
+            "no_signal_reasons": no_signal_reasons,
+            "missing_book_state_reasons": missing_book_reasons,
+            "safe_mode_by_scope_reason": self._safe_mode_by_scope_reason(
+                window=window,
+                run_id=run_id,
+            ),
+        }
+
+    def load_pnl_timeseries(self, *, window: DashboardWindow, run_id: str | None) -> pd.DataFrame:
+        run_snapshot_frame = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT
+                  created_at AS timestamp,
+                  cumulative_projected_pnl,
+                  open_unmatched_inventory,
+                  total_signals,
+                  total_fills,
+                  resync_cumulative_count
+                FROM run_snapshots
+                WHERE created_at >= ? AND created_at < ?
+                """,
+                run_id=run_id,
+            )
+            + " ORDER BY created_at ASC",
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if not run_snapshot_frame.empty:
+            return run_snapshot_frame
+        return self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT
+                  created_at AS timestamp,
+                  total_projected_pnl AS cumulative_projected_pnl,
+                  unmatched_inventory_mtm AS open_unmatched_inventory,
+                  0 AS total_signals,
+                  0 AS total_fills,
+                  0 AS resync_cumulative_count
+                FROM pnl_snapshots
+                WHERE created_at >= ? AND created_at < ?
+                """,
+                run_id=run_id,
+            )
+            + " ORDER BY created_at ASC",
+            params=self._window_params(window=window, run_id=run_id),
+        )
+
+    def load_market_diagnostics(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+        market_slug: str | None,
+    ) -> pd.DataFrame:
+        signal_query = self._apply_run_filter(
+            """
+            SELECT slug AS market_slug, COUNT(*) AS signal_count
+            FROM signals
+            WHERE detected_at >= ? AND detected_at < ?
+            """,
+            run_id=run_id,
+        )
+        signal_params = self._window_params(window=window, run_id=run_id)
+        if market_slug:
+            signal_query += " AND slug = ?"
+            signal_params.append(market_slug)
+        signal_query += " GROUP BY slug"
+        signals = self._query_df(query=signal_query, params=signal_params)
+
+        execution_query = self._apply_run_filter(
+            """
+            SELECT
+              market_slug,
+              COUNT(*) AS execution_count,
+              SUM(
+                CASE WHEN reject_reason IS NOT NULL AND reject_reason != ''
+                THEN 1 ELSE 0 END
+              ) AS reject_count,
+              SUM(COALESCE(matched_qty, 0)) AS matched_qty,
+              SUM(COALESCE(unmatched_yes_qty, 0)) AS unmatched_yes_qty,
+              SUM(COALESCE(unmatched_no_qty, 0)) AS unmatched_no_qty
+            FROM execution_events
+            WHERE completed_at >= ? AND completed_at < ?
+            """,
+            run_id=run_id,
+        )
+        execution_params = self._window_params(window=window, run_id=run_id)
+        if market_slug:
+            execution_query += " AND market_slug = ?"
+            execution_params.append(market_slug)
+        execution_query += " GROUP BY market_slug"
+        execution = self._query_df(query=execution_query, params=execution_params)
+
+        pnl_query = self._apply_run_filter(
+            """
+            SELECT
+              market_slug,
+              SUM(COALESCE(projected_matched_pnl, 0)) AS projected_matched_pnl,
+              SUM(COALESCE(unmatched_inventory_mtm, 0)) AS unmatched_inventory_mtm,
+              SUM(COALESCE(total_projected_pnl, 0)) AS total_projected_pnl
+            FROM pnl_snapshots
+            WHERE created_at >= ? AND created_at < ?
+            """,
+            run_id=run_id,
+        )
+        pnl_params = self._window_params(window=window, run_id=run_id)
+        if market_slug:
+            pnl_query += " AND market_slug = ?"
+            pnl_params.append(market_slug)
+        pnl_query += " GROUP BY market_slug"
+        pnl = self._query_df(query=pnl_query, params=pnl_params)
+
+        merged = signals.merge(execution, on="market_slug", how="outer").merge(
+            pnl,
+            on="market_slug",
+            how="outer",
+        )
+        if merged.empty:
+            return merged
+        merged = merged.fillna(0)
+        return merged.sort_values("signal_count", ascending=False)
+
+    def load_asset_diagnostics(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        base_query = self._apply_run_filter(
+            """
+            SELECT
+              asset_id,
+              COUNT(*) AS resync_count,
+              SUM(
+                CASE WHEN reason = 'missing_book_state' THEN 1 ELSE 0 END
+              ) AS missing_book_resyncs,
+              SUM(CASE WHEN reason = 'stale_asset' THEN 1 ELSE 0 END) AS stale_resyncs,
+              SUM(CASE WHEN reason = 'idle_timeout' THEN 1 ELSE 0 END) AS idle_resyncs
+            FROM resync_events
+            WHERE created_at >= ? AND created_at < ?
+            """,
+            run_id=run_id,
+        )
+        query = base_query + " GROUP BY asset_id ORDER BY resync_count DESC"
+        params = self._window_params(window=window, run_id=run_id)
+        frame = self._query_df(query=query, params=params)
+        if frame.empty:
+            return frame
+        quote_query = (
+            self._apply_run_filter(
+                """
+            SELECT asset_id, MAX(quote_time) AS last_quote_time
+            FROM quotes
+            WHERE quote_time >= ? AND quote_time < ?
+            """,
+                run_id=run_id,
+            )
+            + " GROUP BY asset_id"
+        )
+        quotes = self._query_df(
+            query=quote_query,
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if quotes.empty:
+            return frame
+        return frame.merge(quotes, on="asset_id", how="left")
+
+    def load_warmup_overview(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> dict[str, float]:
+        if not self.has_database():
+            return {
+                "warmup_events": 0.0,
+                "latest_warming_up_assets": 0.0,
+            }
+        with self._connect() as conn:
+            if conn is None:
+                return {
+                    "warmup_events": 0.0,
+                    "latest_warming_up_assets": 0.0,
+                }
+            count_query = self._apply_run_filter(
+                """
+                SELECT COUNT(*)
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name = 'warming_up_asset_count'
+                  AND metric_value > 0
+                """,
+                run_id=run_id,
+            )
+            params = self._window_params(window=window, run_id=run_id)
+            warmup_events = int(conn.execute(count_query, params).fetchone()[0])
+            latest_query = (
+                self._apply_run_filter(
+                    """
+                    SELECT metric_value
+                    FROM metrics
+                    WHERE created_at >= ? AND created_at < ?
+                      AND metric_name = 'warming_up_asset_count'
+                    """,
+                    run_id=run_id,
+                )
+                + " ORDER BY created_at DESC LIMIT 1"
+            )
+            latest_row = conn.execute(
+                latest_query,
+                self._window_params(window=window, run_id=run_id),
+            ).fetchone()
+        return {
+            "warmup_events": float(warmup_events),
+            "latest_warming_up_assets": float(latest_row[0]) if latest_row else 0.0,
+        }
+
+    def _safe_mode_by_scope_reason(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        rows = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT details
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name IN (
+                    'safe_mode_entered',
+                    'safe_mode_asset_blocked',
+                    'safe_mode_market_blocked'
+                  )
+                """,
+                run_id=run_id,
+            ),
+            params=self._window_params(window=window, run_id=run_id),
+        )
+        if rows.empty:
+            return pd.DataFrame(columns=["scope", "reason", "count"])
+
+        counts: dict[tuple[str, str], int] = {}
+        for details in rows["details"].astype(str):
+            scope = self._extract_kv(details, "scope") or "unknown"
+            reason = self._extract_kv(details, "reason") or "unknown"
+            key = (scope, reason)
+            counts[key] = counts.get(key, 0) + 1
+        return pd.DataFrame(
+            [
+                {"scope": scope, "reason": reason, "count": count}
+                for (scope, reason), count in sorted(
+                    counts.items(),
+                    key=lambda item: item[1],
+                    reverse=True,
+                )
+            ]
+        )
+
+    def _count(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        table: str,
+        time_column: str,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> int:
+        query = f"SELECT COUNT(*) FROM {table} WHERE {time_column} >= ? AND {time_column} < ?"
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_distinct_signal_with_fill(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> int:
+        query = """
+        SELECT COUNT(DISTINCT signal_id)
+        FROM fills
+        WHERE filled_at >= ? AND filled_at < ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_matched_fill_signals(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM execution_events
+        WHERE completed_at >= ? AND completed_at < ?
+          AND matched_qty > 0
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_metric(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        name: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _sum_pnl(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> tuple[float, float, float]:
+        query = """
+        SELECT
+          COALESCE(SUM(projected_matched_pnl), 0),
+          COALESCE(SUM(unmatched_inventory_mtm), 0),
+          COALESCE(SUM(total_projected_pnl), 0)
+        FROM pnl_snapshots
+        WHERE created_at >= ? AND created_at < ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return (
+            float(row[0] if row else 0.0),
+            float(row[1] if row else 0.0),
+            float(row[2] if row else 0.0),
+        )
+
+    def _universe_overview(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> dict[str, int]:
+        current_watched_markets = self._latest_metric_value(
+            conn=conn,
+            window=window,
+            run_id=run_id,
+            metric_name="universe_current_watched_markets",
+        )
+        current_subscribed_assets = self._latest_metric_value(
+            conn=conn,
+            window=window,
+            run_id=run_id,
+            metric_name="universe_current_subscribed_assets",
+        )
+        cumulative_watched_markets = self._latest_metric_value(
+            conn=conn,
+            window=window,
+            run_id=run_id,
+            metric_name="universe_cumulative_watched_markets",
+        )
+        cumulative_subscribed_assets = self._latest_metric_value(
+            conn=conn,
+            window=window,
+            run_id=run_id,
+            metric_name="universe_cumulative_subscribed_assets",
+        )
+
+        if cumulative_watched_markets == 0:
+            row = conn.execute("SELECT COUNT(*) FROM markets").fetchone()
+            cumulative_watched_markets = int(row[0] if row else 0)
+        if cumulative_subscribed_assets == 0:
+            query = """
+            SELECT COUNT(DISTINCT asset_id)
+            FROM quotes
+            WHERE quote_time >= ? AND quote_time < ?
+            """
+            params: list[object] = [window.start_iso, window.end_iso]
+            if run_id is not None:
+                query += " AND run_id = ?"
+                params.append(run_id)
+            row = conn.execute(query, params).fetchone()
+            cumulative_subscribed_assets = int(row[0] if row else 0)
+        if current_watched_markets == 0:
+            current_watched_markets = cumulative_watched_markets
+        if current_subscribed_assets == 0:
+            current_subscribed_assets = cumulative_subscribed_assets
+
+        return {
+            "current_watched_markets": current_watched_markets,
+            "current_subscribed_assets": current_subscribed_assets,
+            "cumulative_watched_markets": cumulative_watched_markets,
+            "cumulative_subscribed_assets": cumulative_subscribed_assets,
+        }
+
+    def _latest_metric_value(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_name: str,
+    ) -> int:
+        query = """
+        SELECT metric_value
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, metric_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            fallback_query = """
+            SELECT metric_value
+            FROM metrics
+            WHERE metric_name = ?
+            """
+            fallback_params: list[object] = [metric_name]
+            if run_id is not None:
+                fallback_query += " AND run_id = ?"
+                fallback_params.append(run_id)
+            fallback_query += " ORDER BY created_at DESC LIMIT 1"
+            row = conn.execute(fallback_query, fallback_params).fetchone()
+        return int(float(row[0])) if row and row[0] is not None else 0
+
+    @staticmethod
+    def _extract_kv(details: str, key: str) -> str | None:
+        prefix = f"{key}="
+        for token in details.split(";"):
+            candidate = token.strip()
+            if candidate.startswith(prefix):
+                value = candidate[len(prefix) :].strip()
+                return value or None
+        return None
+
+    @staticmethod
+    def _window_params(*, window: DashboardWindow, run_id: str | None) -> list[object]:
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            params.append(run_id)
+        return params
+
+    @staticmethod
+    def _apply_run_filter(query: str, *, run_id: str | None) -> str:
+        if run_id is None:
+            return query
+        return query + " AND run_id = ?"
+
+    def _query_df(self, *, query: str, params: list[object]) -> pd.DataFrame:
+        if not self.has_database():
+            return pd.DataFrame()
+        with self._connect() as conn:
+            if conn is None:
+                return pd.DataFrame()
+            return pd.read_sql_query(query, conn, params=params)
+
+    def _connect(self) -> sqlite3.Connection | None:
+        if not self.has_database():
+            return None
+        db_path = self.db_path.resolve().as_posix()
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    @staticmethod
+    def _empty_overview() -> dict[str, float]:
+        return {
+            "total_signals": 0.0,
+            "total_fills": 0.0,
+            "fill_rate": 0.0,
+            "matched_fill_rate": 0.0,
+            "safe_mode_count": 0.0,
+            "resync_count": 0.0,
+            "projected_matched_pnl": 0.0,
+            "unmatched_inventory_mtm": 0.0,
+            "total_projected_pnl": 0.0,
+            "watched_markets_current": 0.0,
+            "watched_markets_cumulative": 0.0,
+            "subscribed_assets_current": 0.0,
+            "subscribed_assets_cumulative": 0.0,
+        }

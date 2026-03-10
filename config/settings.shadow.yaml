@@ -44,8 +44,13 @@ runtime:
   market_refresh_minutes: 30
   stale_asset_ms: 90000
   initial_market_data_grace_ms: 45000
+  per_asset_book_grace_ms: 120000
+  resync_recovery_grace_ms: 300000
   book_resync_idle_ms: 120000
   resync_cooldown_ms: 180000
+  same_reason_resync_cooldown_ms: 300000
+  missing_book_resync_cooldown_ms: 480000
+  stale_asset_resync_cooldown_ms: 420000
   full_resync_cooldown_ms: 300000
   max_resync_assets_per_cycle: 25
   resync_batch_size: 80
@@ -63,6 +68,10 @@ guardrails:
   max_stale_asset_rate: 0.70
   max_resync_rate_per_min: 8.0
   max_exception_rate_per_min: 6.0
+  global_unhealthy_consecutive_count: 4
+  global_unhealthy_min_duration_seconds: 300
+  global_unhealthy_min_asset_ratio: 1.0
+  global_ws_unhealthy_min_asset_ratio: 1.0
   hard_stop_on_exception_spike: false
   hard_stop_exception_rate_per_min: 15.0
 
