@@ -64,8 +64,12 @@ class RuntimeSettings(BaseModel):
     market_refresh_minutes: int = 60
     stale_asset_ms: int = 15_000
     initial_market_data_grace_ms: int = 30_000
+    per_asset_book_grace_ms: int = 60_000
     book_resync_idle_ms: int = 20_000
     resync_cooldown_ms: int = 60_000
+    same_reason_resync_cooldown_ms: int = 120_000
+    missing_book_resync_cooldown_ms: int = 180_000
+    stale_asset_resync_cooldown_ms: int = 180_000
     full_resync_cooldown_ms: int = 120_000
     max_resync_assets_per_cycle: int = 50
     resync_batch_size: int = 100

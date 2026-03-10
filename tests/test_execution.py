@@ -28,6 +28,38 @@ def test_quote_manager_ingests_best_bid_ask() -> None:
     assert ask_no == 0.55
 
 
+def test_quote_manager_ready_checks_require_bid_and_ask_on_both_legs() -> None:
+    manager = QuoteManager(
+        token_to_market_side={
+            "yes-token": ("market-1", "yes"),
+            "no-token": ("market-1", "no"),
+        }
+    )
+    payload = json.dumps(
+        [
+            {"event_type": "best_bid_ask", "asset_id": "yes-token", "ask": "0.41", "bid": "0.39"},
+            {"event_type": "best_bid_ask", "asset_id": "no-token", "ask": "0.55"},
+        ]
+    )
+    manager.ingest_ws_message(payload)
+
+    assert manager.is_asset_ready("yes-token") is True
+    assert manager.is_asset_ready("no-token") is False
+    assert manager.is_market_ready("market-1") is False
+
+    manager.ingest_ws_message(
+        json.dumps(
+            {
+                "event_type": "best_bid_ask",
+                "asset_id": "no-token",
+                "ask": "0.55",
+                "bid": "0.53",
+            }
+        )
+    )
+    assert manager.is_market_ready("market-1") is True
+
+
 def test_paper_order_router_executes_two_leg_fill() -> None:
     router = PaperOrderRouter(order_size_usdc=10.0)
     signal = ArbSignal.new(

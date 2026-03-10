@@ -49,7 +49,8 @@ def test_high_stale_asset_rate_triggers_safe_mode_decision() -> None:
         safe_mode_active=False,
         safe_mode_entered_at=None,
     )
-    assert decision.enter_safe_mode_reason == "high_stale_asset_rate"
+    assert decision.enter_safe_mode_reason == "book_state_unhealthy"
+    assert decision.enter_safe_mode_scope == "global"
 
 
 def test_high_resync_rate_triggers_warning_only() -> None:
@@ -75,7 +76,31 @@ def test_high_resync_rate_triggers_warning_only() -> None:
         safe_mode_entered_at=None,
     )
     assert "high_resync_rate" in decision.warnings
-    assert decision.enter_safe_mode_reason is None
+    assert decision.enter_safe_mode_reason == "resync_storm"
+
+
+def test_ws_unhealthy_triggers_safe_mode_reason() -> None:
+    settings = GuardrailSettings(
+        window_minutes=1,
+        max_resync_rate_per_min=100.0,
+        max_signal_rate_per_min=100.0,
+        max_reject_rate=1.0,
+        max_one_leg_rate=1.0,
+        max_unmatched_rate=1.0,
+        max_stale_asset_rate=1.0,
+        max_exception_rate_per_min=100.0,
+    )
+    monitor = GuardrailMonitor(settings=settings)
+    now = datetime(2026, 3, 10, tzinfo=UTC)
+
+    decision = monitor.evaluate(
+        now_utc=now,
+        stale_asset_rate=0.0,
+        ws_unhealthy=True,
+        safe_mode_active=False,
+        safe_mode_entered_at=None,
+    )
+    assert decision.enter_safe_mode_reason == "ws_unhealthy"
 
 
 def test_safe_mode_can_exit_after_cooldown() -> None:

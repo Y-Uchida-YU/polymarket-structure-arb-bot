@@ -26,6 +26,7 @@ class GuardrailMetrics:
 class GuardrailDecision:
     warnings: list[str]
     enter_safe_mode_reason: str | None
+    enter_safe_mode_scope: str | None
     exit_safe_mode: bool
     hard_stop_reason: str | None
     metrics: GuardrailMetrics
@@ -64,6 +65,8 @@ class GuardrailMonitor:
         *,
         now_utc: datetime,
         stale_asset_rate: float,
+        ws_unhealthy: bool = False,
+        book_state_unhealthy: bool = False,
         safe_mode_active: bool,
         safe_mode_entered_at: datetime | None,
     ) -> GuardrailDecision:
@@ -85,28 +88,42 @@ class GuardrailMonitor:
 
         warnings: list[str] = []
         enter_safe_mode_reason: str | None = None
+        enter_safe_mode_scope: str | None = None
         hard_stop_reason: str | None = None
+
+        def set_safe_mode(reason: str, scope: str = "global") -> None:
+            nonlocal enter_safe_mode_reason, enter_safe_mode_scope
+            if enter_safe_mode_reason is None:
+                enter_safe_mode_reason = reason
+                enter_safe_mode_scope = scope
 
         if signal_rate > self.settings.max_signal_rate_per_min:
             warnings.append("high_signal_rate")
-            enter_safe_mode_reason = enter_safe_mode_reason or "high_signal_rate"
+            set_safe_mode("high_signal_rate")
         if reject_rate > self.settings.max_reject_rate:
             warnings.append("high_reject_rate")
-            enter_safe_mode_reason = enter_safe_mode_reason or "high_reject_rate"
+            set_safe_mode("high_reject_rate")
         if one_leg_rate > self.settings.max_one_leg_rate:
             warnings.append("high_one_leg_rate")
-            enter_safe_mode_reason = enter_safe_mode_reason or "high_one_leg_rate"
+            set_safe_mode("high_one_leg_rate")
         if unmatched_rate > self.settings.max_unmatched_rate:
             warnings.append("high_unmatched_rate")
-            enter_safe_mode_reason = enter_safe_mode_reason or "high_unmatched_rate"
+            set_safe_mode("high_unmatched_rate")
+        if book_state_unhealthy:
+            warnings.append("book_state_unhealthy")
+            set_safe_mode("book_state_unhealthy")
         if stale_asset_rate > self.settings.max_stale_asset_rate:
             warnings.append("high_stale_asset_rate")
-            enter_safe_mode_reason = enter_safe_mode_reason or "high_stale_asset_rate"
+            set_safe_mode("book_state_unhealthy")
+        if ws_unhealthy:
+            warnings.append("ws_unhealthy")
+            set_safe_mode("ws_unhealthy")
         if resync_rate > self.settings.max_resync_rate_per_min:
             warnings.append("high_resync_rate")
+            set_safe_mode("resync_storm")
         if exception_rate > self.settings.max_exception_rate_per_min:
             warnings.append("high_exception_rate")
-            enter_safe_mode_reason = enter_safe_mode_reason or "high_exception_rate"
+            set_safe_mode("exception_rate_exceeded")
         if (
             self.settings.hard_stop_on_exception_spike
             and exception_rate > self.settings.hard_stop_exception_rate_per_min
@@ -122,6 +139,7 @@ class GuardrailMonitor:
         return GuardrailDecision(
             warnings=warnings,
             enter_safe_mode_reason=enter_safe_mode_reason if not safe_mode_active else None,
+            enter_safe_mode_scope=enter_safe_mode_scope if not safe_mode_active else None,
             exit_safe_mode=should_exit_safe_mode,
             hard_stop_reason=hard_stop_reason,
             metrics=GuardrailMetrics(

@@ -42,6 +42,12 @@ RESYNC_REASON_STALE_ASSET = "stale_asset"
 RESYNC_REASON_MARKET_UNIVERSE_CHANGED = "market_universe_changed"
 RESYNC_REASON_MANUAL_REFRESH = "manual_refresh"
 
+SAFE_MODE_SCOPE_GLOBAL = "global"
+SAFE_MODE_SCOPE_ASSET = "asset"
+SAFE_MODE_REASON_ALL_ASSETS_STALE = "all_assets_stale"
+SAFE_MODE_REASON_WS_UNHEALTHY = "ws_unhealthy"
+SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY = "book_state_unhealthy"
+
 
 def setup_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -75,15 +81,27 @@ class AppState:
     last_signal_at_by_market: dict[str, float]
     last_resync_reason_by_asset: dict[str, str] = field(default_factory=dict)
     last_resync_at_by_asset: dict[str, float] = field(default_factory=dict)
+    last_resync_at_by_asset_reason: dict[str, float] = field(default_factory=dict)
     last_resync_at_by_reason: dict[str, float] = field(default_factory=dict)
+    last_no_data_resync_at_by_asset: dict[str, float] = field(default_factory=dict)
     stale_assets: set[str] = field(default_factory=set)
     safe_mode_active: bool = False
     safe_mode_reason: str | None = None
+    safe_mode_scope: str | None = None
+    safe_mode_blocked_assets: set[str] = field(default_factory=set)
+    safe_mode_reason_counts: dict[str, int] = field(default_factory=dict)
+    asset_safe_mode_reason: str | None = None
     safe_mode_entered_at: datetime | None = None
     safe_mode_count: int = 0
     ws_connected_at: datetime | None = None
     subscription_started_at: datetime | None = None
     first_quote_received_at: datetime | None = None
+    ws_unhealthy: bool = False
+    book_state_unhealthy: bool = False
+    asset_subscribed_at: dict[str, datetime] = field(default_factory=dict)
+    ready_assets: set[str] = field(default_factory=set)
+    ever_ready_assets: set[str] = field(default_factory=set)
+    last_book_missing_reason_by_asset: dict[str, str] = field(default_factory=dict)
     last_ws_idle_resync_ts: float = 0.0
     run_id: str = field(default_factory=lambda: uuid4().hex)
     run_started_at: datetime = field(default_factory=utc_now)
@@ -102,6 +120,8 @@ class AppState:
     resync_reason_counts: dict[str, int] = field(default_factory=dict)
     watched_markets: int = 0
     subscribed_assets: int = 0
+    cumulative_watched_market_ids: set[str] = field(default_factory=set)
+    cumulative_subscribed_asset_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(slots=True)
@@ -195,8 +215,40 @@ class PolymarketStructureArbApp:
         self.quote_manager.update_token_mapping(token_to_market_side)
         asset_ids = list(token_to_market_side.keys())
         await self._load_initial_tick_sizes(asset_ids)
+        now = utc_now()
         self.state.watched_markets = len(binary_markets)
         self.state.subscribed_assets = len(asset_ids)
+        self.state.cumulative_watched_market_ids.update(self.markets_by_id.keys())
+        self.state.cumulative_subscribed_asset_ids.update(asset_ids)
+
+        current_assets = set(asset_ids)
+        current_markets = set(self.markets_by_id.keys())
+        self.state.safe_mode_blocked_assets &= current_assets
+        self.state.ready_assets &= current_assets
+        self.state.ever_ready_assets &= current_assets
+        self.state.last_book_missing_reason_by_asset = {
+            asset_id: reason
+            for asset_id, reason in self.state.last_book_missing_reason_by_asset.items()
+            if asset_id in current_assets
+        }
+        self.state.last_no_data_resync_at_by_asset = {
+            asset_id: ts
+            for asset_id, ts in self.state.last_no_data_resync_at_by_asset.items()
+            if asset_id in current_assets
+        }
+        self.state.asset_subscribed_at = {
+            asset_id: subscribed_at
+            for asset_id, subscribed_at in self.state.asset_subscribed_at.items()
+            if asset_id in current_assets
+        }
+        for asset_id in asset_ids:
+            self.state.asset_subscribed_at.setdefault(asset_id, now)
+        self.state.last_signal_at_by_market = {
+            market_id: ts
+            for market_id, ts in self.state.last_signal_at_by_market.items()
+            if market_id in current_markets
+        }
+        self._record_universe_metrics(now_utc=now)
 
         current_asset_ids = set(asset_ids)
         asset_ids_changed = bool(previous_asset_ids) and previous_asset_ids != current_asset_ids
@@ -229,12 +281,14 @@ class PolymarketStructureArbApp:
             )
         self.logger.info(
             (
-                "Loaded raw_markets=%s watched_markets=%s subscribed_assets=%s "
-                "changed=%s universe_limit=%s"
+                "Loaded raw_markets=%s watched_markets(current/cumulative)=%s/%s "
+                "subscribed_assets(current/cumulative)=%s/%s changed=%s universe_limit=%s"
             ),
             extraction.raw_market_count,
-            len(binary_markets),
-            len(token_to_market_side),
+            self.state.watched_markets,
+            len(self.state.cumulative_watched_market_ids),
+            self.state.subscribed_assets,
+            len(self.state.cumulative_subscribed_asset_ids),
             asset_ids_changed,
             self.config.settings.market_filters.max_markets_to_watch,
         )
@@ -309,6 +363,7 @@ class PolymarketStructureArbApp:
                     tick_size=tick_size,
                     source=update.event_type,
                 )
+                self._mark_asset_ready(update.asset_id)
 
                 market = self.markets_by_id.get(market_id)
                 if market is None:
@@ -320,7 +375,36 @@ class PolymarketStructureArbApp:
                     continue
                 if self.state.safe_mode_active:
                     self._record_no_signal_reason(
-                        reason="safe_mode_blocked",
+                        reason="safe_mode_blocked_global",
+                        now_utc=now,
+                        market_id=market_id,
+                        details={
+                            "safe_mode_reason": self.state.safe_mode_reason,
+                            "safe_mode_scope": self.state.safe_mode_scope or SAFE_MODE_SCOPE_GLOBAL,
+                        },
+                    )
+                    continue
+                blocked_assets = [
+                    asset_id
+                    for asset_id in (market.yes_token_id, market.no_token_id)
+                    if asset_id in self.state.safe_mode_blocked_assets
+                ]
+                if blocked_assets:
+                    self._record_no_signal_reason(
+                        reason="safe_mode_blocked_asset",
+                        now_utc=now,
+                        market_id=market_id,
+                        details={
+                            "safe_mode_reason": self.state.asset_safe_mode_reason
+                            or SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
+                            "safe_mode_scope": SAFE_MODE_SCOPE_ASSET,
+                            "blocked_assets": ",".join(blocked_assets),
+                        },
+                    )
+                    continue
+                if not self.quote_manager.is_market_ready(market_id):
+                    self._record_no_signal_reason(
+                        reason="book_not_ready",
                         now_utc=now,
                         market_id=market_id,
                     )
@@ -328,7 +412,7 @@ class PolymarketStructureArbApp:
                 yes_quote, no_quote = self.quote_manager.get_market_quotes(market_id)
                 if yes_quote is None or no_quote is None:
                     self._record_no_signal_reason(
-                        reason="asset_not_ready",
+                        reason="book_not_ready",
                         now_utc=now,
                         market_id=market_id,
                     )
@@ -449,6 +533,104 @@ class PolymarketStructureArbApp:
             update.source,
         )
 
+    def _record_universe_metrics(self, now_utc: datetime) -> None:
+        metrics = {
+            "universe_current_watched_markets": float(self.state.watched_markets),
+            "universe_current_subscribed_assets": float(self.state.subscribed_assets),
+            "universe_cumulative_watched_markets": float(
+                len(self.state.cumulative_watched_market_ids)
+            ),
+            "universe_cumulative_subscribed_assets": float(
+                len(self.state.cumulative_subscribed_asset_ids)
+            ),
+        }
+        for name, value in metrics.items():
+            self.sqlite_store.save_metric(
+                metric_name=name,
+                metric_value=value,
+                details=f"env={self.config.settings.runtime.environment_name}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": name,
+                    "metric_value": value,
+                },
+                now_utc=now_utc,
+            )
+
+    def _mark_asset_ready(self, asset_id: str) -> None:
+        if not self.quote_manager.is_asset_ready(asset_id):
+            return
+        self.state.ready_assets.add(asset_id)
+        self.state.ever_ready_assets.add(asset_id)
+        self.state.last_book_missing_reason_by_asset.pop(asset_id, None)
+        self.state.safe_mode_blocked_assets.discard(asset_id)
+
+    def _classify_missing_book_reason(self, asset_id: str, now_utc: datetime) -> str:
+        subscribed_at = self.state.asset_subscribed_at.get(asset_id)
+        if subscribed_at is not None:
+            elapsed_ms = max(0.0, (now_utc - subscribed_at).total_seconds() * 1000.0)
+            if elapsed_ms < max(0, self.config.settings.runtime.per_asset_book_grace_ms):
+                return "book_not_ready"
+        if asset_id in self.state.ever_ready_assets:
+            return "book_evicted"
+        reason_key = f"{asset_id}|{RESYNC_REASON_MISSING_BOOK_STATE}"
+        last_missing_resync_ts = self.state.last_resync_at_by_asset_reason.get(reason_key)
+        if last_missing_resync_ts is None:
+            return "no_initial_book"
+        last_no_data_resync = self.state.last_no_data_resync_at_by_asset.get(asset_id)
+        if last_no_data_resync is not None and last_no_data_resync >= last_missing_resync_ts:
+            return "quote_missing_after_resync"
+        return "book_not_resynced_yet"
+
+    def _update_asset_level_safe_mode(
+        self,
+        *,
+        blocked_assets: set[str],
+        reason: str,
+        now_utc: datetime,
+    ) -> None:
+        if self.state.safe_mode_active:
+            return
+        previous_assets = set(self.state.safe_mode_blocked_assets)
+        previous_reason = self.state.asset_safe_mode_reason
+        normalized = set(blocked_assets)
+        self.state.safe_mode_blocked_assets = normalized
+        self.state.asset_safe_mode_reason = reason if normalized else None
+        self.state.safe_mode_scope = SAFE_MODE_SCOPE_ASSET if normalized else None
+        if normalized == previous_assets and self.state.asset_safe_mode_reason == previous_reason:
+            return
+        metric_name = "safe_mode_asset_blocked" if normalized else "safe_mode_asset_cleared"
+        details = (
+            f"scope={SAFE_MODE_SCOPE_ASSET};reason={reason};blocked_assets={len(normalized)}"
+            if normalized
+            else "scope=asset;reason=none;blocked_assets=0"
+        )
+        metric_value = float(len(normalized)) if normalized else 1.0
+        self.sqlite_store.save_metric(
+            metric_name=metric_name,
+            metric_value=metric_value,
+            details=details,
+            created_at_iso=now_utc.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now_utc.isoformat(),
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "scope": SAFE_MODE_SCOPE_ASSET,
+                "safe_mode_reason": reason if normalized else None,
+                "blocked_assets": len(normalized),
+            },
+            now_utc=now_utc,
+        )
+
     def _market_has_stale_quotes(self, market: BinaryMarket, now_utc: datetime) -> bool:
         if (
             market.yes_token_id in self.state.stale_assets
@@ -481,9 +663,9 @@ class PolymarketStructureArbApp:
             "spread_guard": "spread_too_wide",
             "min_depth_guard": "depth_too_low",
             "quote_age_exceeded": "quote_too_old",
-            "missing_quote": "asset_not_ready",
-            "missing_best_ask": "asset_not_ready",
-            "tick_alignment_guard": "asset_not_ready",
+            "missing_quote": "book_not_ready",
+            "missing_best_ask": "book_not_ready",
+            "tick_alignment_guard": "book_not_ready",
         }
         return mapping.get(reason, reason or "strategy_rejected")
 
@@ -492,16 +674,28 @@ class PolymarketStructureArbApp:
         reason: str,
         now_utc: datetime,
         market_id: str | None = None,
+        asset_id: str | None = None,
+        details: dict[str, object] | None = None,
     ) -> None:
         normalized_reason = (reason or "unknown").strip() or "unknown"
         self.state.no_signal_reason_counts[normalized_reason] = (
             self.state.no_signal_reason_counts.get(normalized_reason, 0) + 1
         )
-        details = f"market_id={market_id}" if market_id else ""
+        detail_parts: list[str] = []
+        if market_id:
+            detail_parts.append(f"market_id={market_id}")
+        if asset_id:
+            detail_parts.append(f"asset_id={asset_id}")
+        if details:
+            for key, value in sorted(details.items()):
+                if value is None:
+                    continue
+                detail_parts.append(f"{key}={value}")
+        details_text = ";".join(detail_parts)
         self.sqlite_store.save_metric(
             metric_name=f"no_signal_reason:{normalized_reason}",
             metric_value=1.0,
-            details=details,
+            details=details_text,
             created_at_iso=now_utc.isoformat(),
             run_id=self.state.run_id,
         )
@@ -512,7 +706,9 @@ class PolymarketStructureArbApp:
                 "metric_name": f"no_signal_reason:{normalized_reason}",
                 "metric_value": 1.0,
                 "market_id": market_id,
+                "asset_id": asset_id,
                 "reason": normalized_reason,
+                "details": details_text,
             },
             now_utc=now_utc,
         )
@@ -791,6 +987,8 @@ class PolymarketStructureArbApp:
         now = utc_now()
         self.state.ws_connected_at = now
         self.state.subscription_started_at = now
+        for asset_id in asset_ids:
+            self.state.asset_subscribed_at.setdefault(asset_id, now)
         reason = self.state.pending_connect_resync_reason or RESYNC_REASON_WS_CONNECTED
         self.state.pending_connect_resync_reason = None
         await self.resync_assets(asset_ids=asset_ids, reason=reason, force=True)
@@ -871,9 +1069,17 @@ class PolymarketStructureArbApp:
             warming_up_assets = [
                 asset_id
                 for asset_id in tracked_assets
-                if asset_id not in self.healthcheck.state.asset_last_update_at
+                if not self.quote_manager.is_asset_ready(asset_id)
             ]
             self.state.stale_assets = set()
+            # During startup/warm-up we intentionally suppress ws health escalation.
+            self.state.ws_unhealthy = False
+            self.state.book_state_unhealthy = False
+            self._update_asset_level_safe_mode(
+                blocked_assets=set(),
+                reason=SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
+                now_utc=now,
+            )
             self.sqlite_store.save_metric(
                 metric_name="warming_up_asset_count",
                 metric_value=float(len(warming_up_assets)),
@@ -891,22 +1097,40 @@ class PolymarketStructureArbApp:
                 },
                 now_utc=now,
             )
-            if self.state.safe_mode_reason == "all_assets_stale":
+            if self.state.safe_mode_reason in {
+                SAFE_MODE_REASON_ALL_ASSETS_STALE,
+                SAFE_MODE_REASON_WS_UNHEALTHY,
+                SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
+            }:
                 self._maybe_exit_safe_mode(now)
             self._evaluate_guardrails(now_utc=now, stale_asset_rate=0.0)
             return
 
-        missing_assets = [
-            asset_id
-            for asset_id in tracked_assets
-            if asset_id not in self.healthcheck.state.asset_last_update_at
-        ]
+        for asset_id in tracked_assets:
+            if self.quote_manager.is_asset_ready(asset_id):
+                self._mark_asset_ready(asset_id)
+
+        missing_assets: list[str] = []
+        missing_assets_by_reason: dict[str, list[str]] = {}
+        for asset_id in tracked_assets:
+            if self.quote_manager.is_asset_ready(asset_id):
+                self.state.last_book_missing_reason_by_asset.pop(asset_id, None)
+                continue
+            reason = self._classify_missing_book_reason(asset_id=asset_id, now_utc=now)
+            self.state.last_book_missing_reason_by_asset[asset_id] = reason
+            missing_assets.append(asset_id)
+            missing_assets_by_reason.setdefault(reason, []).append(asset_id)
+
         stale_assets = self.healthcheck.stale_assets(
             tracked_assets=tracked_assets,
             now_utc=now,
             max_age_ms=self.config.settings.runtime.stale_asset_ms,
         )
         self.state.stale_assets = set(stale_assets)
+        unhealthy_assets = set(stale_assets) | set(missing_assets)
+        tracked_count = max(1, len(tracked_assets))
+        unhealthy_ratio = len(unhealthy_assets) / tracked_count
+
         self.sqlite_store.save_metric(
             metric_name="stale_asset_count",
             metric_value=float(len(stale_assets)),
@@ -941,12 +1165,38 @@ class PolymarketStructureArbApp:
             },
             now_utc=now,
         )
+        for reason, assets in sorted(missing_assets_by_reason.items()):
+            self.sqlite_store.save_metric(
+                metric_name=f"missing_book_state_reason:{reason}",
+                metric_value=float(len(assets)),
+                details=f"tracked_assets={len(tracked_assets)}",
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": f"missing_book_state_reason:{reason}",
+                    "metric_value": len(assets),
+                    "tracked_assets": len(tracked_assets),
+                },
+                now_utc=now,
+            )
+
+        self.state.ws_unhealthy = self._is_ws_idle(now)
+        self.state.book_state_unhealthy = unhealthy_ratio >= max(
+            0.01, self.config.settings.guardrails.max_stale_asset_rate
+        )
         if stale_assets:
             self.state.total_stale_events += 1
-        if not stale_assets:
-            if self.state.safe_mode_reason == "all_assets_stale":
+        if not stale_assets and not self.state.ws_unhealthy:
+            if self.state.safe_mode_reason in {
+                SAFE_MODE_REASON_ALL_ASSETS_STALE,
+                SAFE_MODE_REASON_WS_UNHEALTHY,
+            }:
                 self._maybe_exit_safe_mode(now)
-        else:
+        if stale_assets:
             stale_ratio = len(stale_assets) / max(1, len(tracked_assets))
             self.logger.warning(
                 "Stale assets detected count=%s total=%s ratio=%.3f",
@@ -956,33 +1206,58 @@ class PolymarketStructureArbApp:
             )
             if len(stale_assets) == len(tracked_assets):
                 self._enter_safe_mode(
-                    reason="all_assets_stale",
+                    reason=SAFE_MODE_REASON_ALL_ASSETS_STALE,
                     now_utc=now,
+                    scope=SAFE_MODE_SCOPE_GLOBAL,
                 )
-            missing_asset_set = set(missing_assets)
-            stale_only_assets = [
-                asset_id for asset_id in stale_assets if asset_id not in missing_asset_set
-            ]
-            missing_resync_assets = self._select_resync_assets(
-                asset_ids=missing_assets,
+        if (
+            self.state.ws_unhealthy
+            and tracked_assets
+            and len(unhealthy_assets) >= max(1, int(len(tracked_assets) * 0.8))
+        ):
+            self._enter_safe_mode(
+                reason=SAFE_MODE_REASON_WS_UNHEALTHY,
+                now_utc=now,
+                scope=SAFE_MODE_SCOPE_GLOBAL,
+            )
+
+        self._update_asset_level_safe_mode(
+            blocked_assets=(
+                unhealthy_assets if len(unhealthy_assets) < len(tracked_assets) else set()
+            ),
+            reason=SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
+            now_utc=now,
+        )
+
+        missing_resync_candidates: list[str] = []
+        for reason, assets in missing_assets_by_reason.items():
+            if reason in {"no_initial_book", "book_evicted", "quote_missing_after_resync"}:
+                missing_resync_candidates.extend(assets)
+        missing_resync_assets = self._select_resync_assets(
+            asset_ids=missing_resync_candidates,
+            reason=RESYNC_REASON_MISSING_BOOK_STATE,
+            now_utc=now,
+        )
+        if missing_resync_assets:
+            await self.resync_assets(
+                asset_ids=missing_resync_assets,
                 reason=RESYNC_REASON_MISSING_BOOK_STATE,
-                now_utc=now,
             )
-            if missing_resync_assets:
-                await self.resync_assets(
-                    asset_ids=missing_resync_assets,
-                    reason=RESYNC_REASON_MISSING_BOOK_STATE,
-                )
-            stale_resync_assets = self._select_resync_assets(
-                asset_ids=stale_only_assets,
+
+        missing_asset_set = set(missing_assets)
+        stale_only_assets = [
+            asset_id for asset_id in stale_assets if asset_id not in missing_asset_set
+        ]
+        stale_resync_assets = self._select_resync_assets(
+            asset_ids=stale_only_assets,
+            reason=RESYNC_REASON_STALE_ASSET,
+            now_utc=now,
+        )
+        if stale_resync_assets:
+            await self.resync_assets(
+                asset_ids=stale_resync_assets,
                 reason=RESYNC_REASON_STALE_ASSET,
-                now_utc=now,
             )
-            if stale_resync_assets:
-                await self.resync_assets(
-                    asset_ids=stale_resync_assets,
-                    reason=RESYNC_REASON_STALE_ASSET,
-                )
 
         if self._is_ws_idle(now):
             idle_resync_assets = self._select_resync_assets(
@@ -1008,18 +1283,40 @@ class PolymarketStructureArbApp:
             stale_asset_rate=len(stale_assets) / max(1, len(tracked_assets)),
         )
 
-    def _enter_safe_mode(self, reason: str, now_utc: datetime) -> None:
-        if self.state.safe_mode_active and self.state.safe_mode_reason == reason:
+    def _enter_safe_mode(
+        self,
+        reason: str,
+        now_utc: datetime,
+        scope: str = SAFE_MODE_SCOPE_GLOBAL,
+    ) -> None:
+        if scope != SAFE_MODE_SCOPE_GLOBAL:
+            self._update_asset_level_safe_mode(
+                blocked_assets=set(self.state.safe_mode_blocked_assets),
+                reason=reason,
+                now_utc=now_utc,
+            )
+            return
+        if (
+            self.state.safe_mode_active
+            and self.state.safe_mode_reason == reason
+            and self.state.safe_mode_scope == scope
+        ):
             return
         self.state.safe_mode_active = True
         self.state.safe_mode_reason = reason
+        self.state.safe_mode_scope = scope
+        self.state.asset_safe_mode_reason = None
+        self.state.safe_mode_blocked_assets.clear()
         self.state.safe_mode_entered_at = now_utc
         self.state.safe_mode_count += 1
-        self.logger.error("Safe mode enabled reason=%s", reason)
+        self.state.safe_mode_reason_counts[reason] = (
+            self.state.safe_mode_reason_counts.get(reason, 0) + 1
+        )
+        self.logger.error("Safe mode enabled reason=%s scope=%s", reason, scope)
         self.sqlite_store.save_metric(
             metric_name="safe_mode_entered",
             metric_value=1.0,
-            details=reason,
+            details=f"scope={scope};reason={reason}",
             created_at_iso=now_utc.isoformat(),
             run_id=self.state.run_id,
         )
@@ -1030,6 +1327,7 @@ class PolymarketStructureArbApp:
                 "metric_name": "safe_mode_entered",
                 "metric_value": 1.0,
                 "safe_mode_reason": reason,
+                "safe_mode_scope": scope,
             },
             now_utc=now_utc,
         )
@@ -1039,13 +1337,19 @@ class PolymarketStructureArbApp:
             return
         self.state.safe_mode_active = False
         previous_reason = self.state.safe_mode_reason
+        previous_scope = self.state.safe_mode_scope
         self.state.safe_mode_reason = None
+        self.state.safe_mode_scope = None
         self.state.safe_mode_entered_at = None
-        self.logger.warning("Safe mode disabled previous_reason=%s", previous_reason)
+        self.logger.warning(
+            "Safe mode disabled previous_reason=%s previous_scope=%s",
+            previous_reason,
+            previous_scope,
+        )
         self.sqlite_store.save_metric(
             metric_name="safe_mode_exited",
             metric_value=1.0,
-            details=previous_reason or "",
+            details=f"scope={previous_scope or ''};reason={previous_reason or ''}",
             created_at_iso=now_utc.isoformat(),
             run_id=self.state.run_id,
         )
@@ -1056,6 +1360,7 @@ class PolymarketStructureArbApp:
                 "metric_name": "safe_mode_exited",
                 "metric_value": 1.0,
                 "safe_mode_reason": previous_reason,
+                "safe_mode_scope": previous_scope,
             },
             now_utc=now_utc,
         )
@@ -1070,6 +1375,8 @@ class PolymarketStructureArbApp:
         decision = self.guardrail_monitor.evaluate(
             now_utc=now_utc,
             stale_asset_rate=stale_asset_rate,
+            ws_unhealthy=self.state.ws_unhealthy,
+            book_state_unhealthy=self.state.book_state_unhealthy,
             safe_mode_active=self.state.safe_mode_active,
             safe_mode_entered_at=self.state.safe_mode_entered_at,
         )
@@ -1081,7 +1388,7 @@ class PolymarketStructureArbApp:
                 (
                     "Guardrail warning=%s signal_rate=%.2f reject_rate=%.2f "
                     "one_leg_rate=%.2f stale_rate=%.2f resync_rate=%.2f "
-                    "exception_rate=%.2f"
+                    "exception_rate=%.2f ws_unhealthy=%s book_state_unhealthy=%s"
                 ),
                 warning,
                 decision.metrics.signal_rate_per_min,
@@ -1090,6 +1397,8 @@ class PolymarketStructureArbApp:
                 decision.metrics.stale_asset_rate,
                 decision.metrics.resync_rate_per_min,
                 decision.metrics.exception_rate_per_min,
+                self.state.ws_unhealthy,
+                self.state.book_state_unhealthy,
             )
             self.sqlite_store.save_metric(
                 metric_name=f"guardrail_warning_{warning}",
@@ -1102,7 +1411,9 @@ class PolymarketStructureArbApp:
                     f"unmatched_rate={decision.metrics.unmatched_rate:.4f};"
                     f"stale_asset_rate={decision.metrics.stale_asset_rate:.4f};"
                     f"resync_rate_per_min={decision.metrics.resync_rate_per_min:.4f};"
-                    f"exception_rate_per_min={decision.metrics.exception_rate_per_min:.4f}"
+                    f"exception_rate_per_min={decision.metrics.exception_rate_per_min:.4f};"
+                    f"ws_unhealthy={int(self.state.ws_unhealthy)};"
+                    f"book_state_unhealthy={int(self.state.book_state_unhealthy)}"
                 ),
                 created_at_iso=now_utc.isoformat(),
                 run_id=self.state.run_id,
@@ -1120,12 +1431,22 @@ class PolymarketStructureArbApp:
                     "stale_asset_rate": decision.metrics.stale_asset_rate,
                     "resync_rate_per_min": decision.metrics.resync_rate_per_min,
                     "exception_rate_per_min": decision.metrics.exception_rate_per_min,
+                    "ws_unhealthy": self.state.ws_unhealthy,
+                    "book_state_unhealthy": self.state.book_state_unhealthy,
                 },
                 now_utc=now_utc,
             )
         if decision.enter_safe_mode_reason is not None:
-            self._enter_safe_mode(reason=decision.enter_safe_mode_reason, now_utc=now_utc)
-        elif decision.exit_safe_mode and self.state.safe_mode_reason == "all_assets_stale":
+            self._enter_safe_mode(
+                reason=decision.enter_safe_mode_reason,
+                now_utc=now_utc,
+                scope=decision.enter_safe_mode_scope or SAFE_MODE_SCOPE_GLOBAL,
+            )
+        elif decision.exit_safe_mode and self.state.safe_mode_reason in {
+            "resync_storm",
+            "exception_rate_exceeded",
+            SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
+        }:
             self._maybe_exit_safe_mode(now_utc)
 
         if decision.hard_stop_reason is not None:
@@ -1165,6 +1486,19 @@ class PolymarketStructureArbApp:
         max_assets = max(1, self.config.settings.runtime.max_resync_assets_per_cycle)
         resync_cooldown_ms = max(0, self.config.settings.runtime.resync_cooldown_ms)
         full_resync_cooldown_ms = max(0, self.config.settings.runtime.full_resync_cooldown_ms)
+        same_reason_cooldown_ms = max(
+            0, self.config.settings.runtime.same_reason_resync_cooldown_ms
+        )
+        if reason == RESYNC_REASON_STALE_ASSET:
+            same_reason_cooldown_ms = max(
+                same_reason_cooldown_ms,
+                self.config.settings.runtime.stale_asset_resync_cooldown_ms,
+            )
+        elif reason == RESYNC_REASON_MISSING_BOOK_STATE:
+            same_reason_cooldown_ms = max(
+                same_reason_cooldown_ms,
+                self.config.settings.runtime.missing_book_resync_cooldown_ms,
+            )
 
         if is_full_resync:
             last_reason_ts = self.state.last_resync_at_by_reason.get(reason)
@@ -1175,10 +1509,18 @@ class PolymarketStructureArbApp:
 
         selected: list[str] = []
         for asset_id in unique_assets:
+            if reason == RESYNC_REASON_STALE_ASSET and asset_id not in self.state.ready_assets:
+                continue
             last_resync_ts = self.state.last_resync_at_by_asset.get(asset_id)
             if last_resync_ts is not None:
                 elapsed_ms = (now_ts - last_resync_ts) * 1000.0
                 if elapsed_ms < resync_cooldown_ms:
+                    continue
+            reason_key = f"{asset_id}|{reason}"
+            last_same_reason_ts = self.state.last_resync_at_by_asset_reason.get(reason_key)
+            if last_same_reason_ts is not None:
+                elapsed_reason_ms = (now_ts - last_same_reason_ts) * 1000.0
+                if elapsed_reason_ms < same_reason_cooldown_ms:
                     continue
             selected.append(asset_id)
             if len(selected) >= max_assets:
@@ -1203,6 +1545,7 @@ class PolymarketStructureArbApp:
                         continue
                 self.state.last_resync_at_by_asset[asset_id] = now.timestamp()
                 self.state.last_resync_at_by_reason[reason] = now.timestamp()
+                self.state.last_resync_at_by_asset_reason[f"{asset_id}|{reason}"] = now.timestamp()
                 self.state.resync_reason_counts[reason] = (
                     self.state.resync_reason_counts.get(reason, 0) + 1
                 )
@@ -1230,15 +1573,20 @@ class PolymarketStructureArbApp:
                             },
                             now_utc=now,
                         )
+                        self.state.last_no_data_resync_at_by_asset[asset_id] = now.timestamp()
                         self._record_no_signal_reason(
-                            reason=RESYNC_REASON_MISSING_BOOK_STATE,
+                            reason="book_missing_after_resync",
                             now_utc=now,
                             market_id=self.token_to_market_side.get(asset_id, ("", ""))[0] or None,
+                            asset_id=asset_id,
+                            details={"resync_reason": reason},
                         )
                         continue
 
                     update = self.quote_manager.apply_book_resync(summary)
                     self.healthcheck.on_asset_quote_update(asset_id=asset_id, ts=summary.timestamp)
+                    self._mark_asset_ready(asset_id)
+                    self.state.last_no_data_resync_at_by_asset.pop(asset_id, None)
                     mapping = self.token_to_market_side.get(asset_id)
                     if mapping is not None:
                         market_id, side = mapping
@@ -1490,11 +1838,14 @@ class PolymarketStructureArbApp:
             return
         self.logger.info(
             (
-                "Run startup universe watched_markets=%s subscribed_assets=%s "
+                "Run startup universe watched_markets(current/cumulative)=%s/%s "
+                "subscribed_assets(current/cumulative)=%s/%s "
                 "universe_limit=%s stale_asset_ms=%s resync_idle_ms=%s"
             ),
             self.state.watched_markets,
+            len(self.state.cumulative_watched_market_ids),
             self.state.subscribed_assets,
+            len(self.state.cumulative_subscribed_asset_ids),
             self.config.settings.market_filters.max_markets_to_watch,
             self.config.settings.runtime.stale_asset_ms,
             self.config.settings.runtime.book_resync_idle_ms,

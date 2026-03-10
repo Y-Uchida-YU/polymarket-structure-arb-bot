@@ -184,3 +184,80 @@ def test_daily_report_last_hours_with_run_id_includes_boundary_timestamp(
     report = generator.generate(date=None, last_hours=24, run_id="run-1")
 
     assert report["totals"]["total_signals"] == 1
+
+
+def test_daily_report_v7_breakdowns_and_warnings(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+
+    with store.conn:
+        rows = [
+            (
+                "run-1",
+                "safe_mode_entered",
+                1.0,
+                "scope=global;reason=all_assets_stale",
+                now,
+            ),
+            (
+                "run-1",
+                "safe_mode_asset_blocked",
+                3.0,
+                "scope=asset;reason=book_state_unhealthy;blocked_assets=3",
+                now,
+            ),
+            ("run-1", "no_signal_reason:safe_mode_blocked_global", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_global", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_global", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_global", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_global", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_global", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_asset", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_asset", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_asset", 1.0, "", now),
+            ("run-1", "no_signal_reason:safe_mode_blocked_asset", 1.0, "", now),
+            ("run-1", "missing_book_state_reason:no_initial_book", 7.0, "", now),
+            ("run-1", "missing_book_state_reason:quote_missing_after_resync", 4.0, "", now),
+            ("run-1", "warming_up_asset_count", 5.0, "waiting_initial_market_data_grace", now),
+            ("run-1", "universe_current_watched_markets", 40.0, "", now),
+            ("run-1", "universe_current_subscribed_assets", 80.0, "", now),
+            ("run-1", "universe_cumulative_watched_markets", 120.0, "", now),
+            ("run-1", "universe_cumulative_subscribed_assets", 240.0, "", now),
+        ]
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    assert report["totals"]["total_signals"] == 0
+    assert report["universe"]["current_watched_markets"] == 40
+    assert report["universe"]["cumulative_watched_markets"] == 120
+    assert report["universe"]["current_subscribed_assets"] == 80
+    assert report["universe"]["cumulative_subscribed_assets"] == 240
+
+    safe_mode_reasons = {item["reason"]: item["count"] for item in report["safe_mode_reasons"]}
+    assert safe_mode_reasons["all_assets_stale"] >= 1
+    assert safe_mode_reasons["book_state_unhealthy"] >= 1
+
+    missing_reasons = {
+        item["reason"]: item["count"] for item in report["missing_book_state_reasons"]
+    }
+    assert missing_reasons["no_initial_book"] == 7
+    assert missing_reasons["quote_missing_after_resync"] == 4
+
+    assert "safe_mode_triggered" in report["warnings"]
+    assert "safe_mode_dominates_run" in report["warnings"]
+    assert "book_state_unhealthy" in report["warnings"]
+    assert "data_not_ready_for_evaluation" in report["warnings"]
+
+    console = DailyReportGenerator.format_console(report)
+    assert "watched_markets(current/cumulative): 40 / 120" in console
+    assert "subscribed_assets(current/cumulative): 80 / 240" in console

@@ -44,8 +44,12 @@ runtime:
   market_refresh_minutes: 60
   stale_asset_ms: 15000
   initial_market_data_grace_ms: 30000
+  per_asset_book_grace_ms: 45000
   book_resync_idle_ms: 20000
   resync_cooldown_ms: 60000
+  same_reason_resync_cooldown_ms: 120000
+  missing_book_resync_cooldown_ms: 180000
+  stale_asset_resync_cooldown_ms: 180000
   full_resync_cooldown_ms: 120000
   max_resync_assets_per_cycle: 50
   resync_batch_size: 100
