@@ -49,6 +49,13 @@ SAFE_MODE_REASON_ALL_ASSETS_STALE = "all_assets_stale"
 SAFE_MODE_REASON_WS_UNHEALTHY = "ws_unhealthy"
 SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY = "book_state_unhealthy"
 
+MARKET_FRESHNESS_READY = "ready"
+MARKET_FRESHNESS_NOT_READY = "not_ready"
+MARKET_FRESHNESS_PROBATION = "probation"
+MARKET_FRESHNESS_RECOVERING = "recovering"
+MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE = "stale_no_recent_quote"
+MARKET_FRESHNESS_STALE_QUOTE_AGE = "stale_quote_age"
+
 
 def setup_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -111,9 +118,17 @@ class AppState:
     ever_ready_assets: set[str] = field(default_factory=set)
     asset_quote_update_count: dict[str, int] = field(default_factory=dict)
     asset_recovering_until: dict[str, datetime] = field(default_factory=dict)
+    asset_recovering_started_at: dict[str, datetime] = field(default_factory=dict)
     asset_unhealthy_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     last_book_missing_reason_by_asset: dict[str, str] = field(default_factory=dict)
     market_probation_until: dict[str, datetime] = field(default_factory=dict)
+    market_freshness_state_by_market: dict[str, str] = field(default_factory=dict)
+    market_freshness_updated_at: dict[str, datetime] = field(default_factory=dict)
+    market_quality_penalty_by_market: dict[str, int] = field(default_factory=dict)
+    market_refresh_observed_count: dict[str, int] = field(default_factory=dict)
+    eligible_markets: set[str] = field(default_factory=set)
+    last_no_signal_reason_by_market: dict[str, str] = field(default_factory=dict)
+    last_no_signal_reason_at_by_market: dict[str, float] = field(default_factory=dict)
     last_ws_idle_resync_ts: float = 0.0
     run_id: str = field(default_factory=lambda: uuid4().hex)
     run_started_at: datetime = field(default_factory=utc_now)
@@ -228,16 +243,32 @@ class PolymarketStructureArbApp:
             previous_asset_ids=previous_asset_ids,
         )
 
+    def _runtime_low_quality_excluded_market_ids(self) -> set[str]:
+        threshold = max(1, self.config.settings.runtime.low_quality_market_penalty_threshold)
+        min_observations = max(0, self.config.settings.runtime.low_quality_market_min_observations)
+        excluded: set[str] = set()
+        current_markets = set(self.markets_by_id.keys())
+        for market_id, penalty in self.state.market_quality_penalty_by_market.items():
+            observed = self.state.market_refresh_observed_count.get(market_id, 0)
+            if observed < min_observations:
+                continue
+            is_current = market_id in current_markets
+            if penalty >= threshold * 2 or (penalty >= threshold and not is_current):
+                excluded.add(market_id)
+        return excluded
+
     async def _fetch_market_snapshot(self) -> MarketSnapshot:
         raw_markets = await self.gamma_client.fetch_active_markets(
             page_size=self.config.settings.api.gamma_page_size,
             max_pages=self.config.settings.api.gamma_max_pages,
         )
+        runtime_excluded_market_ids = self._runtime_low_quality_excluded_market_ids()
         extraction = extract_binary_markets_with_stats(
             raw_markets=raw_markets,
             market_filters=self.config.settings.market_filters,
             markets_config=self.config.markets,
             preferred_market_ids=set(self.markets_by_id.keys()),
+            runtime_excluded_market_ids=runtime_excluded_market_ids,
         )
         markets_by_id = {market.market_id: market for market in extraction.markets}
         token_to_market_side: dict[str, tuple[str, str]] = {}
@@ -308,9 +339,35 @@ class PolymarketStructureArbApp:
             for market_id, probation_until in self.state.market_probation_until.items()
             if market_id in current_markets
         }
+        self.state.market_freshness_state_by_market = {
+            market_id: state
+            for market_id, state in self.state.market_freshness_state_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.market_freshness_updated_at = {
+            market_id: ts
+            for market_id, ts in self.state.market_freshness_updated_at.items()
+            if market_id in current_markets
+        }
+        self.state.eligible_markets &= current_markets
+        self.state.last_no_signal_reason_by_market = {
+            market_id: reason
+            for market_id, reason in self.state.last_no_signal_reason_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.last_no_signal_reason_at_by_market = {
+            market_id: ts
+            for market_id, ts in self.state.last_no_signal_reason_at_by_market.items()
+            if market_id in current_markets
+        }
         self.state.asset_recovering_until = {
             asset_id: recovering_until
             for asset_id, recovering_until in self.state.asset_recovering_until.items()
+            if asset_id in current_asset_ids
+        }
+        self.state.asset_recovering_started_at = {
+            asset_id: started_at
+            for asset_id, started_at in self.state.asset_recovering_started_at.items()
             if asset_id in current_asset_ids
         }
         self.state.last_book_missing_reason_by_asset = {
@@ -335,6 +392,10 @@ class PolymarketStructureArbApp:
         for market_id in added_markets:
             self.state.market_probation_until[market_id] = now + timedelta(
                 milliseconds=probation_ms
+            )
+        for market_id in current_markets:
+            self.state.market_refresh_observed_count[market_id] = (
+                self.state.market_refresh_observed_count.get(market_id, 0) + 1
             )
         self.state.last_signal_at_by_market = {
             market_id: ts
@@ -507,6 +568,20 @@ class PolymarketStructureArbApp:
                         now_utc=now,
                         market_id=market_id,
                         details=readiness_details,
+                    )
+                    continue
+                eligibility_ok, eligibility_reason, eligibility_details = (
+                    self._evaluate_market_signal_eligibility(
+                        market=market,
+                        now_utc=now,
+                    )
+                )
+                if not eligibility_ok:
+                    self._record_no_signal_reason(
+                        reason=eligibility_reason,
+                        now_utc=now,
+                        market_id=market_id,
+                        details=eligibility_details,
                     )
                     continue
                 if market_id in self.state.safe_mode_blocked_markets:
@@ -691,6 +766,7 @@ class PolymarketStructureArbApp:
         self.state.ready_assets.add(asset_id)
         self.state.ever_ready_assets.add(asset_id)
         self.state.asset_recovering_until.pop(asset_id, None)
+        self.state.asset_recovering_started_at.pop(asset_id, None)
         self.state.last_book_missing_reason_by_asset.pop(asset_id, None)
         self.state.safe_mode_blocked_assets.discard(asset_id)
 
@@ -782,6 +858,7 @@ class PolymarketStructureArbApp:
     def _mark_asset_recovering(self, asset_id: str, now_utc: datetime) -> None:
         grace_ms = max(0, self.config.settings.runtime.resync_recovery_grace_ms)
         recovering_until = now_utc + timedelta(milliseconds=grace_ms)
+        self.state.asset_recovering_started_at.setdefault(asset_id, now_utc)
         self.state.asset_recovering_until[asset_id] = recovering_until
         self.state.ready_assets.discard(asset_id)
 
@@ -789,8 +866,17 @@ class PolymarketStructureArbApp:
         recovering_until = self.state.asset_recovering_until.get(asset_id)
         if recovering_until is None:
             return False
+        started_at = self.state.asset_recovering_started_at.get(asset_id)
+        max_recovering_ms = max(0, self.config.settings.runtime.market_recovering_max_ms)
+        if started_at is not None and max_recovering_ms > 0:
+            elapsed_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
+            if elapsed_ms >= max_recovering_ms:
+                self.state.asset_recovering_until.pop(asset_id, None)
+                self.state.asset_recovering_started_at.pop(asset_id, None)
+                return False
         if now_utc > recovering_until:
             self.state.asset_recovering_until.pop(asset_id, None)
+            self.state.asset_recovering_started_at.pop(asset_id, None)
             return False
         return True
 
@@ -826,20 +912,49 @@ class PolymarketStructureArbApp:
             return "quote_missing_after_resync"
         return "book_not_resynced_yet"
 
-    def _evaluate_market_readiness(
+    def _market_quote_update_counts(self, market: BinaryMarket) -> tuple[int, int]:
+        yes_updates = self.state.asset_quote_update_count.get(market.yes_token_id, 0)
+        no_updates = self.state.asset_quote_update_count.get(market.no_token_id, 0)
+        return yes_updates, no_updates
+
+    def _resolve_market_freshness_state(
         self,
         *,
         market: BinaryMarket,
         now_utc: datetime,
-    ) -> tuple[bool, str, dict[str, object]]:
+    ) -> tuple[str, dict[str, object]]:
         if self._is_market_in_probation(market=market, now_utc=now_utc):
             probation_until = self.state.market_probation_until.get(market.market_id)
             return (
-                False,
-                "market_probation",
+                MARKET_FRESHNESS_PROBATION,
                 {
                     "market_id": market.market_id,
                     "probation_until": probation_until.isoformat() if probation_until else "",
+                },
+            )
+
+        if self._is_connection_recovering(now_utc=now_utc):
+            return (
+                MARKET_FRESHNESS_RECOVERING,
+                {
+                    "market_id": market.market_id,
+                    "recovery_reason": "connection_recovering",
+                    "ws_reconnect_reason": self.state.last_ws_reconnect_reason or "",
+                },
+            )
+
+        if self._is_asset_recovering(
+            asset_id=market.yes_token_id,
+            now_utc=now_utc,
+        ) or self._is_asset_recovering(
+            asset_id=market.no_token_id,
+            now_utc=now_utc,
+        ):
+            return (
+                MARKET_FRESHNESS_RECOVERING,
+                {
+                    "market_id": market.market_id,
+                    "recovery_reason": "asset_recovering",
                 },
             )
 
@@ -851,8 +966,7 @@ class PolymarketStructureArbApp:
                 }
             )
             return (
-                False,
-                "market_not_ready",
+                MARKET_FRESHNESS_NOT_READY,
                 {
                     "market_id": market.market_id,
                     "missing_reasons": ",".join(missing_reasons),
@@ -861,51 +975,127 @@ class PolymarketStructureArbApp:
 
         yes_quote, no_quote = self.quote_manager.get_market_quotes(market.market_id)
         if yes_quote is None or no_quote is None:
-            return False, "market_not_ready", {"market_id": market.market_id}
+            return MARKET_FRESHNESS_NOT_READY, {"market_id": market.market_id}
 
-        if self._is_connection_recovering(now_utc=now_utc):
+        if (
+            market.yes_token_id in self.state.stale_assets
+            or market.no_token_id in self.state.stale_assets
+        ):
             return (
-                False,
-                "market_recovering",
+                MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE,
                 {
                     "market_id": market.market_id,
-                    "state": "connection_recovering",
-                    "ws_reconnect_reason": self.state.last_ws_reconnect_reason or "",
                 },
             )
 
-        if self._market_has_stale_quotes(market=market, now_utc=now_utc):
-            if self._is_asset_recovering(
-                asset_id=market.yes_token_id,
+        max_quote_age_ms = max(1, self.config.settings.strategy.max_quote_age_ms_for_signal)
+        quote_age_ms = max(
+            (now_utc - yes_quote.timestamp).total_seconds() * 1000.0,
+            (now_utc - no_quote.timestamp).total_seconds() * 1000.0,
+        )
+        if quote_age_ms > max_quote_age_ms:
+            return (
+                MARKET_FRESHNESS_STALE_QUOTE_AGE,
+                {
+                    "market_id": market.market_id,
+                    "quote_age_ms": round(quote_age_ms, 3),
+                },
+            )
+
+        return MARKET_FRESHNESS_READY, {"market_id": market.market_id}
+
+    def _update_market_freshness_state(
+        self,
+        *,
+        market_id: str,
+        state: str,
+        now_utc: datetime,
+    ) -> None:
+        self.state.market_freshness_state_by_market[market_id] = state
+        self.state.market_freshness_updated_at[market_id] = now_utc
+
+    @staticmethod
+    def _market_freshness_to_no_signal_reason(state: str) -> str:
+        mapping = {
+            MARKET_FRESHNESS_NOT_READY: "market_not_ready",
+            MARKET_FRESHNESS_PROBATION: "market_probation",
+            MARKET_FRESHNESS_RECOVERING: "market_recovering",
+            MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE: "market_quote_stale_no_recent_quote",
+            MARKET_FRESHNESS_STALE_QUOTE_AGE: "market_quote_stale_quote_age",
+        }
+        return mapping.get(state, "market_not_ready")
+
+    def _evaluate_market_signal_eligibility(
+        self,
+        *,
+        market: BinaryMarket,
+        now_utc: datetime,
+    ) -> tuple[bool, str, dict[str, object]]:
+        state = self.state.market_freshness_state_by_market.get(market.market_id)
+        if state is None:
+            state, state_details = self._resolve_market_freshness_state(
+                market=market,
                 now_utc=now_utc,
-            ) or self._is_asset_recovering(
-                asset_id=market.no_token_id,
+            )
+            self._update_market_freshness_state(
+                market_id=market.market_id,
+                state=state,
                 now_utc=now_utc,
-            ):
-                return (
-                    False,
-                    "market_quote_stale_recovery",
-                    {
-                        "market_id": market.market_id,
-                        "state": "recovering",
-                    },
-                )
-            if (
-                market.yes_token_id in self.state.stale_assets
-                or market.no_token_id in self.state.stale_assets
-            ):
-                return (
-                    False,
-                    "market_quote_stale_no_recent_quote",
-                    {"market_id": market.market_id},
-                )
+            )
+            if state != MARKET_FRESHNESS_READY:
+                return False, self._market_freshness_to_no_signal_reason(state), state_details
+
+        if state != MARKET_FRESHNESS_READY:
             return (
                 False,
-                "market_quote_stale_quote_age",
+                self._market_freshness_to_no_signal_reason(state),
                 {"market_id": market.market_id},
             )
 
-        return True, "market_ready", {"market_id": market.market_id}
+        min_updates = max(
+            0,
+            self.config.settings.runtime.market_eligibility_min_quote_updates_per_asset,
+        )
+        yes_updates, no_updates = self._market_quote_update_counts(market)
+        if yes_updates < min_updates or no_updates < min_updates:
+            return (
+                False,
+                "book_not_ready_insufficient_updates",
+                {
+                    "market_id": market.market_id,
+                    "yes_updates": yes_updates,
+                    "no_updates": no_updates,
+                    "required_updates": min_updates,
+                },
+            )
+
+        if not self.quote_manager.is_market_ready(market.market_id):
+            return (
+                False,
+                "book_not_ready_missing_leg_ready",
+                {"market_id": market.market_id},
+            )
+
+        return True, "market_eligible", {"market_id": market.market_id}
+
+    def _evaluate_market_readiness(
+        self,
+        *,
+        market: BinaryMarket,
+        now_utc: datetime,
+    ) -> tuple[bool, str, dict[str, object]]:
+        state, details = self._resolve_market_freshness_state(
+            market=market,
+            now_utc=now_utc,
+        )
+        self._update_market_freshness_state(
+            market_id=market.market_id,
+            state=state,
+            now_utc=now_utc,
+        )
+        if state == MARKET_FRESHNESS_READY:
+            return True, "market_ready", details
+        return False, self._market_freshness_to_no_signal_reason(state), details
 
     def _update_asset_level_safe_mode(
         self,
@@ -1212,6 +1402,23 @@ class PolymarketStructureArbApp:
         details: dict[str, object] | None = None,
     ) -> None:
         normalized_reason = (reason or "unknown").strip() or "unknown"
+        if market_id:
+            now_ts = now_utc.timestamp()
+            cooldown_ms = max(
+                0,
+                self.config.settings.runtime.market_no_signal_reason_cooldown_ms,
+            )
+            previous_reason = self.state.last_no_signal_reason_by_market.get(market_id)
+            previous_ts = self.state.last_no_signal_reason_at_by_market.get(market_id)
+            if (
+                cooldown_ms > 0
+                and previous_reason == normalized_reason
+                and previous_ts is not None
+                and (now_ts - previous_ts) * 1000.0 < cooldown_ms
+            ):
+                return
+            self.state.last_no_signal_reason_by_market[market_id] = normalized_reason
+            self.state.last_no_signal_reason_at_by_market[market_id] = now_ts
         self.state.no_signal_reason_counts[normalized_reason] = (
             self.state.no_signal_reason_counts.get(normalized_reason, 0) + 1
         )
@@ -1874,6 +2081,7 @@ class PolymarketStructureArbApp:
                 if not self.quote_manager.is_asset_ready(asset_id)
             ]
             self.state.stale_assets = set()
+            self.state.eligible_markets = set()
             # During startup/warm-up we intentionally suppress ws health escalation.
             self.state.ws_unhealthy = False
             self.state.book_state_unhealthy = False
@@ -1942,14 +2150,82 @@ class PolymarketStructureArbApp:
             for asset_id in stale_assets
             if self._is_asset_in_probation(asset_id=asset_id, now_utc=now)
         ]
+        recovering_asset_set = set(recovering_assets)
+        probation_asset_set = set(probation_assets)
         effective_stale_assets = [
             asset_id
             for asset_id in stale_assets
-            if asset_id not in set(recovering_assets) and asset_id not in set(probation_assets)
+            if asset_id not in recovering_asset_set and asset_id not in probation_asset_set
         ]
         if connection_recovering:
             effective_stale_assets = []
         self.state.stale_assets = set(effective_stale_assets)
+        market_state_counts: dict[str, int] = {
+            MARKET_FRESHNESS_READY: 0,
+            MARKET_FRESHNESS_NOT_READY: 0,
+            MARKET_FRESHNESS_PROBATION: 0,
+            MARKET_FRESHNESS_RECOVERING: 0,
+            MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE: 0,
+            MARKET_FRESHNESS_STALE_QUOTE_AGE: 0,
+        }
+        eligible_markets: set[str] = set()
+        block_eligible_markets: set[str] = set()
+        min_updates = max(
+            0,
+            self.config.settings.runtime.market_eligibility_min_quote_updates_per_asset,
+        )
+        penalty_threshold = max(
+            1,
+            self.config.settings.runtime.low_quality_market_penalty_threshold,
+        )
+        penalty_increment = max(
+            1,
+            self.config.settings.runtime.low_quality_market_penalty_increment,
+        )
+        penalty_decay = max(1, self.config.settings.runtime.low_quality_market_penalty_decay)
+        for market in self.markets_by_id.values():
+            market_state, _ = self._resolve_market_freshness_state(market=market, now_utc=now)
+            self._update_market_freshness_state(
+                market_id=market.market_id,
+                state=market_state,
+                now_utc=now,
+            )
+            market_state_counts[market_state] = market_state_counts.get(market_state, 0) + 1
+            yes_updates, no_updates = self._market_quote_update_counts(market)
+            if market_state == MARKET_FRESHNESS_READY:
+                block_eligible_markets.add(market.market_id)
+            if (
+                market_state == MARKET_FRESHNESS_READY
+                and yes_updates >= min_updates
+                and no_updates >= min_updates
+            ):
+                eligible_markets.add(market.market_id)
+                current_penalty = self.state.market_quality_penalty_by_market.get(
+                    market.market_id,
+                    0,
+                )
+                self.state.market_quality_penalty_by_market[market.market_id] = max(
+                    0,
+                    current_penalty - penalty_decay,
+                )
+                continue
+            current_penalty = self.state.market_quality_penalty_by_market.get(market.market_id, 0)
+            if market_state in {
+                MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE,
+                MARKET_FRESHNESS_STALE_QUOTE_AGE,
+                MARKET_FRESHNESS_RECOVERING,
+                MARKET_FRESHNESS_NOT_READY,
+            }:
+                self.state.market_quality_penalty_by_market[market.market_id] = min(
+                    penalty_threshold * 3,
+                    current_penalty + penalty_increment,
+                )
+            else:
+                self.state.market_quality_penalty_by_market[market.market_id] = max(
+                    0,
+                    current_penalty - penalty_decay,
+                )
+        self.state.eligible_markets = eligible_markets
         missing_reasons_by_asset = self.state.last_book_missing_reason_by_asset
         blocking_missing_assets = {
             asset_id
@@ -1965,14 +2241,18 @@ class PolymarketStructureArbApp:
         blocking_unhealthy_assets = set(effective_stale_assets) | blocking_missing_assets
         if connection_recovering:
             blocking_unhealthy_assets = set()
+        eligible_assets: set[str] = set()
+        for market_id in block_eligible_markets:
+            market = self.markets_by_id.get(market_id)
+            if market is None:
+                continue
+            eligible_assets.add(market.yes_token_id)
+            eligible_assets.add(market.no_token_id)
+        blocking_unhealthy_assets &= eligible_assets
         unhealthy_assets = set(blocking_unhealthy_assets)
         tracked_count = max(1, len(tracked_assets))
         unhealthy_ratio = len(unhealthy_assets) / tracked_count
-        probation_market_count = sum(
-            1
-            for market_id in self.markets_by_id
-            if self._is_market_id_in_probation(market_id=market_id, now_utc=now)
-        )
+        probation_market_count = market_state_counts.get(MARKET_FRESHNESS_PROBATION, 0)
 
         self.sqlite_store.save_metric(
             metric_name="stale_asset_count",
@@ -2041,6 +2321,63 @@ class PolymarketStructureArbApp:
                 "metric_name": "probation_market_count",
                 "metric_value": probation_market_count,
                 "tracked_markets": len(self.markets_by_id),
+            },
+            now_utc=now,
+        )
+        market_state_metric_map = {
+            "market_state_ready_count": market_state_counts.get(MARKET_FRESHNESS_READY, 0),
+            "market_state_not_ready_count": market_state_counts.get(MARKET_FRESHNESS_NOT_READY, 0),
+            "market_state_probation_count": market_state_counts.get(MARKET_FRESHNESS_PROBATION, 0),
+            "market_state_recovering_count": market_state_counts.get(
+                MARKET_FRESHNESS_RECOVERING, 0
+            ),
+            "market_state_stale_no_recent_quote_count": market_state_counts.get(
+                MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE,
+                0,
+            ),
+            "market_state_stale_quote_age_count": market_state_counts.get(
+                MARKET_FRESHNESS_STALE_QUOTE_AGE,
+                0,
+            ),
+            "market_state_eligible_count": len(eligible_markets),
+        }
+        for metric_name, metric_value in market_state_metric_map.items():
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(metric_value),
+                details=f"tracked_markets={len(self.markets_by_id)}",
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                    "tracked_markets": len(self.markets_by_id),
+                },
+                now_utc=now,
+            )
+        low_quality_market_count = sum(
+            1
+            for penalty in self.state.market_quality_penalty_by_market.values()
+            if penalty >= penalty_threshold
+        )
+        self.sqlite_store.save_metric(
+            metric_name="low_quality_market_count",
+            metric_value=float(low_quality_market_count),
+            details=f"threshold={penalty_threshold}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "low_quality_market_count",
+                "metric_value": low_quality_market_count,
+                "threshold": penalty_threshold,
             },
             now_utc=now,
         )
@@ -2125,6 +2462,23 @@ class PolymarketStructureArbApp:
             reason=SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
             now_utc=now,
         )
+        self.sqlite_store.save_metric(
+            metric_name="market_state_blocked_count",
+            metric_value=float(len(self.state.safe_mode_blocked_markets)),
+            details=f"blocked_assets={len(self.state.safe_mode_blocked_assets)}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "market_state_blocked_count",
+                "metric_value": len(self.state.safe_mode_blocked_markets),
+                "blocked_assets": len(self.state.safe_mode_blocked_assets),
+            },
+            now_utc=now,
+        )
 
         candidate_global_reason = self._global_unhealthy_candidate_reason(
             tracked_assets=tracked_assets,
@@ -2192,7 +2546,7 @@ class PolymarketStructureArbApp:
             asset_id
             for asset_id in effective_stale_assets
             if asset_id not in missing_asset_set
-            and not self._is_asset_recovering(asset_id=asset_id, now_utc=now)
+            and self._is_asset_eligible_for_stale_resync(asset_id=asset_id, now_utc=now)
         ]
         stale_resync_assets = self._select_resync_assets(
             asset_ids=stale_only_assets,
@@ -2428,6 +2782,33 @@ class PolymarketStructureArbApp:
             now_utc.timestamp() - self.state.last_ws_idle_resync_ts
         ) * 1000.0 >= self.config.settings.runtime.book_resync_idle_ms
 
+    def _is_asset_eligible_for_stale_resync(self, *, asset_id: str, now_utc: datetime) -> bool:
+        if self._is_asset_recovering(asset_id=asset_id, now_utc=now_utc):
+            return False
+        if self._is_asset_in_probation(asset_id=asset_id, now_utc=now_utc):
+            return False
+        mapping = self.token_to_market_side.get(asset_id)
+        if mapping is None:
+            return False
+        market_id, _ = mapping
+        market = self.markets_by_id.get(market_id)
+        if market is None:
+            return False
+        freshness_state = self.state.market_freshness_state_by_market.get(market_id)
+        if freshness_state in {
+            MARKET_FRESHNESS_PROBATION,
+            MARKET_FRESHNESS_RECOVERING,
+            MARKET_FRESHNESS_NOT_READY,
+        }:
+            return False
+        min_ready_ratio = min(
+            1.0,
+            max(0.0, self.config.settings.runtime.stale_asset_resync_ready_ratio_min),
+        )
+        if self._market_ready_asset_ratio(market) < min_ready_ratio:
+            return False
+        return True
+
     def _select_resync_assets(
         self,
         *,
@@ -2452,6 +2833,10 @@ class PolymarketStructureArbApp:
                 same_reason_cooldown_ms,
                 self.config.settings.runtime.stale_asset_resync_cooldown_ms,
             )
+            same_reason_cooldown_ms = max(
+                same_reason_cooldown_ms,
+                self.config.settings.runtime.stale_asset_resync_additional_cooldown_ms,
+            )
         elif reason == RESYNC_REASON_MISSING_BOOK_STATE:
             same_reason_cooldown_ms = max(
                 same_reason_cooldown_ms,
@@ -2473,8 +2858,11 @@ class PolymarketStructureArbApp:
                 RESYNC_REASON_IDLE_TIMEOUT,
             }:
                 continue
-            if reason == RESYNC_REASON_STALE_ASSET and asset_id not in self.state.ready_assets:
-                continue
+            if reason == RESYNC_REASON_STALE_ASSET:
+                if asset_id not in self.state.ready_assets:
+                    continue
+                if not self._is_asset_eligible_for_stale_resync(asset_id=asset_id, now_utc=now_utc):
+                    continue
             if reason in {RESYNC_REASON_STALE_ASSET, RESYNC_REASON_MISSING_BOOK_STATE} and (
                 self._is_asset_recovering(asset_id=asset_id, now_utc=now_utc)
                 or self._is_asset_in_probation(asset_id=asset_id, now_utc=now_utc)

@@ -141,7 +141,11 @@ class DailyReportGenerator:
         no_signal_reason_map = {
             str(item.get("reason", "")): int(item.get("count", 0)) for item in no_signal_reasons
         }
-        book_not_ready_count = no_signal_reason_map.get("book_not_ready", 0)
+        book_not_ready_count = sum(
+            count
+            for reason, count in no_signal_reason_map.items()
+            if reason == "book_not_ready" or reason.startswith("book_not_ready_")
+        )
         quote_too_old_count = no_signal_reason_map.get("quote_too_old", 0)
         book_recovering_count = no_signal_reason_map.get("book_recovering", 0)
         market_not_ready_count = no_signal_reason_map.get("market_not_ready", 0)
@@ -154,6 +158,41 @@ class DailyReportGenerator:
         asset_warming_up_count = no_signal_reason_map.get("asset_warming_up", 0)
         connection_recovering_count = no_signal_reason_map.get("connection_recovering", 0)
         market_recovering_count = no_signal_reason_map.get("market_recovering", 0)
+        ready_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_ready_count",
+        )
+        recovering_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_recovering_count",
+        )
+        stale_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_stale_no_recent_quote_count",
+        ) + self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_stale_quote_age_count",
+        )
+        eligible_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_eligible_count",
+        )
+        blocked_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_blocked_count",
+        )
         readiness_no_signal_total = (
             book_not_ready_count
             + quote_too_old_count
@@ -168,24 +207,26 @@ class DailyReportGenerator:
         book_no_signal_total = sum(
             int(item.get("count", 0))
             for item in no_signal_reasons
-            if str(item.get("reason", ""))
-            in {
-                "book_not_ready",
-                "book_recovering",
-                "book_missing_after_resync",
-                "book_not_resynced_yet",
-                "book_evicted",
-                "no_initial_book",
-                "asset_warming_up",
-                "connection_recovering",
-                "market_recovering",
-                "market_not_ready",
-                "market_probation",
-                "market_quote_stale",
-                "market_quote_stale_no_recent_quote",
-                "market_quote_stale_recovery",
-                "market_quote_stale_quote_age",
-            }
+            if (
+                str(item.get("reason", "")).startswith("book_not_ready")
+                or str(item.get("reason", ""))
+                in {
+                    "book_recovering",
+                    "book_missing_after_resync",
+                    "book_not_resynced_yet",
+                    "book_evicted",
+                    "no_initial_book",
+                    "asset_warming_up",
+                    "connection_recovering",
+                    "market_recovering",
+                    "market_not_ready",
+                    "market_probation",
+                    "market_quote_stale",
+                    "market_quote_stale_no_recent_quote",
+                    "market_quote_stale_recovery",
+                    "market_quote_stale_quote_age",
+                }
+            )
         )
         missing_book_total = sum(int(item.get("count", 0)) for item in missing_book_state_reasons)
 
@@ -222,6 +263,10 @@ class DailyReportGenerator:
             or warmup.get("warmup_events", 0) > 0
         ):
             warnings.append("data_not_ready_for_evaluation")
+        if universe["current_watched_markets"] > 0 and eligible_market_count == 0:
+            warnings.append("no_eligible_markets")
+        if stale_market_count > max(5, ready_market_count):
+            warnings.append("freshness_friction_high")
         if universe["current_watched_markets"] > 150 or universe["current_subscribed_assets"] > 300:
             warnings.append("universe_too_large")
 
@@ -265,6 +310,11 @@ class DailyReportGenerator:
                 "asset_warming_up_count": asset_warming_up_count,
                 "connection_recovering_count": connection_recovering_count,
                 "market_recovering_count": market_recovering_count,
+                "ready_market_count": ready_market_count,
+                "recovering_market_count": recovering_market_count,
+                "stale_market_count": stale_market_count,
+                "eligible_market_count": eligible_market_count,
+                "blocked_market_count": blocked_market_count,
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
@@ -349,6 +399,11 @@ class DailyReportGenerator:
             f"asset_warming_up_count: {totals['asset_warming_up_count']}",
             f"connection_recovering_count: {totals['connection_recovering_count']}",
             f"market_recovering_count: {totals['market_recovering_count']}",
+            f"ready_market_count: {totals['ready_market_count']}",
+            f"recovering_market_count: {totals['recovering_market_count']}",
+            f"stale_market_count: {totals['stale_market_count']}",
+            f"eligible_market_count: {totals['eligible_market_count']}",
+            f"blocked_market_count: {totals['blocked_market_count']}",
             (
                 "watched_markets(current/cumulative): "
                 f"{universe.get('current_watched_markets', 0)} / "

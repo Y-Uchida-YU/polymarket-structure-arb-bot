@@ -241,3 +241,40 @@ def test_resolve_window_last_hours_is_relative_to_now(monkeypatch) -> None:
     end = datetime.fromisoformat(window.end_iso)
     delta = end - start
     assert delta == timedelta(hours=6)
+
+
+def test_dashboard_loader_overview_includes_market_state_and_book_not_ready_prefix_counts(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_dashboard_data(db_path)
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "no_signal_reason:book_not_ready_insufficient_updates", 1.0, "", now),
+                ("run-1", "market_state_ready_count", 6.0, "", now),
+                ("run-1", "market_state_recovering_count", 2.0, "", now),
+                ("run-1", "market_state_stale_no_recent_quote_count", 1.0, "", now),
+                ("run-1", "market_state_stale_quote_age_count", 1.0, "", now),
+                ("run-1", "market_state_eligible_count", 4.0, "", now),
+                ("run-1", "market_state_blocked_count", 1.0, "", now),
+            ],
+        )
+    store.close()
+
+    loader = DashboardDataLoader(db_path=db_path)
+    window = resolve_window(last_hours=24)
+    overview = loader.load_overview(window=window, run_id="run-1")
+
+    assert overview["book_not_ready_count"] == 1.0
+    assert overview["ready_market_count"] == 6.0
+    assert overview["recovering_market_count"] == 2.0
+    assert overview["stale_market_count"] == 2.0
+    assert overview["eligible_market_count"] == 4.0
+    assert overview["blocked_market_count"] == 1.0

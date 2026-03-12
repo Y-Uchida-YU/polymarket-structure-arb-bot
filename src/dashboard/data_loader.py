@@ -145,11 +145,11 @@ class DashboardDataLoader:
                 run_id=run_id,
                 name="safe_mode_asset_blocked",
             )
-            book_not_ready_count = self._count_metric(
+            book_not_ready_count = self._count_metric_like(
                 conn=conn,
                 window=window,
                 run_id=run_id,
-                name="no_signal_reason:book_not_ready",
+                pattern="no_signal_reason:book_not_ready%",
             )
             quote_too_old_count = self._count_metric(
                 conn=conn,
@@ -211,6 +211,41 @@ class DashboardDataLoader:
                 run_id=run_id,
                 name="no_signal_reason:market_probation",
             )
+            ready_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_ready_count",
+            )
+            recovering_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_recovering_count",
+            )
+            stale_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_stale_no_recent_quote_count",
+            ) + self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_stale_quote_age_count",
+            )
+            eligible_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_eligible_count",
+            )
+            blocked_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_blocked_count",
+            )
             resync_count = self._count(
                 conn=conn,
                 table="resync_events",
@@ -254,6 +289,11 @@ class DashboardDataLoader:
             "market_probation_count": float(market_probation_count),
             "connection_recovering_count": float(connection_recovering_count),
             "market_recovering_count": float(market_recovering_count),
+            "ready_market_count": float(ready_market_count),
+            "recovering_market_count": float(recovering_market_count),
+            "stale_market_count": float(stale_market_count),
+            "eligible_market_count": float(eligible_market_count),
+            "blocked_market_count": float(blocked_market_count),
             "no_initial_book_count": float(
                 self._sum_metric(
                     conn=conn,
@@ -877,6 +917,27 @@ class DashboardDataLoader:
         row = conn.execute(query, params).fetchone()
         return int(row[0] if row else 0)
 
+    def _count_metric_like(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        pattern: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, pattern]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
     def _sum_metric(
         self,
         *,
@@ -1135,6 +1196,11 @@ class DashboardDataLoader:
             "market_probation_count": 0.0,
             "connection_recovering_count": 0.0,
             "market_recovering_count": 0.0,
+            "ready_market_count": 0.0,
+            "recovering_market_count": 0.0,
+            "stale_market_count": 0.0,
+            "eligible_market_count": 0.0,
+            "blocked_market_count": 0.0,
             "no_initial_book_count": 0.0,
             "asset_warming_up_count": 0.0,
             "resync_count": 0.0,

@@ -1351,3 +1351,240 @@ def test_reconnect_connected_uses_selective_resync_when_quotes_are_fresh(tmp_pat
     assert app.book_client.calls == []
 
     asyncio.run(app.shutdown())
+
+
+def test_market_no_signal_reason_cooldown_suppresses_repeated_market_not_ready_logs(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_market_no_signal_reason_cooldown")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 0,
+            "market_no_signal_reason_cooldown_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.48",
+            "bid": "0.47",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(yes_payload))
+
+    row = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'no_signal_reason:market_not_ready'
+        """
+    ).fetchone()
+    assert int(row[0] if row else 0) == 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_market_eligibility_requires_min_quote_updates_before_strategy(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_market_eligibility_updates")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 0,
+            "market_eligibility_min_quote_updates_per_asset": 2,
+            "market_no_signal_reason_cooldown_ms": 0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.47",
+            "bid": "0.46",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.52",
+            "bid": "0.51",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+
+    market = app.markets_by_id["m1"]
+    now = datetime.now(tz=UTC)
+    readiness_ok, _, _ = app._evaluate_market_readiness(market=market, now_utc=now)
+    assert readiness_ok is True
+    eligible_ok, reason, _ = app._evaluate_market_signal_eligibility(market=market, now_utc=now)
+    assert eligible_ok is False
+    assert reason == "book_not_ready_insufficient_updates"
+
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+    eligible_ok, reason, _ = app._evaluate_market_signal_eligibility(
+        market=market,
+        now_utc=datetime.now(tz=UTC),
+    )
+    assert eligible_ok is True
+    assert reason == "market_eligible"
+
+    asyncio.run(app.shutdown())
+
+
+def test_probation_assets_are_excluded_from_stale_resync_candidates(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_probation_stale_resync_exclusion")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 0,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "resync_cooldown_ms": 0,
+            "same_reason_resync_cooldown_ms": 0,
+            "stale_asset_resync_cooldown_ms": 0,
+            "stale_asset_resync_additional_cooldown_ms": 0,
+            "max_resync_assets_per_cycle": 10,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    now = datetime.now(tz=UTC)
+    app.state.ws_connected_at = now
+    app.state.subscription_started_at = now - timedelta(seconds=2)
+    app.state.first_quote_received_at = now
+    app.state.market_probation_until["m1"] = now + timedelta(minutes=5)
+
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.48",
+            "bid": "0.47",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.52",
+            "bid": "0.51",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+    stale_ts = datetime.now(tz=UTC) - timedelta(seconds=10)
+    app.healthcheck.on_asset_quote_update("yes1", stale_ts)
+    app.healthcheck.on_asset_quote_update("no1", stale_ts)
+
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert isinstance(app.book_client, FakeBookClient)
+    assert app.book_client.calls == []
+
+    asyncio.run(app.shutdown())
+
+
+def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_runtime_low_quality_exclusion")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_universe_change_confirmations": 1,
+            "low_quality_market_penalty_threshold": 3,
+            "low_quality_market_min_observations": 1,
+        },
+        market_filters={
+            "max_markets_to_watch": 2,
+            "min_recent_activity": 0.0,
+            "min_liquidity_proxy": 0.0,
+            "min_volume_24h_proxy": 0.0,
+            "min_days_to_expiry": 0.0,
+            "max_days_to_expiry": 3650.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [make_raw_market("m1", "yes1", "no1")],
+            [make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    app.state.market_quality_penalty_by_market["m2"] = 4
+    app.state.market_refresh_observed_count["m2"] = 2
+
+    asyncio.run(app.refresh_market_universe())
+
+    assert set(app.markets_by_id.keys()) == {"m1"}
+    assert app.resubscribe_event.is_set() is False
+    row = app.sqlite_store.conn.execute(
+        """
+        SELECT details
+        FROM metrics
+        WHERE metric_name = 'market_filter_exclusion_summary'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None
+    assert "low_quality_runtime" in str(row[0])
+
+    asyncio.run(app.shutdown())

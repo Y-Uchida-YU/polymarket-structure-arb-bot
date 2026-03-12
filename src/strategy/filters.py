@@ -267,6 +267,7 @@ def extract_binary_markets_with_stats(
     market_filters: MarketFilterSettings,
     markets_config: MarketsConfig,
     preferred_market_ids: set[str] | None = None,
+    runtime_excluded_market_ids: set[str] | None = None,
     now_utc: datetime | None = None,
 ) -> MarketExtractionResult:
     reference_now = now_utc or datetime.now(tz=UTC)
@@ -274,6 +275,13 @@ def extract_binary_markets_with_stats(
     excluded_counts: dict[str, int] = {}
 
     for raw in raw_markets:
+        market_id = str(raw.get("id", "")).strip()
+        if runtime_excluded_market_ids and market_id in runtime_excluded_market_ids:
+            excluded_counts["low_quality_runtime"] = (
+                excluded_counts.get("low_quality_runtime", 0) + 1
+            )
+            continue
+
         reason = _exclude_reason(
             raw=raw,
             market_filters=market_filters,
@@ -339,12 +347,14 @@ def extract_binary_markets(
     market_filters: MarketFilterSettings,
     markets_config: MarketsConfig,
     preferred_market_ids: set[str] | None = None,
+    runtime_excluded_market_ids: set[str] | None = None,
 ) -> list[BinaryMarket]:
     return extract_binary_markets_with_stats(
         raw_markets=raw_markets,
         market_filters=market_filters,
         markets_config=markets_config,
         preferred_market_ids=preferred_market_ids,
+        runtime_excluded_market_ids=runtime_excluded_market_ids,
     ).markets
 
 

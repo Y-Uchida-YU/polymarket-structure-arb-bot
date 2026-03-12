@@ -104,6 +104,10 @@ def _evaluation_status(
     resync_count = float(overview.get("resync_count", 0.0))
     ws_reconnect_events = float(overview.get("ws_reconnect_events", 0.0))
     total_blocks = float(overview.get("total_block_events", 0.0))
+    watched_markets_current = float(overview.get("watched_markets_current", 0.0))
+    ready_market_count = float(overview.get("ready_market_count", 0.0))
+    stale_market_count = float(overview.get("stale_market_count", 0.0))
+    eligible_market_count = float(overview.get("eligible_market_count", 0.0))
     readiness_friction_count = (
         float(overview.get("book_not_ready_count", 0.0))
         + float(overview.get("quote_too_old_count", 0.0))
@@ -137,6 +141,8 @@ def _evaluation_status(
         or readiness_friction_count >= 200
         or missing_book_total >= 50
         or blocking_ratio >= 0.5
+        or (watched_markets_current > 0 and eligible_market_count <= 0)
+        or stale_market_count > max(5.0, ready_market_count)
     )
     if not_ready:
         return "NOT READY", "red"
@@ -212,6 +218,13 @@ def _overview_section(
     col23.metric("Connection Recovering", int(overview["connection_recovering_count"]))
     col24.metric("Market Recovering", int(overview["market_recovering_count"]))
 
+    col25, col26, col27, col28, col29 = st.columns(5)
+    col25.metric("Ready Markets", int(overview["ready_market_count"]))
+    col26.metric("Recovering Markets", int(overview["recovering_market_count"]))
+    col27.metric("Stale Markets", int(overview["stale_market_count"]))
+    col28.metric("Eligible Markets", int(overview["eligible_market_count"]))
+    col29.metric("Blocked Markets", int(overview["blocked_market_count"]))
+
     st.caption(
         "Universe (current/cumulative): "
         f"markets {int(overview['watched_markets_current'])}/"
@@ -273,8 +286,12 @@ def _diagnostics_section(
         focus_reasons = {
             "edge_below_threshold",
             "book_not_ready",
+            "book_not_ready_insufficient_updates",
+            "book_not_ready_missing_leg_ready",
             "quote_too_old",
             "market_quote_stale",
+            "market_quote_stale_no_recent_quote",
+            "market_quote_stale_quote_age",
             "book_recovering",
             "market_not_ready",
             "market_probation",
@@ -371,7 +388,7 @@ def _diagnostics_section(
             key = str(reason)
             if key in strategy_reasons:
                 return "strategy"
-            if key in readiness_reasons:
+            if key.startswith("book_not_ready") or key in readiness_reasons:
                 return "readiness"
             return "transport_or_other"
 
