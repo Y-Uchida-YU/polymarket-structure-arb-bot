@@ -103,6 +103,14 @@ def _evaluation_status(
     total_signals = int(overview.get("total_signals", 0.0))
     resync_count = float(overview.get("resync_count", 0.0))
     total_blocks = float(overview.get("total_block_events", 0.0))
+    readiness_friction_count = (
+        float(overview.get("book_not_ready_count", 0.0))
+        + float(overview.get("quote_too_old_count", 0.0))
+        + float(overview.get("market_quote_stale_count", 0.0))
+        + float(overview.get("book_recovering_count", 0.0))
+        + float(overview.get("market_not_ready_count", 0.0))
+        + float(overview.get("market_probation_count", 0.0))
+    )
 
     no_signal_total = (
         float(no_signal_reasons["count"].sum()) if not no_signal_reasons.empty else 0.0
@@ -122,13 +130,17 @@ def _evaluation_status(
     not_ready = total_signals == 0 and (
         resync_count >= 100
         or total_blocks >= 30
+        or readiness_friction_count >= 200
         or missing_book_total >= 50
         or blocking_ratio >= 0.5
     )
     if not_ready:
         return "NOT READY", "red"
     partial = total_signals == 0 and (
-        resync_count >= 40 or total_blocks >= 10 or missing_book_total > 0
+        resync_count >= 40
+        or total_blocks >= 10
+        or missing_book_total > 0
+        or readiness_friction_count > 0
     )
     if partial:
         return "PARTIALLY READY", "orange"
@@ -173,6 +185,19 @@ def _overview_section(
     col10.metric("Projected Matched PnL", f"{overview['projected_matched_pnl']:.4f}")
     col11.metric("Unmatched Inventory MTM", f"{overview['unmatched_inventory_mtm']:.4f}")
     col12.metric("Total Projected PnL", f"{overview['total_projected_pnl']:.4f}")
+
+    col13, col14, col15, col16 = st.columns(4)
+    col13.metric("Universe Changed", int(overview["market_universe_changed_count"]))
+    col14.metric("Book Not Ready", int(overview["book_not_ready_count"]))
+    col15.metric(
+        "Quote Stale",
+        int(overview["quote_too_old_count"] + overview["market_quote_stale_count"]),
+    )
+    col16.metric("Book Recovering", int(overview["book_recovering_count"]))
+
+    col17, col18 = st.columns(2)
+    col17.metric("Market Not Ready", int(overview["market_not_ready_count"]))
+    col18.metric("Market Probation", int(overview["market_probation_count"]))
 
     st.caption(
         "Universe (current/cumulative): "
@@ -232,6 +257,21 @@ def _diagnostics_section(
 
     no_signal_local = _timeseries_to_local(no_signal_ts, timezone)
     if not no_signal_local.empty:
+        focus_reasons = {
+            "edge_below_threshold",
+            "book_not_ready",
+            "quote_too_old",
+            "market_quote_stale",
+            "book_recovering",
+            "market_not_ready",
+            "market_probation",
+        }
+        focus = no_signal_local[no_signal_local["reason"].astype(str).isin(focus_reasons)]
+        if not focus.empty:
+            focus_pivot = _reason_chart_frame(focus, key_column="reason", top_n=10)
+            if not focus_pivot.empty:
+                st.markdown("**Readiness vs Strategy Reasons Over Time**")
+                st.area_chart(focus_pivot, use_container_width=True)
         no_signal_pivot = _reason_chart_frame(no_signal_local, key_column="reason", top_n=8)
         if not no_signal_pivot.empty:
             st.markdown("**No-Signal Reasons (Stacked)**")

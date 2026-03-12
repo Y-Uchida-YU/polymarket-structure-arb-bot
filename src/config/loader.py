@@ -64,12 +64,16 @@ class RuntimeSettings(BaseModel):
     market_refresh_minutes: int = 60
     market_universe_change_confirmations: int = 2
     market_universe_change_min_asset_delta: int = 4
+    market_probation_ms: int = 0
+    market_probation_min_quote_updates_per_asset: int = 2
+    market_probation_min_ready_asset_ratio: float = 1.0
     stale_asset_ms: int = 15_000
     initial_market_data_grace_ms: int = 30_000
     per_asset_book_grace_ms: int = 60_000
     resync_recovery_grace_ms: int = 180_000
     no_data_resync_cooldown_ms: int = 240_000
     quote_missing_after_resync_delay_ms: int = 240_000
+    asset_block_min_consecutive_unhealthy_cycles: int = 2
     market_block_min_consecutive_unhealthy_cycles: int = 2
     book_resync_idle_ms: int = 20_000
     resync_cooldown_ms: int = 60_000
@@ -113,6 +117,9 @@ class MarketFilterSettings(BaseModel):
     min_liquidity_proxy: float | None = None
     min_volume_24h_proxy: float | None = None
     require_recent_trade_within_minutes: int | None = None
+    prefer_existing_watched_markets: bool = True
+    existing_market_hysteresis_score_ratio: float = 0.9
+    max_market_replacements_per_refresh: int = 2
 
 
 class SecretSettings(BaseModel):

@@ -117,8 +117,15 @@ def build_startup_summary(
         "resync_cooldown_ms": config.settings.runtime.resync_cooldown_ms,
         "full_resync_cooldown_ms": config.settings.runtime.full_resync_cooldown_ms,
         "max_resync_assets_per_cycle": config.settings.runtime.max_resync_assets_per_cycle,
+        "market_probation_ms": config.settings.runtime.market_probation_ms,
+        "market_probation_min_quote_updates_per_asset": (
+            config.settings.runtime.market_probation_min_quote_updates_per_asset
+        ),
         "market_refresh_minutes": config.settings.runtime.market_refresh_minutes,
         "universe_limit_markets": config.settings.market_filters.max_markets_to_watch,
+        "universe_max_market_replacements_per_refresh": (
+            config.settings.market_filters.max_market_replacements_per_refresh
+        ),
         "require_orderbook_enabled": config.settings.market_filters.require_orderbook_enabled,
         "min_days_to_expiry": config.settings.market_filters.min_days_to_expiry,
         "max_days_to_expiry": config.settings.market_filters.max_days_to_expiry,

@@ -266,6 +266,7 @@ def extract_binary_markets_with_stats(
     raw_markets: list[dict[str, Any]],
     market_filters: MarketFilterSettings,
     markets_config: MarketsConfig,
+    preferred_market_ids: set[str] | None = None,
     now_utc: datetime | None = None,
 ) -> MarketExtractionResult:
     reference_now = now_utc or datetime.now(tz=UTC)
@@ -313,6 +314,14 @@ def extract_binary_markets_with_stats(
             reverse=True,
         )
         kept = sorted_candidates[:max_markets]
+        if market_filters.prefer_existing_watched_markets and preferred_market_ids:
+            kept = _stabilize_market_universe_selection(
+                sorted_candidates=sorted_candidates,
+                max_markets=max_markets,
+                preferred_market_ids=preferred_market_ids,
+                hysteresis_ratio=market_filters.existing_market_hysteresis_score_ratio,
+                max_replacements=market_filters.max_market_replacements_per_refresh,
+            )
         excluded_counts["max_markets_to_watch"] = excluded_counts.get("max_markets_to_watch", 0) + (
             len(candidates) - len(kept)
         )
@@ -329,9 +338,86 @@ def extract_binary_markets(
     raw_markets: list[dict[str, Any]],
     market_filters: MarketFilterSettings,
     markets_config: MarketsConfig,
+    preferred_market_ids: set[str] | None = None,
 ) -> list[BinaryMarket]:
     return extract_binary_markets_with_stats(
         raw_markets=raw_markets,
         market_filters=market_filters,
         markets_config=markets_config,
+        preferred_market_ids=preferred_market_ids,
     ).markets
+
+
+def _stabilize_market_universe_selection(
+    *,
+    sorted_candidates: list[BinaryMarket],
+    max_markets: int,
+    preferred_market_ids: set[str],
+    hysteresis_ratio: float,
+    max_replacements: int,
+) -> list[BinaryMarket]:
+    if max_markets <= 0:
+        return []
+    if not sorted_candidates:
+        return []
+
+    clamped_ratio = min(max(hysteresis_ratio, 0.0), 1.0)
+    replacement_budget = max(0, min(max_replacements, max_markets))
+    min_existing_slots = max(0, max_markets - replacement_budget)
+    score_by_market_id = {
+        market.market_id: _market_score(market.raw) for market in sorted_candidates
+    }
+
+    selected: list[BinaryMarket] = []
+    selected_ids: set[str] = set()
+    existing_candidates = [
+        market for market in sorted_candidates if market.market_id in preferred_market_ids
+    ]
+    for market in existing_candidates[:min_existing_slots]:
+        selected.append(market)
+        selected_ids.add(market.market_id)
+
+    for market in sorted_candidates:
+        if len(selected) >= max_markets:
+            break
+        if market.market_id in selected_ids:
+            continue
+        selected.append(market)
+        selected_ids.add(market.market_id)
+
+    if len(selected) < max_markets:
+        return selected
+
+    existing_not_selected = [
+        market for market in existing_candidates if market.market_id not in selected_ids
+    ]
+    newcomers = [market for market in selected if market.market_id not in preferred_market_ids]
+
+    while existing_not_selected and newcomers:
+        strongest_existing = existing_not_selected[0]
+        weakest_newcomer = min(
+            newcomers,
+            key=lambda market: (score_by_market_id.get(market.market_id, 0.0), market.slug),
+        )
+        strongest_score = score_by_market_id.get(strongest_existing.market_id, 0.0)
+        weakest_new_score = score_by_market_id.get(weakest_newcomer.market_id, 0.0)
+        if strongest_score < weakest_new_score * clamped_ratio:
+            break
+        selected = [
+            strongest_existing if item.market_id == weakest_newcomer.market_id else item
+            for item in selected
+        ]
+        selected_ids.add(strongest_existing.market_id)
+        selected_ids.discard(weakest_newcomer.market_id)
+        existing_not_selected = [
+            market
+            for market in existing_not_selected
+            if market.market_id != strongest_existing.market_id
+        ]
+        newcomers = [market for market in selected if market.market_id not in preferred_market_ids]
+
+    return sorted(
+        selected,
+        key=lambda market: (score_by_market_id.get(market.market_id, 0.0), market.slug),
+        reverse=True,
+    )

@@ -115,11 +115,53 @@ class DashboardDataLoader:
                 run_id=run_id,
                 name="safe_mode_market_block_cleared",
             )
+            market_universe_changed_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="market_universe_changed",
+            )
             asset_block_count = self._count_metric(
                 conn=conn,
                 window=window,
                 run_id=run_id,
                 name="safe_mode_asset_blocked",
+            )
+            book_not_ready_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:book_not_ready",
+            )
+            quote_too_old_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:quote_too_old",
+            )
+            market_quote_stale_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_quote_stale",
+            )
+            book_recovering_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:book_recovering",
+            )
+            market_not_ready_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_not_ready",
+            )
+            market_probation_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_probation",
             )
             resync_count = self._count(
                 conn=conn,
@@ -151,6 +193,13 @@ class DashboardDataLoader:
             "total_block_events": float(
                 global_safe_mode_count + market_block_count + asset_block_count
             ),
+            "market_universe_changed_count": float(market_universe_changed_count),
+            "book_not_ready_count": float(book_not_ready_count),
+            "quote_too_old_count": float(quote_too_old_count),
+            "market_quote_stale_count": float(market_quote_stale_count),
+            "book_recovering_count": float(book_recovering_count),
+            "market_not_ready_count": float(market_not_ready_count),
+            "market_probation_count": float(market_probation_count),
             "resync_count": float(resync_count),
             "projected_matched_pnl": projected_matched_pnl,
             "unmatched_inventory_mtm": unmatched_inventory_mtm,
@@ -916,6 +965,13 @@ class DashboardDataLoader:
             "market_block_count": 0.0,
             "asset_block_count": 0.0,
             "total_block_events": 0.0,
+            "market_universe_changed_count": 0.0,
+            "book_not_ready_count": 0.0,
+            "quote_too_old_count": 0.0,
+            "market_quote_stale_count": 0.0,
+            "book_recovering_count": 0.0,
+            "market_not_ready_count": 0.0,
+            "market_probation_count": 0.0,
             "resync_count": 0.0,
             "projected_matched_pnl": 0.0,
             "unmatched_inventory_mtm": 0.0,

@@ -66,6 +66,12 @@ class DailyReportGenerator:
                 run_id=run_id,
                 name="safe_mode_market_block_cleared",
             )
+            market_universe_changed_count = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="market_universe_changed",
+            )
             asset_block_count = self._count_metric(
                 conn,
                 window,
@@ -100,6 +106,25 @@ class DailyReportGenerator:
             for item in no_signal_reasons
             if str(item.get("reason", "")).startswith("safe_mode_blocked_")
         )
+        no_signal_reason_map = {
+            str(item.get("reason", "")): int(item.get("count", 0)) for item in no_signal_reasons
+        }
+        book_not_ready_count = no_signal_reason_map.get("book_not_ready", 0)
+        quote_too_old_count = no_signal_reason_map.get("quote_too_old", 0)
+        book_recovering_count = no_signal_reason_map.get("book_recovering", 0)
+        market_not_ready_count = no_signal_reason_map.get("market_not_ready", 0)
+        market_probation_count = no_signal_reason_map.get("market_probation", 0)
+        market_quote_stale_count = no_signal_reason_map.get("market_quote_stale", 0)
+        asset_warming_up_count = no_signal_reason_map.get("asset_warming_up", 0)
+        readiness_no_signal_total = (
+            book_not_ready_count
+            + quote_too_old_count
+            + book_recovering_count
+            + market_not_ready_count
+            + market_probation_count
+            + market_quote_stale_count
+            + asset_warming_up_count
+        )
         book_no_signal_total = sum(
             int(item.get("count", 0))
             for item in no_signal_reasons
@@ -111,6 +136,10 @@ class DailyReportGenerator:
                 "book_not_resynced_yet",
                 "book_evicted",
                 "no_initial_book",
+                "asset_warming_up",
+                "market_not_ready",
+                "market_probation",
+                "market_quote_stale",
             }
         )
         missing_book_total = sum(int(item.get("count", 0)) for item in missing_book_state_reasons)
@@ -132,6 +161,8 @@ class DailyReportGenerator:
             warnings.append("asset_blocks_triggered")
         if safe_mode_blocked_total >= max(10, int(no_signal_total * 0.5)):
             warnings.append("blocking_dominates_run")
+        if readiness_no_signal_total >= max(100, int(no_signal_total * 0.25)):
+            warnings.append("readiness_friction_high")
         if resync_count >= 1_000:
             warnings.append("resync_storm_detected")
         if total_signals == 0 and resync_count >= 100:
@@ -173,6 +204,14 @@ class DailyReportGenerator:
                 "market_block_cleared_count": market_block_cleared_count,
                 "asset_block_count": asset_block_count,
                 "total_block_events": total_block_events,
+                "market_universe_changed_count": market_universe_changed_count,
+                "book_not_ready_count": book_not_ready_count,
+                "quote_too_old_count": quote_too_old_count,
+                "book_recovering_count": book_recovering_count,
+                "market_not_ready_count": market_not_ready_count,
+                "market_probation_count": market_probation_count,
+                "market_quote_stale_count": market_quote_stale_count,
+                "asset_warming_up_count": asset_warming_up_count,
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
@@ -241,6 +280,14 @@ class DailyReportGenerator:
             f"market_block_cleared_count: {totals['market_block_cleared_count']}",
             f"asset_block_count: {totals['asset_block_count']}",
             f"total_block_events: {totals['total_block_events']}",
+            f"market_universe_changed_count: {totals['market_universe_changed_count']}",
+            f"book_not_ready_count: {totals['book_not_ready_count']}",
+            f"quote_too_old_count: {totals['quote_too_old_count']}",
+            f"book_recovering_count: {totals['book_recovering_count']}",
+            f"market_not_ready_count: {totals['market_not_ready_count']}",
+            f"market_probation_count: {totals['market_probation_count']}",
+            f"market_quote_stale_count: {totals['market_quote_stale_count']}",
+            f"asset_warming_up_count: {totals['asset_warming_up_count']}",
             (
                 "watched_markets(current/cumulative): "
                 f"{universe.get('current_watched_markets', 0)} / "
