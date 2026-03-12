@@ -100,6 +100,10 @@ class AppState:
     ws_connected_at: datetime | None = None
     subscription_started_at: datetime | None = None
     first_quote_received_at: datetime | None = None
+    ws_health_state: str = "disconnected"
+    last_ws_connect_reason: str | None = None
+    last_ws_reconnect_reason: str | None = None
+    connection_recovering_until: datetime | None = None
     ws_unhealthy: bool = False
     book_state_unhealthy: bool = False
     asset_subscribed_at: dict[str, datetime] = field(default_factory=dict)
@@ -447,6 +451,7 @@ class PolymarketStructureArbApp:
                 return
             if self.state.first_quote_received_at is None:
                 self.state.first_quote_received_at = now
+            self.state.ws_health_state = "healthy"
 
             for update in updates:
                 self.healthcheck.on_ws_message(now)
@@ -471,6 +476,7 @@ class PolymarketStructureArbApp:
                     source=update.event_type,
                 )
                 self._mark_asset_ready(update.asset_id)
+                self._maybe_finish_connection_recovery(now_utc=now)
 
                 market = self.markets_by_id.get(market_id)
                 if market is None:
@@ -734,6 +740,45 @@ class PolymarketStructureArbApp:
         market_id, _ = mapping
         return self._is_market_id_in_probation(market_id, now_utc)
 
+    def _start_connection_recovery(self, *, now_utc: datetime, reason: str) -> None:
+        grace_ms = max(0, self.config.settings.runtime.reconnect_recovery_grace_ms)
+        if grace_ms <= 0:
+            self.state.connection_recovering_until = None
+            return
+        self.state.connection_recovering_until = now_utc + timedelta(milliseconds=grace_ms)
+        self.state.ws_health_state = "reconnecting"
+        self.state.last_ws_reconnect_reason = reason
+
+    def _is_connection_recovering(self, *, now_utc: datetime) -> bool:
+        recovering_until = self.state.connection_recovering_until
+        if recovering_until is None:
+            return False
+        if now_utc >= recovering_until:
+            self.state.connection_recovering_until = None
+            if self.state.ws_health_state == "reconnecting":
+                self.state.ws_health_state = "healthy"
+            return False
+        return True
+
+    def _connection_ready_ratio(self) -> float:
+        tracked_assets = set(self.token_to_market_side.keys())
+        if not tracked_assets:
+            return 0.0
+        return len(self.state.ready_assets & tracked_assets) / max(1, len(tracked_assets))
+
+    def _maybe_finish_connection_recovery(self, *, now_utc: datetime) -> None:
+        if not self._is_connection_recovering(now_utc=now_utc):
+            return
+        if self.state.first_quote_received_at is None:
+            return
+        min_ratio = min(
+            1.0,
+            max(0.0, self.config.settings.runtime.reconnect_recovery_min_ready_asset_ratio),
+        )
+        if self._connection_ready_ratio() >= min_ratio:
+            self.state.connection_recovering_until = None
+            self.state.ws_health_state = "healthy"
+
     def _mark_asset_recovering(self, asset_id: str, now_utc: datetime) -> None:
         grace_ms = max(0, self.config.settings.runtime.resync_recovery_grace_ms)
         recovering_until = now_utc + timedelta(milliseconds=grace_ms)
@@ -752,6 +797,8 @@ class PolymarketStructureArbApp:
     def _classify_missing_book_reason(self, asset_id: str, now_utc: datetime) -> str:
         if self._is_asset_in_probation(asset_id=asset_id, now_utc=now_utc):
             return "asset_warming_up"
+        if self._is_connection_recovering(now_utc=now_utc):
+            return "connection_recovering"
         if self._is_asset_recovering(asset_id=asset_id, now_utc=now_utc):
             return "book_recovering"
         subscribed_at = self.state.asset_subscribed_at.get(asset_id)
@@ -816,19 +863,47 @@ class PolymarketStructureArbApp:
         if yes_quote is None or no_quote is None:
             return False, "market_not_ready", {"market_id": market.market_id}
 
+        if self._is_connection_recovering(now_utc=now_utc):
+            return (
+                False,
+                "market_recovering",
+                {
+                    "market_id": market.market_id,
+                    "state": "connection_recovering",
+                    "ws_reconnect_reason": self.state.last_ws_reconnect_reason or "",
+                },
+            )
+
         if self._market_has_stale_quotes(market=market, now_utc=now_utc):
-            if self._is_asset_recovering(market.yes_token_id, now_utc) or self._is_asset_recovering(
-                market.no_token_id, now_utc
+            if self._is_asset_recovering(
+                asset_id=market.yes_token_id,
+                now_utc=now_utc,
+            ) or self._is_asset_recovering(
+                asset_id=market.no_token_id,
+                now_utc=now_utc,
             ):
                 return (
                     False,
-                    "market_not_ready",
+                    "market_quote_stale_recovery",
                     {
                         "market_id": market.market_id,
                         "state": "recovering",
                     },
                 )
-            return False, "market_quote_stale", {"market_id": market.market_id}
+            if (
+                market.yes_token_id in self.state.stale_assets
+                or market.no_token_id in self.state.stale_assets
+            ):
+                return (
+                    False,
+                    "market_quote_stale_no_recent_quote",
+                    {"market_id": market.market_id},
+                )
+            return (
+                False,
+                "market_quote_stale_quote_age",
+                {"market_id": market.market_id},
+            )
 
         return True, "market_ready", {"market_id": market.market_id}
 
@@ -1121,7 +1196,7 @@ class PolymarketStructureArbApp:
             "adjusted_edge_below_min": "edge_below_threshold",
             "spread_guard": "spread_too_wide",
             "min_depth_guard": "depth_too_low",
-            "quote_age_exceeded": "market_quote_stale",
+            "quote_age_exceeded": "quote_too_old",
             "missing_quote": "book_not_ready",
             "missing_best_ask": "book_not_ready",
             "tick_alignment_guard": "book_not_ready",
@@ -1615,11 +1690,67 @@ class PolymarketStructureArbApp:
         now = utc_now()
         self.state.ws_connected_at = now
         self.state.subscription_started_at = now
+        self.state.ws_health_state = "healthy"
         for asset_id in asset_ids:
             self.state.asset_subscribed_at.setdefault(asset_id, now)
         reason = self.state.pending_connect_resync_reason or RESYNC_REASON_WS_CONNECTED
         self.state.pending_connect_resync_reason = None
-        await self.resync_assets(asset_ids=asset_ids, reason=reason, force=True)
+        self.state.last_ws_connect_reason = reason
+        if reason != RESYNC_REASON_WS_CONNECTED:
+            self._start_connection_recovery(now_utc=now, reason=reason)
+        self.sqlite_store.save_metric(
+            metric_name="ws_connected_event",
+            metric_value=1.0,
+            details=f"reason={reason};assets={len(asset_ids)}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "ws_connected_event",
+                "metric_value": 1.0,
+                "reason": reason,
+                "assets": len(asset_ids),
+            },
+            now_utc=now,
+        )
+        force_resync = (
+            reason == RESYNC_REASON_WS_CONNECTED and self.state.first_quote_received_at is None
+        )
+        resync_candidates = list(asset_ids)
+        if not force_resync:
+            stale_candidates = set(
+                self.healthcheck.stale_assets(
+                    tracked_assets=list(asset_ids),
+                    now_utc=now,
+                    max_age_ms=self.config.settings.runtime.stale_asset_ms,
+                )
+            )
+            resync_candidates = [
+                asset_id
+                for asset_id in asset_ids
+                if not self.quote_manager.is_asset_ready(asset_id) or asset_id in stale_candidates
+            ]
+            if reason == RESYNC_REASON_MARKET_UNIVERSE_CHANGED:
+                never_ready_assets = [
+                    asset_id
+                    for asset_id in asset_ids
+                    if asset_id not in self.state.ever_ready_assets
+                ]
+                resync_candidates = list(dict.fromkeys([*resync_candidates, *never_ready_assets]))
+        if resync_candidates:
+            await self.resync_assets(
+                asset_ids=resync_candidates,
+                reason=reason,
+                force=force_resync,
+            )
+        else:
+            self.logger.info(
+                "WS connected reason=%s with no immediate resync targets.",
+                reason,
+            )
 
     def _market_data_warmup_state(self, now_utc: datetime) -> tuple[bool, str]:
         if self.state.ws_connected_at is None:
@@ -1646,9 +1777,11 @@ class PolymarketStructureArbApp:
             else RESYNC_REASON_WS_RECONNECT
         )
         self.state.pending_connect_resync_reason = mapped_reason
+        self.state.ws_health_state = "reconnecting"
+        self.state.last_ws_reconnect_reason = reason
         now = utc_now()
         self.sqlite_store.save_metric(
-            metric_name="ws_reconnect_required",
+            metric_name="ws_reconnect_event",
             metric_value=1.0,
             details=f"reason={reason};mapped={mapped_reason}",
             created_at_iso=now.isoformat(),
@@ -1658,10 +1791,33 @@ class PolymarketStructureArbApp:
             {
                 "run_id": self.state.run_id,
                 "created_at": now.isoformat(),
-                "metric_name": "ws_reconnect_required",
+                "metric_name": "ws_reconnect_event",
                 "metric_value": 1.0,
                 "reason": reason,
                 "mapped_reason": mapped_reason,
+            },
+            now_utc=now,
+        )
+
+    def on_ws_transport_event(self, event_name: str, reason: str, asset_count: int) -> None:
+        now = utc_now()
+        metric_name = f"ws_transport_{event_name}"
+        details = f"reason={reason};assets={asset_count}"
+        self.sqlite_store.save_metric(
+            metric_name=metric_name,
+            metric_value=1.0,
+            details=details,
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": metric_name,
+                "metric_value": 1.0,
+                "reason": reason,
+                "assets": asset_count,
             },
             now_utc=now,
         )
@@ -1689,6 +1845,24 @@ class PolymarketStructureArbApp:
                 "metric_name": "ws_idle_ms",
                 "metric_value": ws_idle_ms,
                 "has_last_ws_message": last_ws_message_at is not None,
+            },
+            now_utc=now,
+        )
+        connection_recovering = self._is_connection_recovering(now_utc=now)
+        self.sqlite_store.save_metric(
+            metric_name="connection_recovering",
+            metric_value=1.0 if connection_recovering else 0.0,
+            details=f"ws_health_state={self.state.ws_health_state}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "connection_recovering",
+                "metric_value": 1.0 if connection_recovering else 0.0,
+                "ws_health_state": self.state.ws_health_state,
             },
             now_utc=now,
         )
@@ -1742,7 +1916,6 @@ class PolymarketStructureArbApp:
                 continue
             if self.quote_manager.is_asset_ready(asset_id):
                 self._mark_asset_ready(asset_id)
-
         missing_assets: list[str] = []
         missing_assets_by_reason: dict[str, list[str]] = {}
         for asset_id in tracked_assets:
@@ -1774,15 +1947,24 @@ class PolymarketStructureArbApp:
             for asset_id in stale_assets
             if asset_id not in set(recovering_assets) and asset_id not in set(probation_assets)
         ]
+        if connection_recovering:
+            effective_stale_assets = []
         self.state.stale_assets = set(effective_stale_assets)
         missing_reasons_by_asset = self.state.last_book_missing_reason_by_asset
         blocking_missing_assets = {
             asset_id
             for asset_id in missing_assets
             if missing_reasons_by_asset.get(asset_id)
-            not in {"book_recovering", "book_not_ready", "asset_warming_up"}
+            not in {
+                "book_recovering",
+                "book_not_ready",
+                "asset_warming_up",
+                "connection_recovering",
+            }
         }
         blocking_unhealthy_assets = set(effective_stale_assets) | blocking_missing_assets
+        if connection_recovering:
+            blocking_unhealthy_assets = set()
         unhealthy_assets = set(blocking_unhealthy_assets)
         tracked_count = max(1, len(tracked_assets))
         unhealthy_ratio = len(unhealthy_assets) / tracked_count
@@ -1902,6 +2084,13 @@ class PolymarketStructureArbApp:
         self.state.book_state_unhealthy = unhealthy_ratio >= max(
             0.01, self.config.settings.guardrails.max_stale_asset_rate
         )
+        if connection_recovering:
+            self.state.ws_unhealthy = False
+            self.state.book_state_unhealthy = False
+        elif self.state.ws_unhealthy:
+            self.state.ws_health_state = "degraded"
+        else:
+            self.state.ws_health_state = "healthy"
         if effective_stale_assets:
             self.state.total_stale_events += 1
         if effective_stale_assets:
@@ -1920,6 +2109,8 @@ class PolymarketStructureArbApp:
             if len(blocking_unhealthy_assets) < len(tracked_assets)
             else set()
         )
+        if connection_recovering:
+            candidate_unhealthy_assets = set()
         partial_unhealthy_assets = self._derive_asset_blocks(
             candidate_assets=candidate_unhealthy_assets,
         )
@@ -1940,6 +2131,8 @@ class PolymarketStructureArbApp:
             stale_assets=effective_stale_assets,
             unhealthy_assets=unhealthy_assets,
         )
+        if connection_recovering:
+            candidate_global_reason = None
         should_enter_global, trigger_reason = self._update_global_unhealthy_state(
             now_utc=now,
             candidate_reason=candidate_global_reason,
@@ -1988,7 +2181,7 @@ class PolymarketStructureArbApp:
             reason=RESYNC_REASON_MISSING_BOOK_STATE,
             now_utc=now,
         )
-        if missing_resync_assets:
+        if missing_resync_assets and not connection_recovering:
             await self.resync_assets(
                 asset_ids=missing_resync_assets,
                 reason=RESYNC_REASON_MISSING_BOOK_STATE,
@@ -2006,13 +2199,13 @@ class PolymarketStructureArbApp:
             reason=RESYNC_REASON_STALE_ASSET,
             now_utc=now,
         )
-        if stale_resync_assets:
+        if stale_resync_assets and not connection_recovering:
             await self.resync_assets(
                 asset_ids=stale_resync_assets,
                 reason=RESYNC_REASON_STALE_ASSET,
             )
 
-        if self._is_ws_idle(now):
+        if not connection_recovering and self._is_ws_idle(now):
             idle_resync_assets = self._select_resync_assets(
                 asset_ids=tracked_assets,
                 reason=RESYNC_REASON_IDLE_TIMEOUT,
@@ -2223,6 +2416,8 @@ class PolymarketStructureArbApp:
             self.stop_event.set()
 
     def _is_ws_idle(self, now_utc: datetime) -> bool:
+        if self._is_connection_recovering(now_utc=now_utc):
+            return False
         last_ws_message_at = self.healthcheck.state.last_ws_message_at
         if last_ws_message_at is None:
             return False
@@ -2272,6 +2467,12 @@ class PolymarketStructureArbApp:
 
         selected: list[str] = []
         for asset_id in unique_assets:
+            if self._is_connection_recovering(now_utc=now_utc) and reason in {
+                RESYNC_REASON_STALE_ASSET,
+                RESYNC_REASON_MISSING_BOOK_STATE,
+                RESYNC_REASON_IDLE_TIMEOUT,
+            }:
+                continue
             if reason == RESYNC_REASON_STALE_ASSET and asset_id not in self.state.ready_assets:
                 continue
             if reason in {RESYNC_REASON_STALE_ASSET, RESYNC_REASON_MISSING_BOOK_STATE} and (
@@ -2348,8 +2549,13 @@ class PolymarketStructureArbApp:
                         )
                         self.state.last_no_data_resync_at_by_asset[asset_id] = now.timestamp()
                         self._mark_asset_recovering(asset_id=asset_id, now_utc=now)
+                        no_signal_reason = (
+                            "connection_recovering"
+                            if self._is_connection_recovering(now_utc=now)
+                            else "book_recovering"
+                        )
                         self._record_no_signal_reason(
-                            reason="book_recovering",
+                            reason=no_signal_reason,
                             now_utc=now,
                             market_id=self.token_to_market_side.get(asset_id, ("", ""))[0] or None,
                             asset_id=asset_id,
@@ -2638,11 +2844,16 @@ class PolymarketStructureArbApp:
             on_message=self.handle_ws_message,
             on_connected=self.on_ws_connected,
             on_reconnect_required=self.on_ws_reconnect_required,
+            on_transport_event=self.on_ws_transport_event,
             logger=self.logger,
             reconnect_base_seconds=self.config.settings.runtime.reconnect_base_seconds,
             reconnect_max_seconds=self.config.settings.runtime.reconnect_max_seconds,
             ping_interval_seconds=self.config.settings.runtime.websocket_ping_interval_seconds,
             ping_timeout_seconds=self.config.settings.runtime.websocket_ping_timeout_seconds,
+            receive_timeout_seconds=self.config.settings.runtime.websocket_receive_timeout_seconds,
+            receive_timeout_reconnect_count=(
+                self.config.settings.runtime.websocket_receive_timeout_reconnect_count
+            ),
         )
         refresh_interval_seconds = max(
             60.0,

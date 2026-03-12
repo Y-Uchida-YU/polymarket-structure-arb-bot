@@ -184,11 +184,19 @@ def test_dashboard_loader_core_metrics_with_run_id_filter(tmp_path: Path) -> Non
     assert overview["asset_block_count"] == 0.0
     assert overview["total_block_events"] == 1.0
     assert overview["market_universe_changed_count"] == 0.0
+    assert overview["market_universe_change_events"] == 0.0
+    assert overview["resync_due_to_universe_change"] == 0.0
+    assert overview["ws_connected_events"] == 0.0
+    assert overview["ws_reconnect_events"] == 0.0
     assert overview["book_not_ready_count"] == 0.0
     assert overview["quote_too_old_count"] == 0.0
     assert overview["book_recovering_count"] == 0.0
     assert overview["market_not_ready_count"] == 0.0
     assert overview["market_probation_count"] == 0.0
+    assert overview["connection_recovering_count"] == 0.0
+    assert overview["market_recovering_count"] == 0.0
+    assert overview["no_initial_book_count"] == 0.0
+    assert overview["asset_warming_up_count"] == 0.0
     assert overview["watched_markets_current"] == 5.0
     assert overview["subscribed_assets_current"] == 10.0
 
@@ -197,6 +205,8 @@ def test_dashboard_loader_core_metrics_with_run_id_filter(tmp_path: Path) -> Non
     assert str(breakdowns["resyncs_by_reason"].iloc[0]["reason"]) == "ws_connected"
     assert not breakdowns["safe_mode_by_scope_reason"].empty
     assert str(breakdowns["safe_mode_by_scope_reason"].iloc[0]["scope"]) == "global"
+    assert breakdowns["ws_connected_reasons"].empty
+    assert breakdowns["ws_reconnect_reasons"].empty
 
     market_diag = loader.load_market_diagnostics(window=window, run_id="run-1", market_slug=None)
     assert not market_diag.empty

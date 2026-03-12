@@ -72,6 +72,24 @@ class DailyReportGenerator:
                 run_id=run_id,
                 name="market_universe_changed",
             )
+            ws_connected_events = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="ws_connected_event",
+            )
+            ws_reconnect_events = self._count_metric(
+                conn,
+                window,
+                run_id=run_id,
+                name="ws_reconnect_event",
+            )
+            resync_due_to_universe_change = self._count_resync_reason(
+                conn,
+                window,
+                run_id=run_id,
+                reason="market_universe_changed",
+            )
             asset_block_count = self._count_metric(
                 conn,
                 window,
@@ -91,6 +109,20 @@ class DailyReportGenerator:
             safe_mode_by_scope = self._safe_mode_by_scope(conn, window, run_id=run_id)
             missing_book_state_reasons = self._missing_book_state_reasons(
                 conn, window, run_id=run_id
+            )
+            ws_reconnect_reason_breakdown = self._metric_detail_breakdown(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="ws_reconnect_event",
+                detail_key="reason",
+            )
+            ws_connected_reason_breakdown = self._metric_detail_breakdown(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="ws_connected_event",
+                detail_key="reason",
             )
             universe = self._universe_overview(conn, window, run_id=run_id)
             warmup = self._warmup_overview(conn, window, run_id=run_id)
@@ -114,8 +146,14 @@ class DailyReportGenerator:
         book_recovering_count = no_signal_reason_map.get("book_recovering", 0)
         market_not_ready_count = no_signal_reason_map.get("market_not_ready", 0)
         market_probation_count = no_signal_reason_map.get("market_probation", 0)
-        market_quote_stale_count = no_signal_reason_map.get("market_quote_stale", 0)
+        market_quote_stale_count = sum(
+            count
+            for reason, count in no_signal_reason_map.items()
+            if reason.startswith("market_quote_stale")
+        )
         asset_warming_up_count = no_signal_reason_map.get("asset_warming_up", 0)
+        connection_recovering_count = no_signal_reason_map.get("connection_recovering", 0)
+        market_recovering_count = no_signal_reason_map.get("market_recovering", 0)
         readiness_no_signal_total = (
             book_not_ready_count
             + quote_too_old_count
@@ -124,6 +162,8 @@ class DailyReportGenerator:
             + market_probation_count
             + market_quote_stale_count
             + asset_warming_up_count
+            + connection_recovering_count
+            + market_recovering_count
         )
         book_no_signal_total = sum(
             int(item.get("count", 0))
@@ -137,9 +177,14 @@ class DailyReportGenerator:
                 "book_evicted",
                 "no_initial_book",
                 "asset_warming_up",
+                "connection_recovering",
+                "market_recovering",
                 "market_not_ready",
                 "market_probation",
                 "market_quote_stale",
+                "market_quote_stale_no_recent_quote",
+                "market_quote_stale_recovery",
+                "market_quote_stale_quote_age",
             }
         )
         missing_book_total = sum(int(item.get("count", 0)) for item in missing_book_state_reasons)
@@ -165,6 +210,8 @@ class DailyReportGenerator:
             warnings.append("readiness_friction_high")
         if resync_count >= 1_000:
             warnings.append("resync_storm_detected")
+        if ws_reconnect_events >= max(10, int(ws_connected_events * 0.5)):
+            warnings.append("websocket_instability")
         if total_signals == 0 and resync_count >= 100:
             warnings.append("no_signals_but_high_resync")
         if book_no_signal_total > 0 or missing_book_total > 0:
@@ -205,6 +252,10 @@ class DailyReportGenerator:
                 "asset_block_count": asset_block_count,
                 "total_block_events": total_block_events,
                 "market_universe_changed_count": market_universe_changed_count,
+                "market_universe_change_events": market_universe_changed_count,
+                "resync_due_to_universe_change": resync_due_to_universe_change,
+                "ws_connected_events": ws_connected_events,
+                "ws_reconnect_events": ws_reconnect_events,
                 "book_not_ready_count": book_not_ready_count,
                 "quote_too_old_count": quote_too_old_count,
                 "book_recovering_count": book_recovering_count,
@@ -212,6 +263,8 @@ class DailyReportGenerator:
                 "market_probation_count": market_probation_count,
                 "market_quote_stale_count": market_quote_stale_count,
                 "asset_warming_up_count": asset_warming_up_count,
+                "connection_recovering_count": connection_recovering_count,
+                "market_recovering_count": market_recovering_count,
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
@@ -222,6 +275,8 @@ class DailyReportGenerator:
             "safe_mode_reasons": safe_mode_reasons,
             "safe_mode_scope_reasons": safe_mode_scope_reasons,
             "safe_mode_by_scope": safe_mode_by_scope,
+            "ws_reconnect_reasons": ws_reconnect_reason_breakdown,
+            "ws_connected_reasons": ws_connected_reason_breakdown,
             "no_signal_reasons": no_signal_reasons,
             "missing_book_state_reasons": missing_book_state_reasons,
             "top_markets_by_signal_count": top_markets_by_signal,
@@ -281,6 +336,10 @@ class DailyReportGenerator:
             f"asset_block_count: {totals['asset_block_count']}",
             f"total_block_events: {totals['total_block_events']}",
             f"market_universe_changed_count: {totals['market_universe_changed_count']}",
+            f"market_universe_change_events: {totals['market_universe_change_events']}",
+            f"resync_due_to_universe_change: {totals['resync_due_to_universe_change']}",
+            f"ws_connected_events: {totals['ws_connected_events']}",
+            f"ws_reconnect_events: {totals['ws_reconnect_events']}",
             f"book_not_ready_count: {totals['book_not_ready_count']}",
             f"quote_too_old_count: {totals['quote_too_old_count']}",
             f"book_recovering_count: {totals['book_recovering_count']}",
@@ -288,6 +347,8 @@ class DailyReportGenerator:
             f"market_probation_count: {totals['market_probation_count']}",
             f"market_quote_stale_count: {totals['market_quote_stale_count']}",
             f"asset_warming_up_count: {totals['asset_warming_up_count']}",
+            f"connection_recovering_count: {totals['connection_recovering_count']}",
+            f"market_recovering_count: {totals['market_recovering_count']}",
             (
                 "watched_markets(current/cumulative): "
                 f"{universe.get('current_watched_markets', 0)} / "
@@ -322,6 +383,16 @@ class DailyReportGenerator:
                 for item in report["safe_mode_scope_reasons"][:5]
             )
             lines.append(f"top_safe_mode_scope_reasons: {scope_reason_summary}")
+        if report.get("ws_reconnect_reasons"):
+            ws_reconnect_summary = ", ".join(
+                f"{item['reason']}={item['count']}" for item in report["ws_reconnect_reasons"][:5]
+            )
+            lines.append(f"top_ws_reconnect_reasons: {ws_reconnect_summary}")
+        if report.get("ws_connected_reasons"):
+            ws_connected_summary = ", ".join(
+                f"{item['reason']}={item['count']}" for item in report["ws_connected_reasons"][:5]
+            )
+            lines.append(f"top_ws_connected_reasons: {ws_connected_summary}")
         if report.get("no_signal_reasons"):
             no_signal_summary = ", ".join(
                 f"{item['reason']}={item['count']}" for item in report["no_signal_reasons"][:5]
@@ -499,6 +570,57 @@ class DailyReportGenerator:
             params.append(run_id)
         row = conn.execute(query, params).fetchone()
         return int(row[0] if row else 0)
+
+    def _count_resync_reason(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        reason: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM resync_events
+        WHERE created_at >= ? AND created_at < ?
+          AND reason = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, reason]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _metric_detail_breakdown(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+        detail_key: str,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT details
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, metric_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            details = str(row[0] or "")
+            key = self._extract_kv_from_details(details, detail_key) or "unknown"
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            {"reason": reason, "count": count}
+            for reason, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        ]
 
     def _count_metrics(
         self,
