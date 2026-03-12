@@ -61,6 +61,10 @@ class RuntimeSettings(BaseModel):
     reconnect_max_seconds: float = 30.0
     websocket_ping_interval_seconds: int = 20
     websocket_ping_timeout_seconds: int = 20
+    websocket_receive_timeout_seconds: int = 120
+    websocket_receive_timeout_reconnect_count: int = 3
+    reconnect_recovery_grace_ms: int = 90_000
+    reconnect_recovery_min_ready_asset_ratio: float = 0.6
     market_refresh_minutes: int = 60
     market_universe_change_confirmations: int = 2
     market_universe_change_min_asset_delta: int = 4

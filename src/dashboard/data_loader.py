@@ -121,6 +121,24 @@ class DashboardDataLoader:
                 run_id=run_id,
                 name="market_universe_changed",
             )
+            ws_connected_events = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="ws_connected_event",
+            )
+            ws_reconnect_events = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="ws_reconnect_event",
+            )
+            resync_due_to_universe_change = self._count_resync_reason(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                reason="market_universe_changed",
+            )
             asset_block_count = self._count_metric(
                 conn=conn,
                 window=window,
@@ -145,11 +163,41 @@ class DashboardDataLoader:
                 run_id=run_id,
                 name="no_signal_reason:market_quote_stale",
             )
+            market_quote_stale_count += self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_quote_stale_no_recent_quote",
+            )
+            market_quote_stale_count += self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_quote_stale_recovery",
+            )
+            market_quote_stale_count += self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_quote_stale_quote_age",
+            )
             book_recovering_count = self._count_metric(
                 conn=conn,
                 window=window,
                 run_id=run_id,
                 name="no_signal_reason:book_recovering",
+            )
+            connection_recovering_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:connection_recovering",
+            )
+            market_recovering_count = self._count_metric(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                name="no_signal_reason:market_recovering",
             )
             market_not_ready_count = self._count_metric(
                 conn=conn,
@@ -194,12 +242,34 @@ class DashboardDataLoader:
                 global_safe_mode_count + market_block_count + asset_block_count
             ),
             "market_universe_changed_count": float(market_universe_changed_count),
+            "market_universe_change_events": float(market_universe_changed_count),
+            "resync_due_to_universe_change": float(resync_due_to_universe_change),
+            "ws_connected_events": float(ws_connected_events),
+            "ws_reconnect_events": float(ws_reconnect_events),
             "book_not_ready_count": float(book_not_ready_count),
             "quote_too_old_count": float(quote_too_old_count),
             "market_quote_stale_count": float(market_quote_stale_count),
             "book_recovering_count": float(book_recovering_count),
             "market_not_ready_count": float(market_not_ready_count),
             "market_probation_count": float(market_probation_count),
+            "connection_recovering_count": float(connection_recovering_count),
+            "market_recovering_count": float(market_recovering_count),
+            "no_initial_book_count": float(
+                self._sum_metric(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    name="missing_book_state_reason:no_initial_book",
+                )
+            ),
+            "asset_warming_up_count": float(
+                self._sum_metric(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    name="missing_book_state_reason:asset_warming_up",
+                )
+            ),
             "resync_count": float(resync_count),
             "projected_matched_pnl": projected_matched_pnl,
             "unmatched_inventory_mtm": unmatched_inventory_mtm,
@@ -301,6 +371,16 @@ class DashboardDataLoader:
             "safe_mode_by_scope_reason": self._safe_mode_by_scope_reason(
                 window=window,
                 run_id=run_id,
+            ),
+            "ws_reconnect_reasons": self._metric_reason_breakdown(
+                window=window,
+                run_id=run_id,
+                metric_name="ws_reconnect_event",
+            ),
+            "ws_connected_reasons": self._metric_reason_breakdown(
+                window=window,
+                run_id=run_id,
+                metric_name="ws_connected_event",
             ),
         }
 
@@ -797,6 +877,48 @@ class DashboardDataLoader:
         row = conn.execute(query, params).fetchone()
         return int(row[0] if row else 0)
 
+    def _sum_metric(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        name: str,
+    ) -> float:
+        query = """
+        SELECT COALESCE(SUM(metric_value), 0)
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return float(row[0] if row else 0.0)
+
+    def _count_resync_reason(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        reason: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM resync_events
+        WHERE created_at >= ? AND created_at < ?
+          AND reason = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, reason]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
     def _sum_pnl(
         self,
         *,
@@ -939,6 +1061,41 @@ class DashboardDataLoader:
             return query
         return query + " AND run_id = ?"
 
+    def _metric_reason_breakdown(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_name: str,
+    ) -> pd.DataFrame:
+        params: list[object] = [window.start_iso, window.end_iso, metric_name]
+        if run_id is not None:
+            params.append(run_id)
+        frame = self._query_df(
+            query=self._apply_run_filter(
+                """
+                SELECT details
+                FROM metrics
+                WHERE created_at >= ? AND created_at < ?
+                  AND metric_name = ?
+                """,
+                run_id=run_id,
+            ),
+            params=params,
+        )
+        if frame.empty:
+            return pd.DataFrame(columns=["reason", "count"])
+        counts: dict[str, int] = {}
+        for details in frame["details"].astype(str):
+            reason = self._extract_kv(details, "reason") or "unknown"
+            counts[reason] = counts.get(reason, 0) + 1
+        return pd.DataFrame(
+            [
+                {"reason": reason, "count": count}
+                for reason, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+            ]
+        )
+
     def _query_df(self, *, query: str, params: list[object]) -> pd.DataFrame:
         if not self.has_database():
             return pd.DataFrame()
@@ -966,12 +1123,20 @@ class DashboardDataLoader:
             "asset_block_count": 0.0,
             "total_block_events": 0.0,
             "market_universe_changed_count": 0.0,
+            "market_universe_change_events": 0.0,
+            "resync_due_to_universe_change": 0.0,
+            "ws_connected_events": 0.0,
+            "ws_reconnect_events": 0.0,
             "book_not_ready_count": 0.0,
             "quote_too_old_count": 0.0,
             "market_quote_stale_count": 0.0,
             "book_recovering_count": 0.0,
             "market_not_ready_count": 0.0,
             "market_probation_count": 0.0,
+            "connection_recovering_count": 0.0,
+            "market_recovering_count": 0.0,
+            "no_initial_book_count": 0.0,
+            "asset_warming_up_count": 0.0,
             "resync_count": 0.0,
             "projected_matched_pnl": 0.0,
             "unmatched_inventory_mtm": 0.0,

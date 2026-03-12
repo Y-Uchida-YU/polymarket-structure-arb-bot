@@ -335,3 +335,58 @@ def test_daily_report_counts_readiness_no_signal_breakdown(tmp_path: Path) -> No
     assert totals["market_not_ready_count"] == 1
     assert totals["market_probation_count"] == 1
     assert totals["market_quote_stale_count"] == 1
+
+
+def test_daily_report_aligns_universe_change_vs_resync_and_ws_reasons(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "run-1",
+                    "market_universe_changed",
+                    1.0,
+                    "added=2;removed=0;reason=hysteresis_confirmed_change",
+                    now,
+                ),
+                ("run-1", "ws_connected_event", 1.0, "reason=ws_connected;assets=10", now),
+                (
+                    "run-1",
+                    "ws_reconnect_event",
+                    1.0,
+                    "reason=socket_closed_remote;mapped=ws_reconnect",
+                    now,
+                ),
+            ],
+        )
+        store.conn.executemany(
+            """
+            INSERT INTO resync_events (run_id, asset_id, reason, status, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "a1", "market_universe_changed", "ok", "resync_applied", now),
+                ("run-1", "a2", "market_universe_changed", "ok", "resync_applied", now),
+                ("run-1", "a3", "market_universe_changed", "ok", "resync_applied", now),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    totals = report["totals"]
+    assert totals["market_universe_change_events"] == 1
+    assert totals["market_universe_changed_count"] == 1
+    assert totals["resync_due_to_universe_change"] == 3
+    assert totals["ws_connected_events"] == 1
+    assert totals["ws_reconnect_events"] == 1
+    assert report["ws_connected_reasons"][0]["reason"] == "ws_connected"
+    assert report["ws_reconnect_reasons"][0]["reason"] == "socket_closed_remote"

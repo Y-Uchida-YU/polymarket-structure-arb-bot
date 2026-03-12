@@ -41,6 +41,10 @@ runtime:
   reconnect_max_seconds: 30.0
   websocket_ping_interval_seconds: 20
   websocket_ping_timeout_seconds: 20
+  websocket_receive_timeout_seconds: 120
+  websocket_receive_timeout_reconnect_count: 3
+  reconnect_recovery_grace_ms: 90000
+  reconnect_recovery_min_ready_asset_ratio: 0.6
   market_refresh_minutes: 60
   market_universe_change_confirmations: 2
   market_universe_change_min_asset_delta: 4

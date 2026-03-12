@@ -102,6 +102,7 @@ def _evaluation_status(
 ) -> tuple[str, str]:
     total_signals = int(overview.get("total_signals", 0.0))
     resync_count = float(overview.get("resync_count", 0.0))
+    ws_reconnect_events = float(overview.get("ws_reconnect_events", 0.0))
     total_blocks = float(overview.get("total_block_events", 0.0))
     readiness_friction_count = (
         float(overview.get("book_not_ready_count", 0.0))
@@ -110,6 +111,8 @@ def _evaluation_status(
         + float(overview.get("book_recovering_count", 0.0))
         + float(overview.get("market_not_ready_count", 0.0))
         + float(overview.get("market_probation_count", 0.0))
+        + float(overview.get("connection_recovering_count", 0.0))
+        + float(overview.get("market_recovering_count", 0.0))
     )
 
     no_signal_total = (
@@ -129,6 +132,7 @@ def _evaluation_status(
 
     not_ready = total_signals == 0 and (
         resync_count >= 100
+        or ws_reconnect_events >= 15
         or total_blocks >= 30
         or readiness_friction_count >= 200
         or missing_book_total >= 50
@@ -138,6 +142,7 @@ def _evaluation_status(
         return "NOT READY", "red"
     partial = total_signals == 0 and (
         resync_count >= 40
+        or ws_reconnect_events >= 5
         or total_blocks >= 10
         or missing_book_total > 0
         or readiness_friction_count > 0
@@ -195,9 +200,17 @@ def _overview_section(
     )
     col16.metric("Book Recovering", int(overview["book_recovering_count"]))
 
-    col17, col18 = st.columns(2)
+    col17, col18, col19, col20 = st.columns(4)
     col17.metric("Market Not Ready", int(overview["market_not_ready_count"]))
     col18.metric("Market Probation", int(overview["market_probation_count"]))
+    col19.metric("WS Reconnect", int(overview["ws_reconnect_events"]))
+    col20.metric("WS Connected", int(overview["ws_connected_events"]))
+
+    col21, col22, col23, col24 = st.columns(4)
+    col21.metric("No Initial Book", int(overview["no_initial_book_count"]))
+    col22.metric("Asset Warming Up", int(overview["asset_warming_up_count"]))
+    col23.metric("Connection Recovering", int(overview["connection_recovering_count"]))
+    col24.metric("Market Recovering", int(overview["market_recovering_count"]))
 
     st.caption(
         "Universe (current/cumulative): "
@@ -317,6 +330,56 @@ def _diagnostics_section(
             view = no_signals[["reason", "count"]]
             st.bar_chart(view.set_index("reason")["count"], use_container_width=True)
             st.dataframe(view, use_container_width=True, hide_index=True)
+
+    col5, col6 = st.columns(2)
+    with col5:
+        st.markdown("**Top WS Reconnect Reasons**")
+        ws_reconnect = breakdowns["ws_reconnect_reasons"]
+        if ws_reconnect.empty:
+            st.write("No data.")
+        else:
+            st.bar_chart(ws_reconnect.set_index("reason")["count"], use_container_width=True)
+            st.dataframe(ws_reconnect, use_container_width=True, hide_index=True)
+    with col6:
+        st.markdown("**Top WS Connected Reasons**")
+        ws_connected = breakdowns["ws_connected_reasons"]
+        if ws_connected.empty:
+            st.write("No data.")
+        else:
+            st.bar_chart(ws_connected.set_index("reason")["count"], use_container_width=True)
+            st.dataframe(ws_connected, use_container_width=True, hide_index=True)
+
+    if not no_signal_local.empty:
+        grouped = no_signal_local.copy()
+        strategy_reasons = {"edge_below_threshold", "spread_too_wide", "depth_too_low"}
+        readiness_reasons = {
+            "book_not_ready",
+            "book_recovering",
+            "market_not_ready",
+            "market_probation",
+            "market_quote_stale",
+            "market_quote_stale_no_recent_quote",
+            "market_quote_stale_recovery",
+            "market_quote_stale_quote_age",
+            "asset_warming_up",
+            "no_initial_book",
+            "connection_recovering",
+            "market_recovering",
+        }
+
+        def _classify_reason(reason: object) -> str:
+            key = str(reason)
+            if key in strategy_reasons:
+                return "strategy"
+            if key in readiness_reasons:
+                return "readiness"
+            return "transport_or_other"
+
+        grouped["reason_group"] = grouped["reason"].map(_classify_reason)
+        grouped_pivot = _reason_chart_frame(grouped, key_column="reason_group", top_n=3)
+        if not grouped_pivot.empty:
+            st.markdown("**Reason Group Mix (Strategy vs Readiness vs Transport/Other)**")
+            st.area_chart(grouped_pivot, use_container_width=True)
     with col4:
         st.markdown("**Missing Book State Reasons**")
         missing = breakdowns["missing_book_state_reasons"]

@@ -114,6 +114,16 @@ def build_startup_summary(
         "signal_quote_age_limit_ms": config.settings.strategy.max_quote_age_ms_for_signal,
         "stale_asset_ms": config.settings.runtime.stale_asset_ms,
         "book_resync_idle_ms": config.settings.runtime.book_resync_idle_ms,
+        "websocket_receive_timeout_seconds": (
+            config.settings.runtime.websocket_receive_timeout_seconds
+        ),
+        "websocket_receive_timeout_reconnect_count": (
+            config.settings.runtime.websocket_receive_timeout_reconnect_count
+        ),
+        "reconnect_recovery_grace_ms": config.settings.runtime.reconnect_recovery_grace_ms,
+        "reconnect_recovery_min_ready_asset_ratio": (
+            config.settings.runtime.reconnect_recovery_min_ready_asset_ratio
+        ),
         "resync_cooldown_ms": config.settings.runtime.resync_cooldown_ms,
         "full_resync_cooldown_ms": config.settings.runtime.full_resync_cooldown_ms,
         "max_resync_assets_per_cycle": config.settings.runtime.max_resync_assets_per_cycle,

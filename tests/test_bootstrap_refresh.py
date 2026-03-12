@@ -1227,3 +1227,127 @@ def test_healthy_universe_skips_large_market_rotation(tmp_path: Path) -> None:
     assert int(row[0] if row else 0) == 0
 
     asyncio.run(app.shutdown())
+
+
+def test_ws_reconnect_event_metric_records_raw_reason(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_ws_reconnect_metric")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    config = make_config(tmp_path)
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+
+    app.on_ws_reconnect_required("socket_closed_remote")
+
+    assert app.state.pending_connect_resync_reason == "ws_reconnect"
+    assert app.state.last_ws_reconnect_reason == "socket_closed_remote"
+    row = app.sqlite_store.conn.execute("""
+        SELECT details
+        FROM metrics
+        WHERE metric_name = 'ws_reconnect_event'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """).fetchone()
+    assert row is not None
+    assert "reason=socket_closed_remote" in str(row[0])
+
+    asyncio.run(app.shutdown())
+
+
+def test_connection_recovering_grace_suppresses_missing_book_resync(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_connection_recovering_grace")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "reconnect_recovery_grace_ms": 120_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    now = datetime.now(tz=UTC)
+    app.state.ws_connected_at = now
+    app.state.subscription_started_at = now - timedelta(seconds=2)
+    app.state.first_quote_received_at = now
+    app.state.connection_recovering_until = now + timedelta(seconds=60)
+
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert isinstance(app.book_client, FakeBookClientNoData)
+    assert app.book_client.calls == []
+    assert app.state.last_book_missing_reason_by_asset.get("yes1") == "connection_recovering"
+    assert app.state.last_book_missing_reason_by_asset.get("no1") == "connection_recovering"
+    row = app.sqlite_store.conn.execute("""
+        SELECT COALESCE(SUM(metric_value), 0)
+        FROM metrics
+        WHERE metric_name = 'missing_book_state_reason:connection_recovering'
+        """).fetchone()
+    assert int(float(row[0] if row else 0.0)) >= 2
+
+    asyncio.run(app.shutdown())
+
+
+def test_reconnect_connected_uses_selective_resync_when_quotes_are_fresh(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_reconnect_selective_resync")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 60_000,
+            "initial_market_data_grace_ms": 1,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.45",
+            "bid": "0.44",
+            "ask_size": "50",
+            "bid_size": "50",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.55",
+            "bid": "0.54",
+            "ask_size": "50",
+            "bid_size": "50",
+        }
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+    app.state.pending_connect_resync_reason = "ws_reconnect"
+
+    asyncio.run(app.on_ws_connected(["yes1", "no1"]))
+
+    assert isinstance(app.book_client, FakeBookClient)
+    assert app.book_client.calls == []
+
+    asyncio.run(app.shutdown())
