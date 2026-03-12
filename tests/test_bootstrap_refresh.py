@@ -357,6 +357,7 @@ def test_partial_asset_staleness_blocks_asset_scope_without_global_safe_mode(
             "stale_asset_ms": 60_000,
             "initial_market_data_grace_ms": 1,
             "per_asset_book_grace_ms": 1,
+            "asset_block_min_consecutive_unhealthy_cycles": 1,
         },
     )
     config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
@@ -485,6 +486,7 @@ def test_market_scope_block_applies_without_global_stop(tmp_path: Path) -> None:
             "stale_asset_ms": 1000,
             "initial_market_data_grace_ms": 1,
             "per_asset_book_grace_ms": 1,
+            "asset_block_min_consecutive_unhealthy_cycles": 1,
             "market_block_min_consecutive_unhealthy_cycles": 1,
         },
         guardrails={
@@ -628,6 +630,7 @@ def test_market_block_clears_after_market_recovery(tmp_path: Path) -> None:
             "stale_asset_ms": 1000,
             "initial_market_data_grace_ms": 1,
             "per_asset_book_grace_ms": 1,
+            "asset_block_min_consecutive_unhealthy_cycles": 1,
             "market_block_min_consecutive_unhealthy_cycles": 1,
         },
         guardrails={
@@ -795,7 +798,10 @@ def test_ready_condition_unmet_records_book_not_ready_no_signal_reason(tmp_path:
     row = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM metrics
-        WHERE metric_name = 'no_signal_reason:book_not_ready'
+        WHERE metric_name IN (
+            'no_signal_reason:book_not_ready',
+            'no_signal_reason:market_not_ready'
+        )
         """).fetchone()
     assert int(row[0] if row else 0) >= 1
 
@@ -1004,5 +1010,220 @@ def test_universe_metrics_track_current_and_cumulative_counts(tmp_path: Path) ->
     assert metric_map["universe_current_subscribed_assets"] == 2
     assert metric_map["universe_cumulative_watched_markets"] == 2
     assert metric_map["universe_cumulative_subscribed_assets"] == 4
+
+    asyncio.run(app.shutdown())
+
+
+def test_new_market_probation_blocks_signal_until_ready(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_market_probation_blocks_signal")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 300_000,
+            "market_probation_min_quote_updates_per_asset": 3,
+            "market_probation_min_ready_asset_ratio": 1.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.48",
+            "bid": "0.47",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.52",
+            "bid": "0.51",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+
+    row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'no_signal_reason:market_probation'
+        """).fetchone()
+    assert int(row[0] if row else 0) >= 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_market_probation_clears_after_readiness_threshold(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_market_probation_clears")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 300_000,
+            "market_probation_min_quote_updates_per_asset": 1,
+            "market_probation_min_ready_asset_ratio": 1.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.48",
+            "bid": "0.47",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.53",
+            "bid": "0.52",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+
+    assert "m1" not in app.state.market_probation_until
+    edge_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'no_signal_reason:edge_below_threshold'
+        """).fetchone()
+    assert int(edge_row[0] if edge_row else 0) >= 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_probation_assets_do_not_trigger_asset_or_market_block(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_probation_assets_not_blocked")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 300_000,
+            "market_probation_min_quote_updates_per_asset": 3,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "asset_block_min_consecutive_unhealthy_cycles": 1,
+            "market_block_min_consecutive_unhealthy_cycles": 1,
+        },
+        guardrails={
+            "global_unhealthy_consecutive_count": 10,
+            "global_unhealthy_min_duration_seconds": 9999,
+            "global_unhealthy_min_asset_ratio": 1.0,
+            "global_ws_unhealthy_min_asset_ratio": 1.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    app.state.ws_connected_at = datetime.now(tz=UTC)
+    app.state.subscription_started_at = datetime.now(tz=UTC) - timedelta(seconds=2)
+    app.state.first_quote_received_at = datetime.now(tz=UTC)
+
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert app.state.safe_mode_blocked_assets == set()
+    assert app.state.safe_mode_blocked_markets == set()
+    warmup_row = app.sqlite_store.conn.execute("""
+        SELECT COALESCE(SUM(metric_value), 0)
+        FROM metrics
+        WHERE metric_name = 'missing_book_state_reason:asset_warming_up'
+        """).fetchone()
+    assert int(float(warmup_row[0] if warmup_row else 0.0)) >= 2
+
+    asyncio.run(app.shutdown())
+
+
+def test_healthy_universe_skips_large_market_rotation(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_universe_hysteresis_skip")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_universe_change_confirmations": 1,
+            "market_universe_change_min_asset_delta": 99,
+        },
+        market_filters={
+            "max_markets_to_watch": 2,
+            "min_recent_activity": 0.0,
+            "min_liquidity_proxy": 0.0,
+            "min_volume_24h_proxy": 0.0,
+            "prefer_existing_watched_markets": True,
+            "existing_market_hysteresis_score_ratio": 0.9,
+            "max_market_replacements_per_refresh": 1,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")],
+            [make_raw_market("m3", "yes3", "no3"), make_raw_market("m4", "yes4", "no4")],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    asyncio.run(app.on_ws_connected(["yes1", "no1", "yes2", "no2"]))
+    app.state.first_quote_received_at = datetime.now(tz=UTC)
+    app.state.book_state_unhealthy = False
+    app.state.ws_unhealthy = False
+
+    asyncio.run(app.refresh_market_universe())
+
+    assert set(app.markets_by_id.keys()) == {"m1", "m2"}
+    assert app.resubscribe_event.is_set() is False
+    row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(*)
+        FROM metrics
+        WHERE metric_name = 'market_universe_changed'
+        """).fetchone()
+    assert int(row[0] if row else 0) == 0
 
     asyncio.run(app.shutdown())

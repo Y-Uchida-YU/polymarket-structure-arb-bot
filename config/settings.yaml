@@ -44,12 +44,16 @@ runtime:
   market_refresh_minutes: 60
   market_universe_change_confirmations: 2
   market_universe_change_min_asset_delta: 4
+  market_probation_ms: 0
+  market_probation_min_quote_updates_per_asset: 2
+  market_probation_min_ready_asset_ratio: 1.0
   stale_asset_ms: 15000
   initial_market_data_grace_ms: 30000
   per_asset_book_grace_ms: 45000
   resync_recovery_grace_ms: 180000
   no_data_resync_cooldown_ms: 240000
   quote_missing_after_resync_delay_ms: 240000
+  asset_block_min_consecutive_unhealthy_cycles: 2
   market_block_min_consecutive_unhealthy_cycles: 2
   book_resync_idle_ms: 20000
   resync_cooldown_ms: 60000
@@ -95,3 +99,6 @@ market_filters:
   min_liquidity_proxy: 0.0
   min_volume_24h_proxy: 0.0
   require_recent_trade_within_minutes:
+  prefer_existing_watched_markets: true
+  existing_market_hysteresis_score_ratio: 0.9
+  max_market_replacements_per_refresh: 2

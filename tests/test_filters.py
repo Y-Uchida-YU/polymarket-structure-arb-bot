@@ -169,3 +169,59 @@ def test_extract_binary_markets_applies_recent_activity_proxy_filter() -> None:
     )
     assert len(result) == 1
     assert result[0].market_id == "high"
+
+
+def test_extract_binary_markets_prefers_existing_universe_under_hysteresis() -> None:
+    markets = [
+        {**make_raw_market("1", enable_order_book=True), "liquidity": "100", "volume24hr": "0"},
+        {**make_raw_market("2", enable_order_book=True), "liquidity": "99", "volume24hr": "0"},
+        {**make_raw_market("3", enable_order_book=True), "liquidity": "110", "volume24hr": "0"},
+        {**make_raw_market("4", enable_order_book=True), "liquidity": "109", "volume24hr": "0"},
+    ]
+    filters = MarketFilterSettings(
+        max_markets_to_watch=2,
+        min_recent_activity=0.0,
+        min_liquidity_proxy=0.0,
+        min_volume_24h_proxy=0.0,
+        min_days_to_expiry=0.0,
+        max_days_to_expiry=3650.0,
+        prefer_existing_watched_markets=True,
+        existing_market_hysteresis_score_ratio=0.9,
+        max_market_replacements_per_refresh=1,
+    )
+    result = extract_binary_markets(
+        raw_markets=markets,
+        market_filters=filters,
+        markets_config=MarketsConfig(),
+        preferred_market_ids={"1", "2"},
+    )
+    assert len(result) == 2
+    assert {market.market_id for market in result} == {"1", "2"}
+
+
+def test_extract_binary_markets_allows_replacement_when_existing_is_much_weaker() -> None:
+    markets = [
+        {**make_raw_market("1", enable_order_book=True), "liquidity": "10", "volume24hr": "0"},
+        {**make_raw_market("2", enable_order_book=True), "liquidity": "9", "volume24hr": "0"},
+        {**make_raw_market("3", enable_order_book=True), "liquidity": "100", "volume24hr": "0"},
+        {**make_raw_market("4", enable_order_book=True), "liquidity": "99", "volume24hr": "0"},
+    ]
+    filters = MarketFilterSettings(
+        max_markets_to_watch=2,
+        min_recent_activity=0.0,
+        min_liquidity_proxy=0.0,
+        min_volume_24h_proxy=0.0,
+        min_days_to_expiry=0.0,
+        max_days_to_expiry=3650.0,
+        prefer_existing_watched_markets=True,
+        existing_market_hysteresis_score_ratio=0.95,
+        max_market_replacements_per_refresh=1,
+    )
+    result = extract_binary_markets(
+        raw_markets=markets,
+        market_filters=filters,
+        markets_config=MarketsConfig(),
+        preferred_market_ids={"1", "2"},
+    )
+    assert len(result) == 2
+    assert {market.market_id for market in result} == {"1", "3"}

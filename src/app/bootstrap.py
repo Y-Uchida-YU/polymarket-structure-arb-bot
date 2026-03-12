@@ -105,8 +105,11 @@ class AppState:
     asset_subscribed_at: dict[str, datetime] = field(default_factory=dict)
     ready_assets: set[str] = field(default_factory=set)
     ever_ready_assets: set[str] = field(default_factory=set)
+    asset_quote_update_count: dict[str, int] = field(default_factory=dict)
     asset_recovering_until: dict[str, datetime] = field(default_factory=dict)
+    asset_unhealthy_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     last_book_missing_reason_by_asset: dict[str, str] = field(default_factory=dict)
+    market_probation_until: dict[str, datetime] = field(default_factory=dict)
     last_ws_idle_resync_ts: float = 0.0
     run_id: str = field(default_factory=lambda: uuid4().hex)
     run_started_at: datetime = field(default_factory=utc_now)
@@ -230,6 +233,7 @@ class PolymarketStructureArbApp:
             raw_markets=raw_markets,
             market_filters=self.config.settings.market_filters,
             markets_config=self.config.markets,
+            preferred_market_ids=set(self.markets_by_id.keys()),
         )
         markets_by_id = {market.market_id: market for market in extraction.markets}
         token_to_market_side: dict[str, tuple[str, str]] = {}
@@ -249,6 +253,7 @@ class PolymarketStructureArbApp:
         snapshot: MarketSnapshot,
         previous_asset_ids: set[str],
     ) -> MarketLoadResult:
+        previous_market_ids = set(self.markets_by_id.keys())
         self.markets_by_id = snapshot.markets_by_id
         now = utc_now()
         for market in self.markets_by_id.values():
@@ -260,6 +265,8 @@ class PolymarketStructureArbApp:
         current_asset_ids = set(asset_ids)
         added_assets = sorted(current_asset_ids - previous_asset_ids)
         removed_assets = sorted(previous_asset_ids - current_asset_ids)
+        current_markets = set(self.markets_by_id.keys())
+        added_markets = sorted(current_markets - previous_market_ids)
         if added_assets:
             await self._load_initial_tick_sizes(added_assets)
 
@@ -268,11 +275,20 @@ class PolymarketStructureArbApp:
         self.state.cumulative_watched_market_ids.update(self.markets_by_id.keys())
         self.state.cumulative_subscribed_asset_ids.update(asset_ids)
 
-        current_markets = set(self.markets_by_id.keys())
         self.state.safe_mode_blocked_assets &= current_asset_ids
         self.state.safe_mode_blocked_markets &= current_markets
         self.state.ready_assets &= current_asset_ids
         self.state.ever_ready_assets &= current_asset_ids
+        self.state.asset_quote_update_count = {
+            asset_id: count
+            for asset_id, count in self.state.asset_quote_update_count.items()
+            if asset_id in current_asset_ids
+        }
+        self.state.asset_unhealthy_consecutive_cycles = {
+            asset_id: count
+            for asset_id, count in self.state.asset_unhealthy_consecutive_cycles.items()
+            if asset_id in current_asset_ids
+        }
         self.state.market_unhealthy_consecutive_cycles = {
             market_id: count
             for market_id, count in self.state.market_unhealthy_consecutive_cycles.items()
@@ -281,6 +297,11 @@ class PolymarketStructureArbApp:
         self.state.market_block_started_at = {
             market_id: started_at
             for market_id, started_at in self.state.market_block_started_at.items()
+            if market_id in current_markets
+        }
+        self.state.market_probation_until = {
+            market_id: probation_until
+            for market_id, probation_until in self.state.market_probation_until.items()
             if market_id in current_markets
         }
         self.state.asset_recovering_until = {
@@ -305,6 +326,12 @@ class PolymarketStructureArbApp:
         }
         for asset_id in asset_ids:
             self.state.asset_subscribed_at.setdefault(asset_id, now)
+            self.state.asset_quote_update_count.setdefault(asset_id, 0)
+        probation_ms = max(0, self.config.settings.runtime.market_probation_ms)
+        for market_id in added_markets:
+            self.state.market_probation_until[market_id] = now + timedelta(
+                milliseconds=probation_ms
+            )
         self.state.last_signal_at_by_market = {
             market_id: ts
             for market_id, ts in self.state.last_signal_at_by_market.items()
@@ -429,6 +456,9 @@ class PolymarketStructureArbApp:
                     continue
 
                 market_id, side = mapping
+                self.state.asset_quote_update_count[update.asset_id] = (
+                    self.state.asset_quote_update_count.get(update.asset_id, 0) + 1
+                )
                 quote_age_ms = max(0.0, (now - update.timestamp).total_seconds() * 1000.0)
                 tick_size = self.quote_manager.get_tick_size(update.asset_id)
                 self.sqlite_store.save_quote(
@@ -461,6 +491,18 @@ class PolymarketStructureArbApp:
                         },
                     )
                     continue
+                readiness_ok, readiness_reason, readiness_details = self._evaluate_market_readiness(
+                    market=market,
+                    now_utc=now,
+                )
+                if not readiness_ok:
+                    self._record_no_signal_reason(
+                        reason=readiness_reason,
+                        now_utc=now,
+                        market_id=market_id,
+                        details=readiness_details,
+                    )
+                    continue
                 if market_id in self.state.safe_mode_blocked_markets:
                     self._record_no_signal_reason(
                         reason="safe_mode_blocked_market",
@@ -491,42 +533,10 @@ class PolymarketStructureArbApp:
                         },
                     )
                     continue
-                if not self.quote_manager.is_market_ready(market_id):
-                    market_missing_reasons = {
-                        self._classify_missing_book_reason(market.yes_token_id, now_utc=now),
-                        self._classify_missing_book_reason(market.no_token_id, now_utc=now),
-                    }
-                    no_signal_reason = (
-                        "book_recovering"
-                        if "book_recovering" in market_missing_reasons
-                        else "book_not_ready"
-                    )
-                    self._record_no_signal_reason(
-                        reason=no_signal_reason,
-                        now_utc=now,
-                        market_id=market_id,
-                    )
-                    continue
                 yes_quote, no_quote = self.quote_manager.get_market_quotes(market_id)
                 if yes_quote is None or no_quote is None:
-                    market_missing_reasons = {
-                        self._classify_missing_book_reason(market.yes_token_id, now_utc=now),
-                        self._classify_missing_book_reason(market.no_token_id, now_utc=now),
-                    }
-                    no_signal_reason = (
-                        "book_recovering"
-                        if "book_recovering" in market_missing_reasons
-                        else "book_not_ready"
-                    )
                     self._record_no_signal_reason(
-                        reason=no_signal_reason,
-                        now_utc=now,
-                        market_id=market_id,
-                    )
-                    continue
-                if self._market_has_stale_quotes(market=market, now_utc=now):
-                    self._record_no_signal_reason(
-                        reason="quote_too_old",
+                        reason="market_not_ready",
                         now_utc=now,
                         market_id=market_id,
                     )
@@ -678,6 +688,52 @@ class PolymarketStructureArbApp:
         self.state.last_book_missing_reason_by_asset.pop(asset_id, None)
         self.state.safe_mode_blocked_assets.discard(asset_id)
 
+    def _market_ready_asset_ratio(self, market: BinaryMarket) -> float:
+        ready_count = 0
+        for asset_id in (market.yes_token_id, market.no_token_id):
+            if self.quote_manager.is_asset_ready(asset_id):
+                ready_count += 1
+        return ready_count / 2.0
+
+    def _is_market_in_probation(self, market: BinaryMarket, now_utc: datetime) -> bool:
+        probation_until = self.state.market_probation_until.get(market.market_id)
+        if probation_until is None:
+            return False
+        min_updates = max(
+            0, self.config.settings.runtime.market_probation_min_quote_updates_per_asset
+        )
+        min_ready_ratio = min(
+            1.0,
+            max(0.0, self.config.settings.runtime.market_probation_min_ready_asset_ratio),
+        )
+        yes_updates = self.state.asset_quote_update_count.get(market.yes_token_id, 0)
+        no_updates = self.state.asset_quote_update_count.get(market.no_token_id, 0)
+        ready_ratio = self._market_ready_asset_ratio(market)
+        if (
+            ready_ratio >= min_ready_ratio
+            and yes_updates >= min_updates
+            and no_updates >= min_updates
+        ):
+            self.state.market_probation_until.pop(market.market_id, None)
+            return False
+        if now_utc >= probation_until:
+            self.state.market_probation_until.pop(market.market_id, None)
+            return False
+        return True
+
+    def _is_market_id_in_probation(self, market_id: str, now_utc: datetime) -> bool:
+        market = self.markets_by_id.get(market_id)
+        if market is None:
+            return False
+        return self._is_market_in_probation(market, now_utc)
+
+    def _is_asset_in_probation(self, asset_id: str, now_utc: datetime) -> bool:
+        mapping = self.token_to_market_side.get(asset_id)
+        if mapping is None:
+            return False
+        market_id, _ = mapping
+        return self._is_market_id_in_probation(market_id, now_utc)
+
     def _mark_asset_recovering(self, asset_id: str, now_utc: datetime) -> None:
         grace_ms = max(0, self.config.settings.runtime.resync_recovery_grace_ms)
         recovering_until = now_utc + timedelta(milliseconds=grace_ms)
@@ -694,6 +750,8 @@ class PolymarketStructureArbApp:
         return True
 
     def _classify_missing_book_reason(self, asset_id: str, now_utc: datetime) -> str:
+        if self._is_asset_in_probation(asset_id=asset_id, now_utc=now_utc):
+            return "asset_warming_up"
         if self._is_asset_recovering(asset_id=asset_id, now_utc=now_utc):
             return "book_recovering"
         subscribed_at = self.state.asset_subscribed_at.get(asset_id)
@@ -720,6 +778,59 @@ class PolymarketStructureArbApp:
                 return "book_recovering"
             return "quote_missing_after_resync"
         return "book_not_resynced_yet"
+
+    def _evaluate_market_readiness(
+        self,
+        *,
+        market: BinaryMarket,
+        now_utc: datetime,
+    ) -> tuple[bool, str, dict[str, object]]:
+        if self._is_market_in_probation(market=market, now_utc=now_utc):
+            probation_until = self.state.market_probation_until.get(market.market_id)
+            return (
+                False,
+                "market_probation",
+                {
+                    "market_id": market.market_id,
+                    "probation_until": probation_until.isoformat() if probation_until else "",
+                },
+            )
+
+        if not self.quote_manager.is_market_ready(market.market_id):
+            missing_reasons = sorted(
+                {
+                    self._classify_missing_book_reason(market.yes_token_id, now_utc=now_utc),
+                    self._classify_missing_book_reason(market.no_token_id, now_utc=now_utc),
+                }
+            )
+            return (
+                False,
+                "market_not_ready",
+                {
+                    "market_id": market.market_id,
+                    "missing_reasons": ",".join(missing_reasons),
+                },
+            )
+
+        yes_quote, no_quote = self.quote_manager.get_market_quotes(market.market_id)
+        if yes_quote is None or no_quote is None:
+            return False, "market_not_ready", {"market_id": market.market_id}
+
+        if self._market_has_stale_quotes(market=market, now_utc=now_utc):
+            if self._is_asset_recovering(market.yes_token_id, now_utc) or self._is_asset_recovering(
+                market.no_token_id, now_utc
+            ):
+                return (
+                    False,
+                    "market_not_ready",
+                    {
+                        "market_id": market.market_id,
+                        "state": "recovering",
+                    },
+                )
+            return False, "market_quote_stale", {"market_id": market.market_id}
+
+        return True, "market_ready", {"market_id": market.market_id}
 
     def _update_asset_level_safe_mode(
         self,
@@ -875,9 +986,10 @@ class PolymarketStructureArbApp:
         blocked_assets: set[str],
         now_utc: datetime,
     ) -> set[str]:
-        del now_utc  # reserved for future timing policies
         candidate_markets: set[str] = set()
         for market_id, market in self.markets_by_id.items():
+            if self._is_market_id_in_probation(market_id, now_utc):
+                continue
             if market.yes_token_id in blocked_assets and market.no_token_id in blocked_assets:
                 candidate_markets.add(market_id)
 
@@ -899,6 +1011,27 @@ class PolymarketStructureArbApp:
             if current >= min_cycles:
                 blocked_markets.add(market_id)
         return blocked_markets
+
+    def _derive_asset_blocks(self, *, candidate_assets: set[str]) -> set[str]:
+        min_cycles = max(
+            1,
+            self.config.settings.runtime.asset_block_min_consecutive_unhealthy_cycles,
+        )
+        blocked_assets: set[str] = set()
+        tracked_assets = set(self.token_to_market_side.keys())
+        for asset_id in tracked_assets:
+            previous = self.state.asset_unhealthy_consecutive_cycles.get(asset_id, 0)
+            if asset_id in candidate_assets:
+                current = previous + 1
+            else:
+                current = 0
+            if current > 0:
+                self.state.asset_unhealthy_consecutive_cycles[asset_id] = current
+            else:
+                self.state.asset_unhealthy_consecutive_cycles.pop(asset_id, None)
+            if current >= min_cycles:
+                blocked_assets.add(asset_id)
+        return blocked_assets
 
     def _global_unhealthy_candidate_reason(
         self,
@@ -988,7 +1121,7 @@ class PolymarketStructureArbApp:
             "adjusted_edge_below_min": "edge_below_threshold",
             "spread_guard": "spread_too_wide",
             "min_depth_guard": "depth_too_low",
-            "quote_age_exceeded": "quote_too_old",
+            "quote_age_exceeded": "market_quote_stale",
             "missing_quote": "book_not_ready",
             "missing_best_ask": "book_not_ready",
             "tick_alignment_guard": "book_not_ready",
@@ -1302,6 +1435,11 @@ class PolymarketStructureArbApp:
 
             added_assets = sorted(candidate_asset_ids - previous_asset_ids)
             removed_assets = sorted(previous_asset_ids - candidate_asset_ids)
+            previous_market_ids = set(self.markets_by_id.keys())
+            candidate_market_ids = set(snapshot.markets_by_id.keys())
+            added_markets = sorted(candidate_market_ids - previous_market_ids)
+            removed_markets = sorted(previous_market_ids - candidate_market_ids)
+            market_change_count = len(added_markets) + len(removed_markets)
             change_count = len(added_assets) + len(removed_assets)
             candidate_signature = self._asset_universe_signature(candidate_asset_ids)
             if candidate_signature == self.state.pending_universe_signature:
@@ -1318,8 +1456,29 @@ class PolymarketStructureArbApp:
                 1,
                 self.config.settings.runtime.market_universe_change_min_asset_delta,
             )
+            replacement_limit = max(
+                0,
+                self.config.settings.market_filters.max_market_replacements_per_refresh,
+            )
+            ready_ratio = len(self.state.ready_assets & previous_asset_ids) / max(
+                1, len(previous_asset_ids)
+            )
+            healthy_universe = (
+                bool(previous_asset_ids)
+                and ready_ratio >= 0.8
+                and not self.state.book_state_unhealthy
+                and not self.state.ws_unhealthy
+            )
+            dynamic_confirmation_target = confirmation_target + (
+                1 if healthy_universe and market_change_count > 0 else 0
+            )
+            skipped_by_hysteresis = (
+                market_change_count > replacement_limit
+                and change_count < force_delta_target
+                and healthy_universe
+            )
             confirmed_change = (
-                self.state.pending_universe_confirmation_count >= confirmation_target
+                self.state.pending_universe_confirmation_count >= dynamic_confirmation_target
                 or change_count >= force_delta_target
             )
             now = utc_now()
@@ -1328,8 +1487,9 @@ class PolymarketStructureArbApp:
                 metric_value=float(change_count),
                 details=(
                     f"added={len(added_assets)};removed={len(removed_assets)};"
+                    f"added_markets={len(added_markets)};removed_markets={len(removed_markets)};"
                     f"confirmations={self.state.pending_universe_confirmation_count};"
-                    f"required={confirmation_target};"
+                    f"required={dynamic_confirmation_target};"
                     f"forced={int(change_count >= force_delta_target)}"
                 ),
                 created_at_iso=now.isoformat(),
@@ -1343,22 +1503,42 @@ class PolymarketStructureArbApp:
                     "metric_value": change_count,
                     "added_assets": len(added_assets),
                     "removed_assets": len(removed_assets),
+                    "added_markets": len(added_markets),
+                    "removed_markets": len(removed_markets),
                     "confirmation_count": self.state.pending_universe_confirmation_count,
-                    "confirmation_required": confirmation_target,
+                    "confirmation_required": dynamic_confirmation_target,
                     "forced_change": change_count >= force_delta_target,
+                    "healthy_universe": healthy_universe,
+                    "ready_ratio": round(ready_ratio, 3),
+                    "skipped_by_hysteresis": skipped_by_hysteresis,
                 },
                 now_utc=now,
             )
+            if skipped_by_hysteresis:
+                self.logger.info(
+                    (
+                        "Market universe candidate skipped by hysteresis "
+                        "added_markets=%s removed_markets=%s replacement_limit=%s ready_ratio=%.3f"
+                    ),
+                    len(added_markets),
+                    len(removed_markets),
+                    replacement_limit,
+                    ready_ratio,
+                )
+                return
             if not confirmed_change:
                 self.logger.info(
                     (
                         "Market universe change candidate pending "
-                        "added_assets=%s removed_assets=%s confirmation=%s/%s"
+                        "added_assets=%s removed_assets=%s added_markets=%s removed_markets=%s "
+                        "confirmation=%s/%s"
                     ),
                     len(added_assets),
                     len(removed_assets),
+                    len(added_markets),
+                    len(removed_markets),
                     self.state.pending_universe_confirmation_count,
-                    confirmation_target,
+                    dynamic_confirmation_target,
                 )
                 return
 
@@ -1385,7 +1565,10 @@ class PolymarketStructureArbApp:
                     details=(
                         f"added={len(result.added_assets)};"
                         f"removed={len(result.removed_assets)};"
-                        f"watched_markets={self.state.watched_markets}"
+                        f"added_markets={len(added_markets)};"
+                        f"removed_markets={len(removed_markets)};"
+                        f"watched_markets={self.state.watched_markets};"
+                        "reason=hysteresis_confirmed_change"
                     ),
                     created_at_iso=changed_now.isoformat(),
                     run_id=self.state.run_id,
@@ -1398,7 +1581,10 @@ class PolymarketStructureArbApp:
                         "metric_value": len(result.asset_ids),
                         "added_assets": len(result.added_assets),
                         "removed_assets": len(result.removed_assets),
+                        "added_markets": len(added_markets),
+                        "removed_markets": len(removed_markets),
                         "watched_markets": self.state.watched_markets,
+                        "change_reason": "hysteresis_confirmed_change",
                     },
                     now_utc=changed_now,
                 )
@@ -1578,20 +1764,33 @@ class PolymarketStructureArbApp:
             for asset_id in stale_assets
             if self._is_asset_recovering(asset_id=asset_id, now_utc=now)
         ]
+        probation_assets = [
+            asset_id
+            for asset_id in stale_assets
+            if self._is_asset_in_probation(asset_id=asset_id, now_utc=now)
+        ]
         effective_stale_assets = [
-            asset_id for asset_id in stale_assets if asset_id not in set(recovering_assets)
+            asset_id
+            for asset_id in stale_assets
+            if asset_id not in set(recovering_assets) and asset_id not in set(probation_assets)
         ]
         self.state.stale_assets = set(effective_stale_assets)
         missing_reasons_by_asset = self.state.last_book_missing_reason_by_asset
         blocking_missing_assets = {
             asset_id
             for asset_id in missing_assets
-            if missing_reasons_by_asset.get(asset_id) not in {"book_recovering", "book_not_ready"}
+            if missing_reasons_by_asset.get(asset_id)
+            not in {"book_recovering", "book_not_ready", "asset_warming_up"}
         }
-        unhealthy_assets = set(effective_stale_assets) | set(missing_assets)
         blocking_unhealthy_assets = set(effective_stale_assets) | blocking_missing_assets
+        unhealthy_assets = set(blocking_unhealthy_assets)
         tracked_count = max(1, len(tracked_assets))
         unhealthy_ratio = len(unhealthy_assets) / tracked_count
+        probation_market_count = sum(
+            1
+            for market_id in self.markets_by_id
+            if self._is_market_id_in_probation(market_id=market_id, now_utc=now)
+        )
 
         self.sqlite_store.save_metric(
             metric_name="stale_asset_count",
@@ -1607,6 +1806,7 @@ class PolymarketStructureArbApp:
                 "metric_name": "stale_asset_count",
                 "metric_value": len(effective_stale_assets),
                 "recovering_assets": len(recovering_assets),
+                "probation_assets": len(probation_assets),
                 "tracked_assets": len(tracked_assets),
             },
             now_utc=now,
@@ -1625,6 +1825,40 @@ class PolymarketStructureArbApp:
                 "metric_name": "recovering_asset_count",
                 "metric_value": len(recovering_assets),
                 "tracked_assets": len(tracked_assets),
+            },
+            now_utc=now,
+        )
+        self.sqlite_store.save_metric(
+            metric_name="probation_asset_count",
+            metric_value=float(len(probation_assets)),
+            details=f"tracked_assets={len(tracked_assets)}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "probation_asset_count",
+                "metric_value": len(probation_assets),
+                "tracked_assets": len(tracked_assets),
+            },
+            now_utc=now,
+        )
+        self.sqlite_store.save_metric(
+            metric_name="probation_market_count",
+            metric_value=float(probation_market_count),
+            details=f"tracked_markets={len(self.markets_by_id)}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "probation_market_count",
+                "metric_value": probation_market_count,
+                "tracked_markets": len(self.markets_by_id),
             },
             now_utc=now,
         )
@@ -1673,17 +1907,21 @@ class PolymarketStructureArbApp:
         if effective_stale_assets:
             stale_ratio = len(effective_stale_assets) / max(1, len(tracked_assets))
             self.logger.warning(
-                "Stale assets detected count=%s total=%s ratio=%.3f recovering=%s",
+                "Stale assets detected count=%s total=%s ratio=%.3f recovering=%s probation=%s",
                 len(effective_stale_assets),
                 len(tracked_assets),
                 stale_ratio,
                 len(recovering_assets),
+                len(probation_assets),
             )
 
-        partial_unhealthy_assets = (
+        candidate_unhealthy_assets = (
             blocking_unhealthy_assets
             if len(blocking_unhealthy_assets) < len(tracked_assets)
             else set()
+        )
+        partial_unhealthy_assets = self._derive_asset_blocks(
+            candidate_assets=candidate_unhealthy_assets,
         )
         partial_unhealthy_markets = self._derive_market_blocks(
             blocked_assets=partial_unhealthy_assets,
@@ -2038,6 +2276,7 @@ class PolymarketStructureArbApp:
                 continue
             if reason in {RESYNC_REASON_STALE_ASSET, RESYNC_REASON_MISSING_BOOK_STATE} and (
                 self._is_asset_recovering(asset_id=asset_id, now_utc=now_utc)
+                or self._is_asset_in_probation(asset_id=asset_id, now_utc=now_utc)
             ):
                 continue
             last_no_data_resync = self.state.last_no_data_resync_at_by_asset.get(asset_id)

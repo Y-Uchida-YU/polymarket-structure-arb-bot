@@ -44,12 +44,16 @@ runtime:
   market_refresh_minutes: 30
   market_universe_change_confirmations: 3
   market_universe_change_min_asset_delta: 6
+  market_probation_ms: 300000
+  market_probation_min_quote_updates_per_asset: 3
+  market_probation_min_ready_asset_ratio: 1.0
   stale_asset_ms: 90000
   initial_market_data_grace_ms: 45000
   per_asset_book_grace_ms: 120000
   resync_recovery_grace_ms: 300000
   no_data_resync_cooldown_ms: 600000
   quote_missing_after_resync_delay_ms: 600000
+  asset_block_min_consecutive_unhealthy_cycles: 3
   market_block_min_consecutive_unhealthy_cycles: 2
   book_resync_idle_ms: 120000
   resync_cooldown_ms: 180000
@@ -81,17 +85,16 @@ guardrails:
   hard_stop_exception_rate_per_min: 15.0
 
 market_filters:
-  exclude_categories:
-    - politics
-    - geopolitics
-    - death
-    - celebrity
+  exclude_categories: []
   exclude_keywords: []
   require_orderbook_enabled: true
-  max_markets_to_watch: 40
-  min_days_to_expiry: 1.0
-  max_days_to_expiry: 90.0
-  min_recent_activity: 5000.0
-  min_liquidity_proxy: 2500.0
-  min_volume_24h_proxy: 1500.0
+  max_markets_to_watch: 20
+  min_days_to_expiry: 0.5
+  max_days_to_expiry: 365.0
+  min_recent_activity: 500.0
+  min_liquidity_proxy: 250.0
+  min_volume_24h_proxy: 100.0
   require_recent_trade_within_minutes:
+  prefer_existing_watched_markets: true
+  existing_market_hysteresis_score_ratio: 0.85
+  max_market_replacements_per_refresh: 2

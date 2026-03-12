@@ -183,6 +183,12 @@ def test_dashboard_loader_core_metrics_with_run_id_filter(tmp_path: Path) -> Non
     assert overview["market_block_count"] == 0.0
     assert overview["asset_block_count"] == 0.0
     assert overview["total_block_events"] == 1.0
+    assert overview["market_universe_changed_count"] == 0.0
+    assert overview["book_not_ready_count"] == 0.0
+    assert overview["quote_too_old_count"] == 0.0
+    assert overview["book_recovering_count"] == 0.0
+    assert overview["market_not_ready_count"] == 0.0
+    assert overview["market_probation_count"] == 0.0
     assert overview["watched_markets_current"] == 5.0
     assert overview["subscribed_assets_current"] == 10.0
 

@@ -297,3 +297,41 @@ def test_daily_report_v7_breakdowns_and_warnings(tmp_path: Path) -> None:
     console = DailyReportGenerator.format_console(report)
     assert "watched_markets(current/cumulative): 40 / 120" in console
     assert "subscribed_assets(current/cumulative): 80 / 240" in console
+
+
+def test_daily_report_counts_readiness_no_signal_breakdown(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+
+    with store.conn:
+        rows = [
+            ("run-1", "market_universe_changed", 1.0, "", now),
+            ("run-1", "no_signal_reason:book_not_ready", 1.0, "", now),
+            ("run-1", "no_signal_reason:book_not_ready", 1.0, "", now),
+            ("run-1", "no_signal_reason:quote_too_old", 1.0, "", now),
+            ("run-1", "no_signal_reason:book_recovering", 1.0, "", now),
+            ("run-1", "no_signal_reason:market_not_ready", 1.0, "", now),
+            ("run-1", "no_signal_reason:market_probation", 1.0, "", now),
+            ("run-1", "no_signal_reason:market_quote_stale", 1.0, "", now),
+        ]
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    totals = report["totals"]
+    assert totals["market_universe_changed_count"] == 1
+    assert totals["book_not_ready_count"] == 2
+    assert totals["quote_too_old_count"] == 1
+    assert totals["book_recovering_count"] == 1
+    assert totals["market_not_ready_count"] == 1
+    assert totals["market_probation_count"] == 1
+    assert totals["market_quote_stale_count"] == 1
