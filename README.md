@@ -1,4 +1,4 @@
-# Polymarket Structure Arb Bot (Shadow Paper Run v11)
+# Polymarket Structure Arb Bot (Shadow Paper Run v12)
 
 Paper-only bot for Polymarket YES/NO complement arbitrage validation.
 
@@ -8,94 +8,88 @@ Paper-only bot for Polymarket YES/NO complement arbitrage validation.
 - Auth/signing/balance/cancel-replace are not implemented.
 - Use only for paper/shadow-paper diagnostics.
 
-## v11 Goal
+## v12 Goal
 
-v11 focuses on reducing **transport/readiness friction** so shadow runs can approach strategy-evaluable quality.
+v12 focuses on reducing **freshness/readiness friction** so shadow runs can approach strategy-evaluable quality.
 
 Key targets:
 
-- reduce websocket reconnect/re-subscribe storms
-- stabilize reconnect-after recovery
 - reduce noisy `market_quote_stale`, `book_not_ready`, `book_recovering`
-- align summary counts and reason aggregates for resync/universe-change
+- suppress `stale_asset -> resync -> recovering -> block` loops
+- evaluate only truly signal-eligible markets/assets
+- gradually drop low-quality markets from watched universe
 - keep strategy threshold strict (no signal inflation by threshold loosening)
 
-## Core v11 Changes
+## Core v12 Changes
 
-### 1. Transport Stabilization (WS)
+### 1. Freshness State Machine
 
-- WebSocket receive-timeout no longer triggers immediate reconnect on first timeout.
-- Reconnect now requires consecutive timeout threshold:
-  - `runtime.websocket_receive_timeout_seconds`
-  - `runtime.websocket_receive_timeout_reconnect_count`
-- Reconnect reasons are classified and logged (examples):
-  - `idle_watchdog_reconnect`
-  - `socket_closed_remote`
-  - `socket_closed_local`
-  - `subscribe_failure`
-  - `auth_failure_placeholder`
-  - `unknown_transport_error`
-- Duplicate resubscribe is suppressed when asset set is unchanged.
+- Market freshness/readiness states are explicit:
+  - `ready`
+  - `not_ready`
+  - `probation`
+  - `recovering`
+  - `stale_no_recent_quote`
+  - `stale_quote_age`
+- Strategy evaluation runs only after readiness + eligibility pass.
+- `market_quote_stale*` now focuses on truly stale states, not probation/recovering side-effects.
 
-### 2. Reconnect Recovery Grace
+### 2. Signal Eligibility Gate
 
-- After reconnect, the app enters connection recovery grace:
-  - `runtime.reconnect_recovery_grace_ms`
-  - `runtime.reconnect_recovery_min_ready_asset_ratio`
-- During recovery grace:
-  - stale/missing/block escalation is softened
-  - aggressive missing/stale/idle resync loops are suppressed
-  - no-signal can be classified as `connection_recovering` / `market_recovering`
+- Added pre-strategy eligibility requirements:
+  - both legs ready
+  - minimum quote update count per leg (`runtime.market_eligibility_min_quote_updates_per_asset`)
+  - market freshness state must be `ready`
+- Ineligible markets are logged as readiness-side reasons (for example `book_not_ready_insufficient_updates`).
 
-### 3. `market_quote_stale` vs `quote_too_old`
+### 3. No-Signal Spam Suppression
 
-- `quote_too_old`:
-  - strategy-layer quote age reject (`quote_age_exceeded`) after readiness passed.
-- `market_quote_stale*`:
-  - readiness-layer stale states before strategy evaluation.
-  - can be split as:
-    - `market_quote_stale_no_recent_quote`
-    - `market_quote_stale_recovery`
-    - `market_quote_stale_quote_age`
+- Repeated identical no-signal reasons per market are rate-limited by:
+  - `runtime.market_no_signal_reason_cooldown_ms`
+- This prevents high-frequency duplicate reason inflation while preserving first-hit diagnostics.
 
-This separation is intentional: strategy-quality stale and transport/readiness stale are different signals.
+### 4. Stale/Resync Loop Suppression
 
-### 4. Summary Count vs Reason Aggregate Alignment
+- Stale-asset resync now skips probation/recovering/not-ready assets.
+- Added stronger stale resync cooldown knobs:
+  - `runtime.stale_asset_resync_additional_cooldown_ms`
+  - `runtime.stale_asset_resync_ready_ratio_min`
+- Recovering assets have max dwell via:
+  - `runtime.market_recovering_max_ms`
+
+### 5. Runtime Low-Quality Market Exclusion
+
+- Markets with sustained poor readiness quality accumulate penalty.
+- Refresh can exclude those markets via runtime-only filter (`low_quality_runtime`).
+- Key knobs:
+  - `runtime.low_quality_market_penalty_threshold`
+  - `runtime.low_quality_market_penalty_increment`
+  - `runtime.low_quality_market_penalty_decay`
+  - `runtime.low_quality_market_min_observations`
+
+### 6. Summary Count vs Reason Aggregate Alignment
 
 - `market_universe_change_events`:
   - explicit universe-change events (metric event count).
 - `resync_due_to_universe_change`:
   - resync event count whose reason is `market_universe_changed` (often per-asset).
-- `ws_connected_events` / `ws_reconnect_events`:
-  - explicit websocket event counts.
+- `ws_connected_events` / `ws_reconnect_events`: explicit websocket event counts.
 - This avoids confusion such as:
   - one universe-change event causing many per-asset resync rows.
 
-### 5. Dashboard / Report Additions
+### 7. Dashboard / Report Additions
 
-Daily report totals now include transport + readiness breakdown:
+Daily report/dashboard now include market-state readiness counters:
 
-- `market_universe_changed_count`
-- `market_universe_change_events`
-- `resync_due_to_universe_change`
-- `ws_connected_events`
-- `ws_reconnect_events`
-- `book_not_ready_count`
-- `quote_too_old_count`
-- `book_recovering_count`
-- `market_not_ready_count`
-- `market_probation_count`
-- `market_quote_stale_count`
-- `asset_warming_up_count`
-- `connection_recovering_count`
-- `market_recovering_count`
+- `ready_market_count`
+- `recovering_market_count`
+- `stale_market_count`
+- `eligible_market_count`
+- `blocked_market_count`
 
-Dashboard overview/diagnostics add:
+No-signal reasons now distinguish readiness preconditions more explicitly (for example `book_not_ready_insufficient_updates`).
 
-- WS counters (`ws_connected_events`, `ws_reconnect_events`)
-- WS reason tables/charts (connected/reconnect reason breakdown)
-- readiness counters (`book_not_ready`, `market_quote_stale*`, `book_recovering`, `no_initial_book`, `asset_warming_up`, `connection_recovering`, `market_recovering`)
-- reason-group view (strategy vs readiness vs transport/other)
+Dashboard diagnostics keep strategy/readiness/transport grouping and remain read-only.
 
 ## CLI
 
@@ -156,11 +150,13 @@ Treat run as **not strategy-evaluable** if one or more remain dominant:
 - high `resync_due_to_universe_change` without matching `market_universe_change_events`
 - readiness no-signal dominance (`book_not_ready`, `market_not_ready`, `market_probation`, `book_recovering`)
 - frequent market/asset blocks dominating no-signal reasons
+- very low `eligible_market_count` relative to watched markets
 
 Treat run as **close to strategy-evaluable** when:
 
 - watched universe is stable (low churn, low cumulative drift)
 - transport/readiness no-signal reasons trend down materially
+- `eligible_market_count` remains stably positive
 - block events are intermittent and clear quickly
 - no-signal distribution is mostly strategy-side (`edge_below_threshold`)
 

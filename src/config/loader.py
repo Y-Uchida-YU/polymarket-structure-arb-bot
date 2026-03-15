@@ -71,6 +71,9 @@ class RuntimeSettings(BaseModel):
     market_probation_ms: int = 0
     market_probation_min_quote_updates_per_asset: int = 2
     market_probation_min_ready_asset_ratio: float = 1.0
+    market_eligibility_min_quote_updates_per_asset: int = 1
+    market_no_signal_reason_cooldown_ms: int = 15_000
+    market_recovering_max_ms: int = 480_000
     stale_asset_ms: int = 15_000
     initial_market_data_grace_ms: int = 30_000
     per_asset_book_grace_ms: int = 60_000
@@ -84,9 +87,15 @@ class RuntimeSettings(BaseModel):
     same_reason_resync_cooldown_ms: int = 120_000
     missing_book_resync_cooldown_ms: int = 180_000
     stale_asset_resync_cooldown_ms: int = 180_000
+    stale_asset_resync_additional_cooldown_ms: int = 180_000
+    stale_asset_resync_ready_ratio_min: float = 1.0
     full_resync_cooldown_ms: int = 120_000
     max_resync_assets_per_cycle: int = 50
     resync_batch_size: int = 100
+    low_quality_market_penalty_threshold: int = 12
+    low_quality_market_penalty_increment: int = 2
+    low_quality_market_penalty_decay: int = 1
+    low_quality_market_min_observations: int = 3
     snapshot_interval_minutes: int = 60
     report_export_interval_minutes: int = 1_440
     environment_name: str = "win11-local"

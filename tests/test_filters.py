@@ -225,3 +225,24 @@ def test_extract_binary_markets_allows_replacement_when_existing_is_much_weaker(
     )
     assert len(result) == 2
     assert {market.market_id for market in result} == {"1", "3"}
+
+
+def test_extract_binary_markets_excludes_runtime_low_quality_market_ids() -> None:
+    markets = [
+        make_raw_market("1", enable_order_book=True),
+        make_raw_market("2", enable_order_book=True),
+    ]
+    filters = MarketFilterSettings(
+        min_recent_activity=0.0,
+        min_liquidity_proxy=0.0,
+        min_volume_24h_proxy=0.0,
+        min_days_to_expiry=0.0,
+        max_days_to_expiry=3650.0,
+    )
+    result = extract_binary_markets(
+        raw_markets=markets,
+        market_filters=filters,
+        markets_config=MarketsConfig(),
+        runtime_excluded_market_ids={"2"},
+    )
+    assert {market.market_id for market in result} == {"1"}

@@ -390,3 +390,41 @@ def test_daily_report_aligns_universe_change_vs_resync_and_ws_reasons(tmp_path: 
     assert totals["ws_reconnect_events"] == 1
     assert report["ws_connected_reasons"][0]["reason"] == "ws_connected"
     assert report["ws_reconnect_reasons"][0]["reason"] == "socket_closed_remote"
+
+
+def test_daily_report_aggregates_book_not_ready_prefix_and_market_state_metrics(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "no_signal_reason:book_not_ready", 1.0, "", now),
+                ("run-1", "no_signal_reason:book_not_ready_insufficient_updates", 1.0, "", now),
+                ("run-1", "no_signal_reason:book_not_ready_missing_leg_ready", 1.0, "", now),
+                ("run-1", "market_state_ready_count", 8.0, "", now),
+                ("run-1", "market_state_recovering_count", 2.0, "", now),
+                ("run-1", "market_state_stale_no_recent_quote_count", 3.0, "", now),
+                ("run-1", "market_state_stale_quote_age_count", 1.0, "", now),
+                ("run-1", "market_state_eligible_count", 5.0, "", now),
+                ("run-1", "market_state_blocked_count", 1.0, "", now),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    totals = report["totals"]
+    assert totals["book_not_ready_count"] == 3
+    assert totals["ready_market_count"] == 8
+    assert totals["recovering_market_count"] == 2
+    assert totals["stale_market_count"] == 4
+    assert totals["eligible_market_count"] == 5
+    assert totals["blocked_market_count"] == 1

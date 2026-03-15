@@ -51,6 +51,9 @@ runtime:
   market_probation_ms: 300000
   market_probation_min_quote_updates_per_asset: 3
   market_probation_min_ready_asset_ratio: 1.0
+  market_eligibility_min_quote_updates_per_asset: 3
+  market_no_signal_reason_cooldown_ms: 20000
+  market_recovering_max_ms: 300000
   stale_asset_ms: 90000
   initial_market_data_grace_ms: 45000
   per_asset_book_grace_ms: 120000
@@ -64,9 +67,15 @@ runtime:
   same_reason_resync_cooldown_ms: 300000
   missing_book_resync_cooldown_ms: 480000
   stale_asset_resync_cooldown_ms: 420000
+  stale_asset_resync_additional_cooldown_ms: 300000
+  stale_asset_resync_ready_ratio_min: 1.0
   full_resync_cooldown_ms: 300000
   max_resync_assets_per_cycle: 25
   resync_batch_size: 80
+  low_quality_market_penalty_threshold: 10
+  low_quality_market_penalty_increment: 2
+  low_quality_market_penalty_decay: 1
+  low_quality_market_min_observations: 3
   snapshot_interval_minutes: 60
   report_export_interval_minutes: 1440
   environment_name: "shadow-paper-win11"
