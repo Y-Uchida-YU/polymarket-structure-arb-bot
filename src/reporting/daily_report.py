@@ -193,6 +193,37 @@ class DailyReportGenerator:
             run_id=run_id,
             metric_name="market_state_blocked_count",
         )
+        watched_market_count_current = int(universe.get("current_watched_markets", 0))
+        min_watched_markets_floor = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="universe_min_watched_markets_floor",
+        )
+        low_quality_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="low_quality_market_count",
+        )
+        low_quality_runtime_excluded_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="low_quality_runtime_excluded_count",
+        )
+        ready_market_ratio = self._latest_metric_float_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_ready_ratio",
+        )
+        eligible_market_ratio = self._latest_metric_float_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_eligible_ratio",
+        )
         readiness_no_signal_total = (
             book_not_ready_count
             + quote_too_old_count
@@ -204,6 +235,28 @@ class DailyReportGenerator:
             + connection_recovering_count
             + market_recovering_count
         )
+        no_eligible_markets_causes: list[str] = []
+        if watched_market_count_current <= 0:
+            no_eligible_markets_causes.append("watched_too_small")
+        if watched_market_count_current < max(1, min_watched_markets_floor):
+            no_eligible_markets_causes.append("watched_too_small")
+        if (
+            watched_market_count_current > 0
+            and recovering_market_count >= watched_market_count_current
+        ):
+            no_eligible_markets_causes.append("all_markets_recovering")
+        if (
+            watched_market_count_current > 0
+            and ready_market_count == 0
+            and market_not_ready_count > 0
+        ):
+            no_eligible_markets_causes.append("all_markets_not_ready")
+        if watched_market_count_current > 0 and stale_market_count >= watched_market_count_current:
+            no_eligible_markets_causes.append("all_markets_stale")
+        if low_quality_runtime_excluded_count >= max(1, watched_market_count_current):
+            no_eligible_markets_causes.append("quality_penalty_excessive")
+        if eligible_market_count == 0 and not no_eligible_markets_causes:
+            no_eligible_markets_causes.append("eligibility_gate_unmet")
         book_no_signal_total = sum(
             int(item.get("count", 0))
             for item in no_signal_reasons
@@ -311,16 +364,22 @@ class DailyReportGenerator:
                 "connection_recovering_count": connection_recovering_count,
                 "market_recovering_count": market_recovering_count,
                 "ready_market_count": ready_market_count,
+                "ready_market_ratio": ready_market_ratio,
                 "recovering_market_count": recovering_market_count,
                 "stale_market_count": stale_market_count,
                 "eligible_market_count": eligible_market_count,
+                "eligible_market_ratio": eligible_market_ratio,
                 "blocked_market_count": blocked_market_count,
+                "min_watched_markets_floor": min_watched_markets_floor,
+                "low_quality_market_count": low_quality_market_count,
+                "low_quality_runtime_excluded_count": low_quality_runtime_excluded_count,
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
             },
             "universe": universe,
             "warmup": warmup,
+            "no_eligible_market_causes": sorted(set(no_eligible_markets_causes)),
             "resyncs_by_reason": resync_by_reason,
             "safe_mode_reasons": safe_mode_reasons,
             "safe_mode_scope_reasons": safe_mode_scope_reasons,
@@ -400,10 +459,18 @@ class DailyReportGenerator:
             f"connection_recovering_count: {totals['connection_recovering_count']}",
             f"market_recovering_count: {totals['market_recovering_count']}",
             f"ready_market_count: {totals['ready_market_count']}",
+            f"ready_market_ratio: {totals['ready_market_ratio']:.3f}",
             f"recovering_market_count: {totals['recovering_market_count']}",
             f"stale_market_count: {totals['stale_market_count']}",
             f"eligible_market_count: {totals['eligible_market_count']}",
+            f"eligible_market_ratio: {totals['eligible_market_ratio']:.3f}",
             f"blocked_market_count: {totals['blocked_market_count']}",
+            f"min_watched_markets_floor: {totals['min_watched_markets_floor']}",
+            f"low_quality_market_count: {totals['low_quality_market_count']}",
+            (
+                "low_quality_runtime_excluded_count: "
+                f"{totals['low_quality_runtime_excluded_count']}"
+            ),
             (
                 "watched_markets(current/cumulative): "
                 f"{universe.get('current_watched_markets', 0)} / "
@@ -417,6 +484,10 @@ class DailyReportGenerator:
             (
                 "warmup_events/latest_warming_up_assets: "
                 f"{warmup.get('warmup_events', 0)} / {warmup.get('latest_warming_up_assets', 0)}"
+            ),
+            (
+                "no_eligible_market_causes: "
+                + ", ".join(report.get("no_eligible_market_causes", []))
             ),
             f"projected_matched_pnl: {totals['projected_matched_pnl']:.6f}",
             f"unmatched_inventory_mtm: {totals['unmatched_inventory_mtm']:.6f}",
@@ -1015,6 +1086,23 @@ class DailyReportGenerator:
         run_id: str | None,
         metric_name: str,
     ) -> int:
+        return int(
+            self._latest_metric_float_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+
+    def _latest_metric_float_value(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+    ) -> float:
         query = """
         SELECT metric_value
         FROM metrics
@@ -1039,7 +1127,7 @@ class DailyReportGenerator:
                 fallback_params.append(run_id)
             fallback_query += " ORDER BY created_at DESC LIMIT 1"
             row = conn.execute(fallback_query, fallback_params).fetchone()
-        return int(float(row[0])) if row and row[0] is not None else 0
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     @staticmethod
     def _extract_kv_from_details(details: str, key: str) -> str | None:

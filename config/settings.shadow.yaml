@@ -76,6 +76,13 @@ runtime:
   low_quality_market_penalty_increment: 2
   low_quality_market_penalty_decay: 1
   low_quality_market_min_observations: 3
+  low_quality_market_exclusion_consecutive_cycles: 18
+  low_quality_market_degraded_penalty_ratio: 0.5
+  low_quality_market_probation_penalty_ratio: 1.0
+  low_quality_market_exclusion_candidate_penalty_ratio: 1.8
+  min_watched_markets_floor: 10
+  watched_floor_relax_activity_filters: true
+  watched_floor_relax_runtime_exclusion: true
   snapshot_interval_minutes: 60
   report_export_interval_minutes: 1440
   environment_name: "shadow-paper-win11"

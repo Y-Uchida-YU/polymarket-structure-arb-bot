@@ -96,6 +96,13 @@ class RuntimeSettings(BaseModel):
     low_quality_market_penalty_increment: int = 2
     low_quality_market_penalty_decay: int = 1
     low_quality_market_min_observations: int = 3
+    low_quality_market_exclusion_consecutive_cycles: int = 8
+    low_quality_market_degraded_penalty_ratio: float = 0.5
+    low_quality_market_probation_penalty_ratio: float = 1.0
+    low_quality_market_exclusion_candidate_penalty_ratio: float = 1.5
+    min_watched_markets_floor: int = 8
+    watched_floor_relax_activity_filters: bool = True
+    watched_floor_relax_runtime_exclusion: bool = True
     snapshot_interval_minutes: int = 60
     report_export_interval_minutes: int = 1_440
     environment_name: str = "win11-local"

@@ -246,6 +246,36 @@ class DashboardDataLoader:
                 run_id=run_id,
                 metric_name="market_state_blocked_count",
             )
+            min_watched_markets_floor = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="universe_min_watched_markets_floor",
+            )
+            low_quality_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="low_quality_market_count",
+            )
+            low_quality_runtime_excluded_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="low_quality_runtime_excluded_count",
+            )
+            ready_market_ratio = self._latest_metric_float_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_ready_ratio",
+            )
+            eligible_market_ratio = self._latest_metric_float_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="market_state_eligible_ratio",
+            )
             resync_count = self._count(
                 conn=conn,
                 table="resync_events",
@@ -262,6 +292,7 @@ class DashboardDataLoader:
 
         fill_rate = signals_with_fill / total_signals if total_signals > 0 else 0.0
         matched_fill_rate = matched_fill_signals / total_signals if total_signals > 0 else 0.0
+        watched_markets_current = float(universe["current_watched_markets"])
         return {
             "total_signals": float(total_signals),
             "total_fills": float(total_fills),
@@ -290,10 +321,15 @@ class DashboardDataLoader:
             "connection_recovering_count": float(connection_recovering_count),
             "market_recovering_count": float(market_recovering_count),
             "ready_market_count": float(ready_market_count),
+            "ready_market_ratio": float(ready_market_ratio),
             "recovering_market_count": float(recovering_market_count),
             "stale_market_count": float(stale_market_count),
             "eligible_market_count": float(eligible_market_count),
+            "eligible_market_ratio": float(eligible_market_ratio),
             "blocked_market_count": float(blocked_market_count),
+            "min_watched_markets_floor": float(min_watched_markets_floor),
+            "low_quality_market_count": float(low_quality_market_count),
+            "low_quality_runtime_excluded_count": float(low_quality_runtime_excluded_count),
             "no_initial_book_count": float(
                 self._sum_metric(
                     conn=conn,
@@ -314,7 +350,7 @@ class DashboardDataLoader:
             "projected_matched_pnl": projected_matched_pnl,
             "unmatched_inventory_mtm": unmatched_inventory_mtm,
             "total_projected_pnl": total_projected_pnl,
-            "watched_markets_current": float(universe["current_watched_markets"]),
+            "watched_markets_current": watched_markets_current,
             "watched_markets_cumulative": float(universe["cumulative_watched_markets"]),
             "subscribed_assets_current": float(universe["current_subscribed_assets"]),
             "subscribed_assets_cumulative": float(universe["cumulative_subscribed_assets"]),
@@ -1073,6 +1109,23 @@ class DashboardDataLoader:
         run_id: str | None,
         metric_name: str,
     ) -> int:
+        return int(
+            self._latest_metric_float_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+
+    def _latest_metric_float_value(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_name: str,
+    ) -> float:
         query = """
         SELECT metric_value
         FROM metrics
@@ -1097,7 +1150,7 @@ class DashboardDataLoader:
                 fallback_params.append(run_id)
             fallback_query += " ORDER BY created_at DESC LIMIT 1"
             row = conn.execute(fallback_query, fallback_params).fetchone()
-        return int(float(row[0])) if row and row[0] is not None else 0
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     @staticmethod
     def _extract_kv(details: str, key: str) -> str | None:
@@ -1197,10 +1250,15 @@ class DashboardDataLoader:
             "connection_recovering_count": 0.0,
             "market_recovering_count": 0.0,
             "ready_market_count": 0.0,
+            "ready_market_ratio": 0.0,
             "recovering_market_count": 0.0,
             "stale_market_count": 0.0,
             "eligible_market_count": 0.0,
+            "eligible_market_ratio": 0.0,
             "blocked_market_count": 0.0,
+            "min_watched_markets_floor": 0.0,
+            "low_quality_market_count": 0.0,
+            "low_quality_runtime_excluded_count": 0.0,
             "no_initial_book_count": 0.0,
             "asset_warming_up_count": 0.0,
             "resync_count": 0.0,

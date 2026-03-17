@@ -105,9 +105,13 @@ def _evaluation_status(
     ws_reconnect_events = float(overview.get("ws_reconnect_events", 0.0))
     total_blocks = float(overview.get("total_block_events", 0.0))
     watched_markets_current = float(overview.get("watched_markets_current", 0.0))
+    min_watched_floor = float(overview.get("min_watched_markets_floor", 0.0))
     ready_market_count = float(overview.get("ready_market_count", 0.0))
+    ready_market_ratio = float(overview.get("ready_market_ratio", 0.0))
     stale_market_count = float(overview.get("stale_market_count", 0.0))
     eligible_market_count = float(overview.get("eligible_market_count", 0.0))
+    eligible_market_ratio = float(overview.get("eligible_market_ratio", 0.0))
+    low_quality_runtime_excluded_count = float(overview.get("low_quality_runtime_excluded_count", 0.0))
     readiness_friction_count = (
         float(overview.get("book_not_ready_count", 0.0))
         + float(overview.get("quote_too_old_count", 0.0))
@@ -142,6 +146,8 @@ def _evaluation_status(
         or missing_book_total >= 50
         or blocking_ratio >= 0.5
         or (watched_markets_current > 0 and eligible_market_count <= 0)
+        or (watched_markets_current > 0 and watched_markets_current < max(1.0, min_watched_floor))
+        or (watched_markets_current > 0 and low_quality_runtime_excluded_count >= watched_markets_current)
         or stale_market_count > max(5.0, ready_market_count)
     )
     if not_ready:
@@ -152,10 +158,38 @@ def _evaluation_status(
         or total_blocks >= 10
         or missing_book_total > 0
         or readiness_friction_count > 0
+        or ready_market_ratio < 0.5
+        or eligible_market_ratio < 0.2
     )
     if partial:
         return "PARTIALLY READY", "orange"
     return "EVALUATION READY", "green"
+
+
+def _no_eligible_causes(overview: dict[str, float]) -> list[str]:
+    watched_markets = int(float(overview.get("watched_markets_current", 0.0)))
+    min_floor = int(float(overview.get("min_watched_markets_floor", 0.0)))
+    ready_markets = int(float(overview.get("ready_market_count", 0.0)))
+    recovering_markets = int(float(overview.get("recovering_market_count", 0.0)))
+    stale_markets = int(float(overview.get("stale_market_count", 0.0)))
+    eligible_markets = int(float(overview.get("eligible_market_count", 0.0)))
+    market_not_ready = int(float(overview.get("market_not_ready_count", 0.0)))
+    low_quality_excluded = int(float(overview.get("low_quality_runtime_excluded_count", 0.0)))
+
+    causes: list[str] = []
+    if watched_markets < max(1, min_floor):
+        causes.append("watched_too_small")
+    if watched_markets > 0 and recovering_markets >= watched_markets:
+        causes.append("all_markets_recovering")
+    if watched_markets > 0 and ready_markets == 0 and market_not_ready > 0:
+        causes.append("all_markets_not_ready")
+    if watched_markets > 0 and stale_markets >= watched_markets:
+        causes.append("all_markets_stale")
+    if watched_markets > 0 and low_quality_excluded >= watched_markets:
+        causes.append("quality_penalty_excessive")
+    if eligible_markets <= 0 and not causes:
+        causes.append("eligibility_gate_unmet")
+    return sorted(set(causes))
 
 
 def _overview_section(
@@ -178,6 +212,7 @@ def _overview_section(
         "</div>"
     )
     st.markdown(status_html, unsafe_allow_html=True)
+    no_eligible_causes = _no_eligible_causes(overview)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Signals", int(overview["total_signals"]))
@@ -225,6 +260,16 @@ def _overview_section(
     col28.metric("Eligible Markets", int(overview["eligible_market_count"]))
     col29.metric("Blocked Markets", int(overview["blocked_market_count"]))
 
+    col30, col31, col32, col33, col34 = st.columns(5)
+    col30.metric("Ready Ratio", f"{overview['ready_market_ratio']:.2f}")
+    col31.metric("Eligible Ratio", f"{overview['eligible_market_ratio']:.2f}")
+    col32.metric("Watched Floor", int(overview["min_watched_markets_floor"]))
+    col33.metric("Low-Quality Markets", int(overview["low_quality_market_count"]))
+    col34.metric(
+        "Runtime Excluded",
+        int(overview["low_quality_runtime_excluded_count"]),
+    )
+
     st.caption(
         "Universe (current/cumulative): "
         f"markets {int(overview['watched_markets_current'])}/"
@@ -236,6 +281,8 @@ def _overview_section(
         f"Warm-up events: {int(warmup['warmup_events'])}, "
         f"latest warming-up assets: {int(warmup['latest_warming_up_assets'])}"
     )
+    if no_eligible_causes:
+        st.caption(f"No-eligible causes: {', '.join(no_eligible_causes)}")
 
 
 def _run_detail_section(run_summaries: pd.DataFrame, timezone: ZoneInfo) -> None:
