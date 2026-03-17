@@ -94,6 +94,12 @@ def _timeseries_to_local(frame: pd.DataFrame, timezone: ZoneInfo) -> pd.DataFram
     return converted
 
 
+def _as_frame(value: object, *, columns: list[str]) -> pd.DataFrame:
+    if isinstance(value, pd.DataFrame):
+        return value
+    return pd.DataFrame(columns=columns)
+
+
 def _evaluation_status(
     *,
     overview: dict[str, float],
@@ -473,6 +479,112 @@ def _pnl_section(pnl_series: pd.DataFrame, timezone: ZoneInfo) -> None:
     st.dataframe(display_frame, use_container_width=True, hide_index=True)
 
 
+def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
+    st.subheader("Recovery Diagnostics")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Resync Started", int(float(recovery.get("recovery_resync_started_count", 0.0))))
+    col2.metric(
+        "First Quote Success",
+        int(float(recovery.get("recovery_first_quote_success_count", 0.0))),
+    )
+    col3.metric(
+        "Book Ready Success",
+        int(float(recovery.get("recovery_book_ready_success_count", 0.0))),
+    )
+    col4.metric(
+        "Market Ready Success",
+        int(float(recovery.get("recovery_market_ready_success_count", 0.0))),
+    )
+
+    col5, col6, col7 = st.columns(3)
+    col5.metric(
+        "First Quote Success Rate",
+        f"{float(recovery.get('recovery_first_quote_success_rate', 0.0)):.2%}",
+    )
+    col6.metric(
+        "Book Ready Success Rate",
+        f"{float(recovery.get('recovery_book_ready_success_rate', 0.0)):.2%}",
+    )
+    col7.metric(
+        "Market Ready Success Rate",
+        f"{float(recovery.get('recovery_market_ready_success_rate', 0.0)):.2%}",
+    )
+
+    col8, col9, col10 = st.columns(3)
+    col8.metric(
+        "Avg/Max Resync->FirstQuote (ms)",
+        (
+            f"{float(recovery.get('avg_resync_to_first_quote_latency_ms', 0.0)):.1f}"
+            f" / {float(recovery.get('max_resync_to_first_quote_latency_ms', 0.0)):.1f}"
+        ),
+    )
+    col9.metric(
+        "Avg/Max Resync->BookReady (ms)",
+        (
+            f"{float(recovery.get('avg_resync_to_book_ready_latency_ms', 0.0)):.1f}"
+            f" / {float(recovery.get('max_resync_to_book_ready_latency_ms', 0.0)):.1f}"
+        ),
+    )
+    col10.metric(
+        "Avg/Max Recovery->MarketReady (ms)",
+        (
+            f"{float(recovery.get('avg_recovery_to_market_ready_latency_ms', 0.0)):.1f}"
+            f" / {float(recovery.get('max_recovery_to_market_ready_latency_ms', 0.0)):.1f}"
+        ),
+    )
+
+    col11, col12 = st.columns(2)
+    with col11:
+        st.markdown("**Top Stale Assets**")
+        stale_assets = _as_frame(recovery.get("top_stale_assets"), columns=["asset_id", "count"])
+        if stale_assets.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(stale_assets, use_container_width=True, hide_index=True)
+    with col12:
+        st.markdown("**Top Missing Book Assets**")
+        missing_assets = _as_frame(
+            recovery.get("top_missing_book_assets"),
+            columns=["asset_id", "count"],
+        )
+        if missing_assets.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(missing_assets, use_container_width=True, hide_index=True)
+
+    col13, col14 = st.columns(2)
+    with col13:
+        st.markdown("**Top Market Blocked Markets**")
+        blocked_markets = _as_frame(
+            recovery.get("top_market_blocked_markets"),
+            columns=["market_id", "count"],
+        )
+        if blocked_markets.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(blocked_markets, use_container_width=True, hide_index=True)
+    with col14:
+        st.markdown("**Top Recovery Slow Assets**")
+        slow_assets = _as_frame(
+            recovery.get("top_recovery_slow_assets"),
+            columns=["asset_id", "avg_latency_ms", "max_latency_ms", "success_count"],
+        )
+        if slow_assets.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(slow_assets, use_container_width=True, hide_index=True)
+
+    st.markdown("**Top Recovery Slow Markets**")
+    slow_markets = _as_frame(
+        recovery.get("top_recovery_slow_markets"),
+        columns=["market_id", "avg_latency_ms", "max_latency_ms", "success_count"],
+    )
+    if slow_markets.empty:
+        st.write("No data.")
+    else:
+        st.dataframe(slow_markets, use_container_width=True, hide_index=True)
+
+
 def _market_asset_section(markets: pd.DataFrame, assets: pd.DataFrame, timezone: ZoneInfo) -> None:
     st.subheader("Market / Asset View")
     col1, col2 = st.columns(2)
@@ -590,6 +702,7 @@ def main() -> None:
     block_ts = loader.load_block_timeseries(window=window, run_id=run_id)
     no_signal_ts = loader.load_no_signal_reason_timeseries(window=window, run_id=run_id)
     missing_book_ts = loader.load_missing_book_reason_timeseries(window=window, run_id=run_id)
+    recovery_diag = loader.load_recovery_diagnostics(window=window, run_id=run_id)
     market_diag = loader.load_market_diagnostics(
         window=window,
         run_id=run_id,
@@ -617,6 +730,7 @@ def main() -> None:
         missing_book_ts=missing_book_ts,
         timezone=timezone,
     )
+    _recovery_diagnostics_section(recovery_diag)
     _pnl_section(pnl_series=pnl_series, timezone=timezone)
     _market_asset_section(markets=market_diag, assets=asset_diag, timezone=timezone)
 

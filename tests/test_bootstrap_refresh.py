@@ -342,6 +342,192 @@ def test_resync_cooldown_suppresses_storm_on_repeated_stale_checks(tmp_path: Pat
     asyncio.run(app.shutdown())
 
 
+def test_recovery_diagnostics_records_funnel_events_once_per_cycle(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_recovery_diag_funnel")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "resync_recovery_grace_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    now = datetime.now(tz=UTC)
+    app.state.ws_connected_at = now
+    app.state.subscription_started_at = now - timedelta(seconds=2)
+    app.state.first_quote_received_at = now
+
+    asyncio.run(
+        app.resync_assets(
+            asset_ids=["yes1", "no1"],
+            reason="missing_book_state",
+            force=True,
+        )
+    )
+
+    assert "yes1" in app.state.asset_recovery_started_at
+    assert "no1" in app.state.asset_recovery_started_at
+    assert app.state.asset_recovery_reason_by_asset.get("yes1") == "missing_book_state"
+    assert "m1" in app.state.market_recovery_started_at_for_diagnostics
+
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.47",
+            "bid": "0.46",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.53",
+            "bid": "0.52",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+
+    resync_started = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE event_name = 'resync_started'
+        """
+    ).fetchone()
+    first_quote = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE event_name = 'first_quote_after_resync'
+        """
+    ).fetchone()
+    book_ready = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE event_name = 'book_ready_after_resync'
+        """
+    ).fetchone()
+    market_ready = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE event_name = 'market_ready_after_recovery'
+        """
+    ).fetchone()
+    assert int(resync_started[0] if resync_started else 0) == 2
+    assert int(first_quote[0] if first_quote else 0) == 2
+    assert int(book_ready[0] if book_ready else 0) == 2
+    assert int(market_ready[0] if market_ready else 0) == 1
+    assert "yes1" not in app.state.asset_recovery_started_at
+    assert "no1" not in app.state.asset_recovery_started_at
+    assert "m1" not in app.state.market_recovery_started_at_for_diagnostics
+
+    asyncio.run(app.shutdown())
+
+
+def test_recovery_diagnostics_first_quote_and_book_ready_increment_on_new_cycle(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_recovery_diag_cycle_increment")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 1,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "resync_recovery_grace_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    now = datetime.now(tz=UTC)
+    app.state.ws_connected_at = now
+    app.state.subscription_started_at = now - timedelta(seconds=2)
+    app.state.first_quote_received_at = now
+
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.48",
+            "bid": "0.47",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+
+    asyncio.run(
+        app.resync_assets(
+            asset_ids=["yes1"],
+            reason="missing_book_state",
+            force=True,
+        )
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(yes_payload))
+
+    asyncio.run(
+        app.resync_assets(
+            asset_ids=["yes1"],
+            reason="missing_book_state",
+            force=True,
+        )
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(yes_payload))
+
+    first_quote = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE event_name = 'first_quote_after_resync'
+        """
+    ).fetchone()
+    book_ready = app.sqlite_store.conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE event_name = 'book_ready_after_resync'
+        """
+    ).fetchone()
+    assert int(first_quote[0] if first_quote else 0) == 2
+    assert int(book_ready[0] if book_ready else 0) == 2
+
+    asyncio.run(app.shutdown())
+
+
 def test_partial_asset_staleness_blocks_asset_scope_without_global_safe_mode(
     tmp_path: Path,
 ) -> None:

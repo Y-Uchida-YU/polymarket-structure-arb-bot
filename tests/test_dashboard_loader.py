@@ -158,12 +158,16 @@ def test_dashboard_loader_empty_state(tmp_path: Path) -> None:
     window = resolve_window(last_hours=24)
 
     overview = loader.load_overview(window=window, run_id=None)
+    recovery = loader.load_recovery_diagnostics(window=window, run_id=None)
     assert loader.has_database() is False
     assert overview["total_signals"] == 0.0
     assert overview["total_fills"] == 0.0
     assert overview["ready_market_ratio"] == 0.0
     assert overview["eligible_market_ratio"] == 0.0
     assert overview["min_watched_markets_floor"] == 0.0
+    assert recovery["recovery_resync_started_count"] == 0.0
+    assert recovery["recovery_first_quote_success_rate"] == 0.0
+    assert recovery["top_stale_assets"].empty
     assert loader.load_run_ids() == []
     assert loader.load_pnl_timeseries(window=window, run_id=None).empty
 
@@ -290,3 +294,58 @@ def test_dashboard_loader_overview_includes_market_state_and_book_not_ready_pref
     assert overview["ready_market_ratio"] == 0.45
     assert overview["eligible_market_ratio"] == 0.25
     assert overview["blocked_market_count"] == 1.0
+
+
+def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_dashboard_data(db_path)
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "resync_started", "a1", "m1", "missing_book_state", None, "", now),
+                ("run-1", "resync_started", "a2", "m1", "missing_book_state", None, "", now),
+                ("run-1", "first_quote_after_resync", "a1", "m1", "missing_book_state", 100.0, "", now),
+                ("run-1", "book_ready_after_resync", "a1", "m1", "missing_book_state", 250.0, "", now),
+                ("run-1", "market_recovery_started", None, "m1", "missing_book_state", None, "", now),
+                ("run-1", "market_ready_after_recovery", None, "m1", "missing_book_state", 900.0, "", now),
+                ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
+                ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
+                (
+                    "run-1",
+                    "missing_book_state_detected",
+                    "a2",
+                    "m1",
+                    "book_not_resynced_yet",
+                    None,
+                    "",
+                    now,
+                ),
+                ("run-1", "market_block_entered", None, "m1", "book_state_unhealthy", None, "", now),
+            ],
+        )
+    store.close()
+
+    loader = DashboardDataLoader(db_path=db_path)
+    window = resolve_window(last_hours=24)
+    recovery = loader.load_recovery_diagnostics(window=window, run_id="run-1")
+
+    assert recovery["recovery_resync_started_count"] == 2.0
+    assert recovery["recovery_first_quote_success_count"] == 1.0
+    assert recovery["recovery_book_ready_success_count"] == 1.0
+    assert recovery["recovery_market_ready_success_count"] == 1.0
+    assert recovery["recovery_first_quote_success_rate"] == 0.5
+    assert recovery["avg_resync_to_first_quote_latency_ms"] == 100.0
+    assert recovery["avg_recovery_to_market_ready_latency_ms"] == 900.0
+    top_stale_assets = recovery["top_stale_assets"]
+    assert not top_stale_assets.empty
+    assert str(top_stale_assets.iloc[0]["asset_id"]) == "a1"
+    top_slow_markets = recovery["top_recovery_slow_markets"]
+    assert not top_slow_markets.empty
+    assert str(top_slow_markets.iloc[0]["market_id"]) == "m1"
