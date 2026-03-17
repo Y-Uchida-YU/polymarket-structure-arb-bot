@@ -62,6 +62,16 @@ MARKET_QUALITY_PROBATION_EXTENDED = "probation_extended"
 MARKET_QUALITY_EXCLUSION_CANDIDATE = "exclusion_candidate"
 MARKET_QUALITY_EXCLUDED = "excluded"
 
+DIAG_EVENT_RESYNC_STARTED = "resync_started"
+DIAG_EVENT_FIRST_QUOTE_AFTER_RESYNC = "first_quote_after_resync"
+DIAG_EVENT_BOOK_READY_AFTER_RESYNC = "book_ready_after_resync"
+DIAG_EVENT_MARKET_RECOVERY_STARTED = "market_recovery_started"
+DIAG_EVENT_MARKET_READY_AFTER_RECOVERY = "market_ready_after_recovery"
+DIAG_EVENT_STALE_ASSET_DETECTED = "stale_asset_detected"
+DIAG_EVENT_MISSING_BOOK_STATE_DETECTED = "missing_book_state_detected"
+DIAG_EVENT_MARKET_BLOCK_ENTERED = "market_block_entered"
+DIAG_EVENT_MARKET_BLOCK_CLEARED = "market_block_cleared"
+
 
 def setup_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +135,9 @@ class AppState:
     asset_quote_update_count: dict[str, int] = field(default_factory=dict)
     asset_recovering_until: dict[str, datetime] = field(default_factory=dict)
     asset_recovering_started_at: dict[str, datetime] = field(default_factory=dict)
+    asset_recovery_started_at: dict[str, datetime] = field(default_factory=dict)
+    asset_first_quote_after_recovery_at: dict[str, datetime] = field(default_factory=dict)
+    asset_recovery_reason_by_asset: dict[str, str] = field(default_factory=dict)
     asset_unhealthy_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     last_book_missing_reason_by_asset: dict[str, str] = field(default_factory=dict)
     market_probation_until: dict[str, datetime] = field(default_factory=dict)
@@ -171,6 +184,8 @@ class AppState:
     pending_universe_confirmation_count: int = 0
     market_unhealthy_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     market_block_started_at: dict[str, datetime] = field(default_factory=dict)
+    market_recovery_started_at_for_diagnostics: dict[str, datetime] = field(default_factory=dict)
+    market_recovery_reason_by_market: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -597,6 +612,21 @@ class PolymarketStructureArbApp:
             for asset_id, started_at in self.state.asset_recovering_started_at.items()
             if asset_id in current_asset_ids
         }
+        self.state.asset_recovery_started_at = {
+            asset_id: started_at
+            for asset_id, started_at in self.state.asset_recovery_started_at.items()
+            if asset_id in current_asset_ids
+        }
+        self.state.asset_first_quote_after_recovery_at = {
+            asset_id: quoted_at
+            for asset_id, quoted_at in self.state.asset_first_quote_after_recovery_at.items()
+            if asset_id in current_asset_ids
+        }
+        self.state.asset_recovery_reason_by_asset = {
+            asset_id: reason
+            for asset_id, reason in self.state.asset_recovery_reason_by_asset.items()
+            if asset_id in current_asset_ids
+        }
         self.state.last_book_missing_reason_by_asset = {
             asset_id: reason
             for asset_id, reason in self.state.last_book_missing_reason_by_asset.items()
@@ -611,6 +641,16 @@ class PolymarketStructureArbApp:
             asset_id: subscribed_at
             for asset_id, subscribed_at in self.state.asset_subscribed_at.items()
             if asset_id in current_asset_ids
+        }
+        self.state.market_recovery_started_at_for_diagnostics = {
+            market_id: started_at
+            for market_id, started_at in self.state.market_recovery_started_at_for_diagnostics.items()
+            if market_id in current_markets
+        }
+        self.state.market_recovery_reason_by_market = {
+            market_id: reason
+            for market_id, reason in self.state.market_recovery_reason_by_market.items()
+            if market_id in current_markets
         }
         for asset_id in asset_ids:
             self.state.asset_subscribed_at.setdefault(asset_id, now)
@@ -751,6 +791,7 @@ class PolymarketStructureArbApp:
             for update in updates:
                 self.healthcheck.on_ws_message(now)
                 self.healthcheck.on_asset_quote_update(update.asset_id, update.timestamp)
+                self._record_first_quote_after_resync(asset_id=update.asset_id, now_utc=now)
                 mapping = self.token_to_market_side.get(update.asset_id)
                 if mapping is None:
                     continue
@@ -995,9 +1036,125 @@ class PolymarketStructureArbApp:
                 now_utc=now_utc,
             )
 
+    def _save_diagnostics_event(
+        self,
+        *,
+        event_name: str,
+        now_utc: datetime,
+        asset_id: str | None = None,
+        market_id: str | None = None,
+        reason: str | None = None,
+        latency_ms: float | None = None,
+        details: str = "",
+    ) -> None:
+        self.sqlite_store.save_diagnostics_event(
+            event_name=event_name,
+            asset_id=asset_id,
+            market_id=market_id,
+            reason=reason,
+            latency_ms=latency_ms,
+            details=details,
+            created_at_iso=now_utc.isoformat(),
+            run_id=self.state.run_id,
+        )
+
+    def _start_market_recovery_tracking(
+        self,
+        *,
+        market_id: str,
+        reason: str,
+        now_utc: datetime,
+    ) -> None:
+        if market_id not in self.markets_by_id:
+            return
+        if market_id in self.state.market_recovery_started_at_for_diagnostics:
+            return
+        self.state.market_recovery_started_at_for_diagnostics[market_id] = now_utc
+        self.state.market_recovery_reason_by_market[market_id] = reason
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_MARKET_RECOVERY_STARTED,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=reason,
+        )
+
+    def _start_asset_recovery_tracking(self, *, asset_id: str, reason: str, now_utc: datetime) -> None:
+        self.state.asset_recovery_started_at[asset_id] = now_utc
+        self.state.asset_first_quote_after_recovery_at.pop(asset_id, None)
+        self.state.asset_recovery_reason_by_asset[asset_id] = reason
+        mapping = self.token_to_market_side.get(asset_id)
+        market_id = mapping[0] if mapping is not None else None
+        if market_id:
+            self._start_market_recovery_tracking(
+                market_id=market_id,
+                reason=reason,
+                now_utc=now_utc,
+            )
+
+    def _record_first_quote_after_resync(self, *, asset_id: str, now_utc: datetime) -> None:
+        started_at = self.state.asset_recovery_started_at.get(asset_id)
+        if started_at is None:
+            return
+        if asset_id in self.state.asset_first_quote_after_recovery_at:
+            return
+        latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
+        self.state.asset_first_quote_after_recovery_at[asset_id] = now_utc
+        mapping = self.token_to_market_side.get(asset_id)
+        market_id = mapping[0] if mapping is not None else None
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_FIRST_QUOTE_AFTER_RESYNC,
+            now_utc=now_utc,
+            asset_id=asset_id,
+            market_id=market_id,
+            reason=self.state.asset_recovery_reason_by_asset.get(asset_id),
+            latency_ms=latency_ms,
+        )
+
+    def _clear_asset_recovery_tracking(self, *, asset_id: str) -> None:
+        self.state.asset_recovery_started_at.pop(asset_id, None)
+        self.state.asset_first_quote_after_recovery_at.pop(asset_id, None)
+        self.state.asset_recovery_reason_by_asset.pop(asset_id, None)
+
+    def _record_book_ready_after_resync(self, *, asset_id: str, now_utc: datetime) -> None:
+        started_at = self.state.asset_recovery_started_at.get(asset_id)
+        if started_at is None:
+            return
+        # Book-ready can happen in the same update as first quote.
+        self._record_first_quote_after_resync(asset_id=asset_id, now_utc=now_utc)
+        latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
+        mapping = self.token_to_market_side.get(asset_id)
+        market_id = mapping[0] if mapping is not None else None
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_BOOK_READY_AFTER_RESYNC,
+            now_utc=now_utc,
+            asset_id=asset_id,
+            market_id=market_id,
+            reason=self.state.asset_recovery_reason_by_asset.get(asset_id),
+            latency_ms=latency_ms,
+        )
+        self._clear_asset_recovery_tracking(asset_id=asset_id)
+
+    def _record_market_ready_after_recovery(self, *, market_id: str, now_utc: datetime) -> None:
+        started_at = self.state.market_recovery_started_at_for_diagnostics.get(market_id)
+        if started_at is None:
+            return
+        latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
+        reason = self.state.market_recovery_reason_by_market.get(market_id)
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_MARKET_READY_AFTER_RECOVERY,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=reason,
+            latency_ms=latency_ms,
+        )
+        self.state.market_recovery_started_at_for_diagnostics.pop(market_id, None)
+        self.state.market_recovery_reason_by_market.pop(market_id, None)
+
     def _mark_asset_ready(self, asset_id: str) -> None:
         if not self.quote_manager.is_asset_ready(asset_id):
             return
+        now = utc_now()
+        self._record_book_ready_after_resync(asset_id=asset_id, now_utc=now)
         self.state.ready_assets.add(asset_id)
         self.state.ever_ready_assets.add(asset_id)
         self.state.asset_recovering_until.pop(asset_id, None)
@@ -1260,6 +1417,8 @@ class PolymarketStructureArbApp:
     ) -> None:
         self.state.market_freshness_state_by_market[market_id] = state
         self.state.market_freshness_updated_at[market_id] = now_utc
+        if state == MARKET_FRESHNESS_READY:
+            self._record_market_ready_after_recovery(market_id=market_id, now_utc=now_utc)
 
     @staticmethod
     def _market_freshness_to_no_signal_reason(state: str) -> str:
@@ -1368,8 +1527,20 @@ class PolymarketStructureArbApp:
         self.state.market_safe_mode_reason = reason if normalized_markets else None
         for market_id in started_markets:
             self.state.market_block_started_at[market_id] = now_utc
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_BLOCK_ENTERED,
+                now_utc=now_utc,
+                market_id=market_id,
+                reason=reason,
+            )
         for market_id in cleared_markets:
             self.state.market_block_started_at.pop(market_id, None)
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_BLOCK_CLEARED,
+                now_utc=now_utc,
+                market_id=market_id,
+                reason=reason,
+            )
         if normalized_markets:
             self.state.safe_mode_scope = SAFE_MODE_SCOPE_MARKET
         elif normalized:
@@ -2382,6 +2553,16 @@ class PolymarketStructureArbApp:
             self.state.last_book_missing_reason_by_asset[asset_id] = reason
             missing_assets.append(asset_id)
             missing_assets_by_reason.setdefault(reason, []).append(asset_id)
+        for asset_id in missing_assets:
+            mapping = self.token_to_market_side.get(asset_id)
+            market_id = mapping[0] if mapping is not None else None
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MISSING_BOOK_STATE_DETECTED,
+                now_utc=now,
+                asset_id=asset_id,
+                market_id=market_id,
+                reason=self.state.last_book_missing_reason_by_asset.get(asset_id),
+            )
 
         stale_assets = self.healthcheck.stale_assets(
             tracked_assets=tracked_assets,
@@ -2407,6 +2588,16 @@ class PolymarketStructureArbApp:
         ]
         if connection_recovering:
             effective_stale_assets = []
+        for asset_id in effective_stale_assets:
+            mapping = self.token_to_market_side.get(asset_id)
+            market_id = mapping[0] if mapping is not None else None
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_STALE_ASSET_DETECTED,
+                now_utc=now,
+                asset_id=asset_id,
+                market_id=market_id,
+                reason=RESYNC_REASON_STALE_ASSET,
+            )
         self.state.stale_assets = set(effective_stale_assets)
         market_state_counts: dict[str, int] = {
             MARKET_FRESHNESS_READY: 0,
@@ -3210,6 +3401,16 @@ class PolymarketStructureArbApp:
                     )
                     if not allowed:
                         continue
+                self._start_asset_recovery_tracking(asset_id=asset_id, reason=reason, now_utc=now)
+                mapping = self.token_to_market_side.get(asset_id)
+                market_id = mapping[0] if mapping is not None else None
+                self._save_diagnostics_event(
+                    event_name=DIAG_EVENT_RESYNC_STARTED,
+                    now_utc=now,
+                    asset_id=asset_id,
+                    market_id=market_id,
+                    reason=reason,
+                )
                 self.state.last_resync_at_by_asset[asset_id] = now.timestamp()
                 self.state.last_resync_at_by_reason[reason] = now.timestamp()
                 self.state.last_resync_at_by_asset_reason[f"{asset_id}|{reason}"] = now.timestamp()
@@ -3258,6 +3459,7 @@ class PolymarketStructureArbApp:
 
                     update = self.quote_manager.apply_book_resync(summary)
                     self.healthcheck.on_asset_quote_update(asset_id=asset_id, ts=summary.timestamp)
+                    self._record_first_quote_after_resync(asset_id=asset_id, now_utc=now)
                     self._mark_asset_ready(asset_id)
                     self.state.last_no_data_resync_at_by_asset.pop(asset_id, None)
                     mapping = self.token_to_market_side.get(asset_id)

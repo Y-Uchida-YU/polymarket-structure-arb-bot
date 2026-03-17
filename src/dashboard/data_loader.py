@@ -799,6 +799,129 @@ class DashboardDataLoader:
             "latest_warming_up_assets": float(latest_row[0]) if latest_row else 0.0,
         }
 
+    def load_recovery_diagnostics(
+        self,
+        *,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> dict[str, object]:
+        empty = self._empty_recovery_diagnostics()
+        if not self.has_database():
+            return empty
+        with self._connect() as conn:
+            if conn is None or not self._table_exists(conn, "diagnostics_events"):
+                return empty
+            try:
+                resync_started_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="resync_started",
+                )
+                first_quote_success_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="first_quote_after_resync",
+                )
+                book_ready_success_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="book_ready_after_resync",
+                )
+                market_recovery_started_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_recovery_started",
+                )
+                market_ready_success_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery",
+                )
+                first_avg_ms, first_max_ms = self._diagnostics_latency_stats(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="first_quote_after_resync",
+                )
+                book_avg_ms, book_max_ms = self._diagnostics_latency_stats(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="book_ready_after_resync",
+                )
+                market_avg_ms, market_max_ms = self._diagnostics_latency_stats(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery",
+                )
+                market_rate_denominator = market_recovery_started_count or resync_started_count
+                return {
+                    "recovery_resync_started_count": float(resync_started_count),
+                    "recovery_first_quote_success_count": float(first_quote_success_count),
+                    "recovery_book_ready_success_count": float(book_ready_success_count),
+                    "recovery_market_ready_success_count": float(market_ready_success_count),
+                    "recovery_first_quote_success_rate": (
+                        float(first_quote_success_count / resync_started_count)
+                        if resync_started_count > 0
+                        else 0.0
+                    ),
+                    "recovery_book_ready_success_rate": (
+                        float(book_ready_success_count / resync_started_count)
+                        if resync_started_count > 0
+                        else 0.0
+                    ),
+                    "recovery_market_ready_success_rate": (
+                        float(market_ready_success_count / market_rate_denominator)
+                        if market_rate_denominator > 0
+                        else 0.0
+                    ),
+                    "avg_resync_to_first_quote_latency_ms": first_avg_ms,
+                    "max_resync_to_first_quote_latency_ms": first_max_ms,
+                    "avg_resync_to_book_ready_latency_ms": book_avg_ms,
+                    "max_resync_to_book_ready_latency_ms": book_max_ms,
+                    "avg_recovery_to_market_ready_latency_ms": market_avg_ms,
+                    "max_recovery_to_market_ready_latency_ms": market_max_ms,
+                    "top_stale_assets": self._top_diagnostics_counts(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="stale_asset_detected",
+                        entity_column="asset_id",
+                    ),
+                    "top_missing_book_assets": self._top_diagnostics_counts(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="missing_book_state_detected",
+                        entity_column="asset_id",
+                    ),
+                    "top_market_blocked_markets": self._top_diagnostics_counts(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="market_block_entered",
+                        entity_column="market_id",
+                    ),
+                    "top_recovery_slow_assets": self._top_slow_assets(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                    ),
+                    "top_recovery_slow_markets": self._top_slow_markets(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                    ),
+                }
+            except sqlite3.OperationalError:
+                return empty
+
     def _safe_mode_by_scope_reason(
         self,
         *,
@@ -953,6 +1076,27 @@ class DashboardDataLoader:
         row = conn.execute(query, params).fetchone()
         return int(row[0] if row else 0)
 
+    def _count_diagnostics_event(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
     def _count_metric_like(
         self,
         *,
@@ -994,6 +1138,118 @@ class DashboardDataLoader:
             params.append(run_id)
         row = conn.execute(query, params).fetchone()
         return float(row[0] if row else 0.0)
+
+    def _diagnostics_latency_stats(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+    ) -> tuple[float, float]:
+        query = """
+        SELECT AVG(latency_ms), MAX(latency_ms)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+          AND latency_ms IS NOT NULL
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return 0.0, 0.0
+        avg_value = float(row[0]) if row[0] is not None else 0.0
+        max_value = float(row[1]) if row[1] is not None else 0.0
+        return avg_value, max_value
+
+    def _top_diagnostics_counts(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+        entity_column: str,
+    ) -> pd.DataFrame:
+        if entity_column not in {"asset_id", "market_id"}:
+            return pd.DataFrame(columns=[entity_column, "count"])
+        query = f"""
+        SELECT {entity_column}, COUNT(*) AS count
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+          AND {entity_column} IS NOT NULL
+          AND {entity_column} != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += f" GROUP BY {entity_column} ORDER BY count DESC LIMIT 5"
+        return pd.read_sql_query(query, conn, params=params)
+
+    def _top_slow_assets(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        def _query(event_name: str) -> pd.DataFrame:
+            query = """
+            SELECT
+              asset_id,
+              AVG(latency_ms) AS avg_latency_ms,
+              MAX(latency_ms) AS max_latency_ms,
+              COUNT(*) AS success_count
+            FROM diagnostics_events
+            WHERE created_at >= ? AND created_at < ?
+              AND event_name = ?
+              AND latency_ms IS NOT NULL
+              AND asset_id IS NOT NULL
+              AND asset_id != ''
+            """
+            params: list[object] = [window.start_iso, window.end_iso, event_name]
+            if run_id is not None:
+                query += " AND run_id = ?"
+                params.append(run_id)
+            query += " GROUP BY asset_id ORDER BY max_latency_ms DESC, avg_latency_ms DESC LIMIT 5"
+            return pd.read_sql_query(query, conn, params=params)
+
+        frame = _query("book_ready_after_resync")
+        if frame.empty:
+            frame = _query("first_quote_after_resync")
+        return frame
+
+    def _top_slow_markets(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT
+          market_id,
+          AVG(latency_ms) AS avg_latency_ms,
+          MAX(latency_ms) AS max_latency_ms,
+          COUNT(*) AS success_count
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = 'market_ready_after_recovery'
+          AND latency_ms IS NOT NULL
+          AND market_id IS NOT NULL
+          AND market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY market_id ORDER BY max_latency_ms DESC, avg_latency_ms DESC LIMIT 5"
+        return pd.read_sql_query(query, conn, params=params)
 
     def _count_resync_reason(
         self,
@@ -1223,6 +1479,46 @@ class DashboardDataLoader:
             return None
         db_path = self.db_path.resolve().as_posix()
         return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            LIMIT 1
+            """,
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _empty_recovery_diagnostics() -> dict[str, object]:
+        return {
+            "recovery_resync_started_count": 0.0,
+            "recovery_first_quote_success_count": 0.0,
+            "recovery_book_ready_success_count": 0.0,
+            "recovery_market_ready_success_count": 0.0,
+            "recovery_first_quote_success_rate": 0.0,
+            "recovery_book_ready_success_rate": 0.0,
+            "recovery_market_ready_success_rate": 0.0,
+            "avg_resync_to_first_quote_latency_ms": 0.0,
+            "max_resync_to_first_quote_latency_ms": 0.0,
+            "avg_resync_to_book_ready_latency_ms": 0.0,
+            "max_resync_to_book_ready_latency_ms": 0.0,
+            "avg_recovery_to_market_ready_latency_ms": 0.0,
+            "max_recovery_to_market_ready_latency_ms": 0.0,
+            "top_stale_assets": pd.DataFrame(columns=["asset_id", "count"]),
+            "top_missing_book_assets": pd.DataFrame(columns=["asset_id", "count"]),
+            "top_market_blocked_markets": pd.DataFrame(columns=["market_id", "count"]),
+            "top_recovery_slow_assets": pd.DataFrame(
+                columns=["asset_id", "avg_latency_ms", "max_latency_ms", "success_count"]
+            ),
+            "top_recovery_slow_markets": pd.DataFrame(
+                columns=["market_id", "avg_latency_ms", "max_latency_ms", "success_count"]
+            ),
+        }
 
     @staticmethod
     def _empty_overview() -> dict[str, float]:

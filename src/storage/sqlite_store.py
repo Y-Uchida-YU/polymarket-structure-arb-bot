@@ -173,6 +173,19 @@ class SQLiteStore:
                 )
                 """)
             self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS diagnostics_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  run_id TEXT,
+                  event_name TEXT NOT NULL,
+                  asset_id TEXT,
+                  market_id TEXT,
+                  reason TEXT,
+                  latency_ms REAL,
+                  details TEXT,
+                  created_at TEXT NOT NULL
+                )
+                """)
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS metrics (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   run_id TEXT,
@@ -612,6 +625,38 @@ class SQLiteStore:
                     asset_id,
                     reason,
                     status,
+                    details,
+                    created_at_iso,
+                ),
+            )
+
+    def save_diagnostics_event(
+        self,
+        *,
+        event_name: str,
+        created_at_iso: str,
+        asset_id: str | None = None,
+        market_id: str | None = None,
+        reason: str | None = None,
+        latency_ms: float | None = None,
+        details: str = "",
+        run_id: str | None = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO diagnostics_events (
+                  run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    event_name,
+                    asset_id,
+                    market_id,
+                    reason,
+                    latency_ms,
                     details,
                     created_at_iso,
                 ),

@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 from src.dashboard.data_loader import DashboardWindow
-from src.dashboard_app import _build_window, _no_eligible_causes, _to_local_window
+from src.dashboard_app import _as_frame, _build_window, _no_eligible_causes, _to_local_window
 
 
 def test_to_local_window_converts_utc_to_jst() -> None:
@@ -51,3 +53,16 @@ def test_no_eligible_causes_derived_from_overview() -> None:
     assert "watched_too_small" in causes
     assert "all_markets_recovering" in causes
     assert "quality_penalty_excessive" in causes
+
+
+def test_as_frame_returns_empty_frame_when_value_is_missing() -> None:
+    frame = _as_frame(None, columns=["asset_id", "count"])
+    assert isinstance(frame, pd.DataFrame)
+    assert list(frame.columns) == ["asset_id", "count"]
+    assert frame.empty
+
+
+def test_as_frame_returns_input_dataframe() -> None:
+    source = pd.DataFrame([{"asset_id": "a1", "count": 2}])
+    frame = _as_frame(source, columns=["asset_id", "count"])
+    assert frame.equals(source)
