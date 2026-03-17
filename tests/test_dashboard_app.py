@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from src.dashboard.data_loader import DashboardWindow
-from src.dashboard_app import _build_window, _to_local_window
+from src.dashboard_app import _build_window, _no_eligible_causes, _to_local_window
 
 
 def test_to_local_window_converts_utc_to_jst() -> None:
@@ -33,3 +33,21 @@ def test_build_window_datetime_range_uses_local_timezone() -> None:
 
     assert datetime.fromisoformat(window.start_iso) == datetime(2026, 3, 10, 0, 0, tzinfo=UTC)
     assert datetime.fromisoformat(window.end_iso) >= datetime(2026, 3, 10, 1, 0, tzinfo=UTC)
+
+
+def test_no_eligible_causes_derived_from_overview() -> None:
+    causes = _no_eligible_causes(
+        {
+            "watched_markets_current": 2.0,
+            "min_watched_markets_floor": 10.0,
+            "ready_market_count": 0.0,
+            "recovering_market_count": 2.0,
+            "stale_market_count": 0.0,
+            "eligible_market_count": 0.0,
+            "market_not_ready_count": 1.0,
+            "low_quality_runtime_excluded_count": 3.0,
+        }
+    )
+    assert "watched_too_small" in causes
+    assert "all_markets_recovering" in causes
+    assert "quality_penalty_excessive" in causes

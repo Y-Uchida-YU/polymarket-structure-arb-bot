@@ -428,3 +428,41 @@ def test_daily_report_aggregates_book_not_ready_prefix_and_market_state_metrics(
     assert totals["stale_market_count"] == 4
     assert totals["eligible_market_count"] == 5
     assert totals["blocked_market_count"] == 1
+
+
+def test_daily_report_explains_no_eligible_markets_causes(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "universe_current_watched_markets", 2.0, "", now),
+                ("run-1", "universe_min_watched_markets_floor", 10.0, "", now),
+                ("run-1", "market_state_ready_count", 0.0, "", now),
+                ("run-1", "market_state_recovering_count", 2.0, "", now),
+                ("run-1", "market_state_eligible_count", 0.0, "", now),
+                ("run-1", "market_state_stale_no_recent_quote_count", 0.0, "", now),
+                ("run-1", "market_state_stale_quote_age_count", 0.0, "", now),
+                ("run-1", "low_quality_market_count", 4.0, "", now),
+                ("run-1", "low_quality_runtime_excluded_count", 3.0, "", now),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    totals = report["totals"]
+    assert totals["eligible_market_count"] == 0
+    assert totals["min_watched_markets_floor"] == 10
+    assert totals["low_quality_runtime_excluded_count"] == 3
+    assert "no_eligible_markets" in report["warnings"]
+    causes = set(report["no_eligible_market_causes"])
+    assert "watched_too_small" in causes
+    assert "all_markets_recovering" in causes
+    assert "quality_penalty_excessive" in causes

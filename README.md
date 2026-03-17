@@ -1,4 +1,4 @@
-# Polymarket Structure Arb Bot (Shadow Paper Run v12)
+# Polymarket Structure Arb Bot (Shadow Paper Run v13)
 
 Paper-only bot for Polymarket YES/NO complement arbitrage validation.
 
@@ -8,19 +8,25 @@ Paper-only bot for Polymarket YES/NO complement arbitrage validation.
 - Auth/signing/balance/cancel-replace are not implemented.
 - Use only for paper/shadow-paper diagnostics.
 
-## v12 Goal
+## v13 Goal
 
-v12 focuses on reducing **freshness/readiness friction** so shadow runs can approach strategy-evaluable quality.
+v13 focuses on keeping a **stable watched universe** while preserving strict readiness/eligibility gates.
 
 Key targets:
 
-- reduce noisy `market_quote_stale`, `book_not_ready`, `book_recovering`
-- suppress `stale_asset -> resync -> recovering -> block` loops
-- evaluate only truly signal-eligible markets/assets
-- gradually drop low-quality markets from watched universe
-- keep strategy threshold strict (no signal inflation by threshold loosening)
+- avoid `eligible_market_count = 0` lock-in
+- prevent watched markets from collapsing to very small counts
+- separate `watched`, `ready`, and `eligible` concepts
+- keep low-quality penalties, but avoid self-destruction by staged exclusion
+- keep strategy thresholds strict (no signal inflation by threshold loosening)
 
-## Core v12 Changes
+## Core v13 Changes
+
+### Definitions
+
+- `watched market`: monitored in runtime universe (can be warming/recovering).
+- `ready market`: both legs have usable book state for freshness/readiness.
+- `eligible market`: ready market that also passes eligibility gates (update count, freshness state).
 
 ### 1. Freshness State Machine
 
@@ -57,17 +63,27 @@ Key targets:
 - Recovering assets have max dwell via:
   - `runtime.market_recovering_max_ms`
 
-### 5. Runtime Low-Quality Market Exclusion
+### 5. Watched Floor + Selection/Eligibility Separation
 
-- Markets with sustained poor readiness quality accumulate penalty.
-- Refresh can exclude those markets via runtime-only filter (`low_quality_runtime`).
-- Key knobs:
-  - `runtime.low_quality_market_penalty_threshold`
-  - `runtime.low_quality_market_penalty_increment`
-  - `runtime.low_quality_market_penalty_decay`
-  - `runtime.low_quality_market_min_observations`
+- Runtime can keep a minimum watched universe:
+  - `runtime.min_watched_markets_floor`
+- If watched count falls below floor, refresh can backfill watched candidates while keeping strategy eligibility strict.
+- `watched` does not imply `eligible`; not-ready markets can remain watched and continue warming/recovering.
 
-### 6. Summary Count vs Reason Aggregate Alignment
+### 6. Staged Low-Quality Penalty (Healthy -> Degraded -> Candidate -> Excluded)
+
+- Low-quality penalty now uses staged progression instead of one-shot ejection.
+- Exclusion requires sustained deterioration:
+  - `runtime.low_quality_market_exclusion_consecutive_cycles`
+- Stage thresholds are configurable:
+  - `runtime.low_quality_market_degraded_penalty_ratio`
+  - `runtime.low_quality_market_probation_penalty_ratio`
+  - `runtime.low_quality_market_exclusion_candidate_penalty_ratio`
+- Runtime exclusion can be relaxed while watched universe is below floor:
+  - `runtime.watched_floor_relax_runtime_exclusion`
+  - `runtime.watched_floor_relax_activity_filters`
+
+### 7. Summary Count vs Reason Aggregate Alignment
 
 - `market_universe_change_events`:
   - explicit universe-change events (metric event count).
@@ -77,17 +93,28 @@ Key targets:
 - This avoids confusion such as:
   - one universe-change event causing many per-asset resync rows.
 
-### 7. Dashboard / Report Additions
+### 8. Dashboard / Report Additions
 
 Daily report/dashboard now include market-state readiness counters:
 
+- `watched_market_count_current`
 - `ready_market_count`
 - `recovering_market_count`
 - `stale_market_count`
 - `eligible_market_count`
 - `blocked_market_count`
+- `ready_market_ratio`
+- `eligible_market_ratio`
+- `min_watched_markets_floor`
+- `low_quality_runtime_excluded_count`
 
-No-signal reasons now distinguish readiness preconditions more explicitly (for example `book_not_ready_insufficient_updates`).
+`no_eligible_markets` now exposes cause hints:
+
+- `watched_too_small`
+- `all_markets_recovering`
+- `all_markets_not_ready`
+- `all_markets_stale`
+- `quality_penalty_excessive`
 
 Dashboard diagnostics keep strategy/readiness/transport grouping and remain read-only.
 
@@ -156,7 +183,8 @@ Treat run as **close to strategy-evaluable** when:
 
 - watched universe is stable (low churn, low cumulative drift)
 - transport/readiness no-signal reasons trend down materially
-- `eligible_market_count` remains stably positive
+- `watched_market_count_current >= min_watched_markets_floor`
+- `ready_market_ratio` and `eligible_market_ratio` remain stably positive
 - block events are intermittent and clear quickly
 - no-signal distribution is mostly strategy-side (`edge_below_threshold`)
 

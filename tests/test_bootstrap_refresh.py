@@ -1547,6 +1547,9 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
             "market_universe_change_confirmations": 1,
             "low_quality_market_penalty_threshold": 3,
             "low_quality_market_min_observations": 1,
+            "low_quality_market_exclusion_consecutive_cycles": 1,
+            "min_watched_markets_floor": 0,
+            "watched_floor_relax_runtime_exclusion": False,
         },
         market_filters={
             "max_markets_to_watch": 2,
@@ -1570,6 +1573,7 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
     asyncio.run(app.load_markets())
     app.state.market_quality_penalty_by_market["m2"] = 4
     app.state.market_refresh_observed_count["m2"] = 2
+    app.state.market_low_quality_consecutive_cycles["m2"] = 2
 
     asyncio.run(app.refresh_market_universe())
 
@@ -1586,5 +1590,160 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
     ).fetchone()
     assert row is not None
     assert "low_quality_runtime" in str(row[0])
+
+    asyncio.run(app.shutdown())
+
+
+def test_runtime_low_quality_market_not_excluded_on_temporary_deterioration(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_runtime_low_quality_temporary")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "low_quality_market_penalty_threshold": 3,
+            "low_quality_market_min_observations": 1,
+            "low_quality_market_exclusion_consecutive_cycles": 3,
+            "min_watched_markets_floor": 0,
+            "watched_floor_relax_runtime_exclusion": False,
+        },
+        market_filters={
+            "max_markets_to_watch": 2,
+            "min_recent_activity": 0.0,
+            "min_liquidity_proxy": 0.0,
+            "min_volume_24h_proxy": 0.0,
+            "min_days_to_expiry": 0.0,
+            "max_days_to_expiry": 3650.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[[make_raw_market("m1", "yes1", "no1"), make_raw_market("m2", "yes2", "no2")]]
+    )
+
+    asyncio.run(app.load_markets())
+    app.state.market_quality_penalty_by_market["m2"] = 6
+    app.state.market_refresh_observed_count["m2"] = 2
+    app.state.market_low_quality_consecutive_cycles["m2"] = 2
+
+    excluded = app._runtime_low_quality_excluded_market_ids()
+    assert "m2" not in excluded
+
+    app.state.market_low_quality_consecutive_cycles["m2"] = 3
+    excluded = app._runtime_low_quality_excluded_market_ids()
+    assert "m2" in excluded
+    assert "m2" in app.state.market_exclusion_reason_by_market
+
+    asyncio.run(app.shutdown())
+
+
+def test_watched_market_floor_prevents_extreme_universe_shrink(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_watched_floor")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_universe_change_confirmations": 1,
+            "low_quality_market_penalty_threshold": 3,
+            "low_quality_market_min_observations": 1,
+            "low_quality_market_exclusion_consecutive_cycles": 1,
+            "min_watched_markets_floor": 2,
+            "watched_floor_relax_runtime_exclusion": True,
+        },
+        market_filters={
+            "max_markets_to_watch": 3,
+            "min_recent_activity": 0.0,
+            "min_liquidity_proxy": 0.0,
+            "min_volume_24h_proxy": 0.0,
+            "min_days_to_expiry": 0.0,
+            "max_days_to_expiry": 3650.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+                make_raw_market("m2", "yes2", "no2"),
+                make_raw_market("m3", "yes3", "no3"),
+            ],
+            [
+                make_raw_market("m1", "yes1", "no1"),
+                make_raw_market("m2", "yes2", "no2"),
+                make_raw_market("m3", "yes3", "no3"),
+                make_raw_market("m4", "yes4", "no4"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    for market_id in ("m1", "m2", "m3", "m4"):
+        app.state.market_quality_penalty_by_market[market_id] = 8
+        app.state.market_low_quality_consecutive_cycles[market_id] = 2
+        app.state.market_refresh_observed_count[market_id] = 3
+
+    asyncio.run(app.refresh_market_universe())
+
+    assert app.state.watched_markets >= 2
+    assert len(app.markets_by_id) >= 2
+
+    asyncio.run(app.shutdown())
+
+
+def test_market_can_be_watched_while_not_eligible(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_watched_vs_eligible")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+            "market_probation_ms": 0,
+            "market_eligibility_min_quote_updates_per_asset": 3,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    now = datetime.now(tz=UTC)
+    app.state.ws_connected_at = now
+    app.state.subscription_started_at = now - timedelta(seconds=2)
+    app.state.first_quote_received_at = now
+
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    assert app.state.watched_markets == 1
+    assert len(app.markets_by_id) == 1
+    assert "m1" not in app.state.eligible_markets
+    watched_metric = app.sqlite_store.conn.execute(
+        """
+        SELECT metric_value
+        FROM metrics
+        WHERE metric_name = 'market_state_watched_count'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert watched_metric is not None
+    assert int(float(watched_metric[0])) == 1
 
     asyncio.run(app.shutdown())

@@ -13,7 +13,7 @@ from src.clients.book_client import BookClient
 from src.clients.gamma_client import GammaClient
 from src.clients.tick_size_client import TickSizeClient
 from src.clients.ws_client import MarketWebSocketClient
-from src.config.loader import AppConfig, load_app_config
+from src.config.loader import AppConfig, MarketFilterSettings, load_app_config
 from src.domain.book import TickSizeUpdate
 from src.domain.market import BinaryMarket
 from src.domain.position import Position
@@ -55,6 +55,12 @@ MARKET_FRESHNESS_PROBATION = "probation"
 MARKET_FRESHNESS_RECOVERING = "recovering"
 MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE = "stale_no_recent_quote"
 MARKET_FRESHNESS_STALE_QUOTE_AGE = "stale_quote_age"
+
+MARKET_QUALITY_HEALTHY = "healthy"
+MARKET_QUALITY_DEGRADED = "degraded"
+MARKET_QUALITY_PROBATION_EXTENDED = "probation_extended"
+MARKET_QUALITY_EXCLUSION_CANDIDATE = "exclusion_candidate"
+MARKET_QUALITY_EXCLUDED = "excluded"
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -125,6 +131,9 @@ class AppState:
     market_freshness_state_by_market: dict[str, str] = field(default_factory=dict)
     market_freshness_updated_at: dict[str, datetime] = field(default_factory=dict)
     market_quality_penalty_by_market: dict[str, int] = field(default_factory=dict)
+    market_low_quality_consecutive_cycles: dict[str, int] = field(default_factory=dict)
+    market_quality_stage_by_market: dict[str, str] = field(default_factory=dict)
+    market_exclusion_reason_by_market: dict[str, str] = field(default_factory=dict)
     market_refresh_observed_count: dict[str, int] = field(default_factory=dict)
     eligible_markets: set[str] = field(default_factory=set)
     last_no_signal_reason_by_market: dict[str, str] = field(default_factory=dict)
@@ -243,18 +252,139 @@ class PolymarketStructureArbApp:
             previous_asset_ids=previous_asset_ids,
         )
 
+    def _effective_watched_floor(self) -> int:
+        configured_floor = max(0, self.config.settings.runtime.min_watched_markets_floor)
+        max_markets = self.config.settings.market_filters.max_markets_to_watch
+        if max_markets is not None and max_markets > 0:
+            return min(configured_floor, max_markets)
+        return configured_floor
+
+    def _market_quality_stage(
+        self,
+        *,
+        penalty: int,
+        consecutive_bad_cycles: int,
+        excluded: bool,
+    ) -> str:
+        if excluded:
+            return MARKET_QUALITY_EXCLUDED
+        threshold = max(1, self.config.settings.runtime.low_quality_market_penalty_threshold)
+        degraded_cutoff = max(
+            1,
+            int(
+                threshold * max(0.0, self.config.settings.runtime.low_quality_market_degraded_penalty_ratio)
+            ),
+        )
+        probation_cutoff = max(
+            degraded_cutoff,
+            int(
+                threshold
+                * max(0.0, self.config.settings.runtime.low_quality_market_probation_penalty_ratio)
+            ),
+        )
+        candidate_cutoff = max(
+            probation_cutoff,
+            int(
+                threshold
+                * max(
+                    0.0,
+                    self.config.settings.runtime.low_quality_market_exclusion_candidate_penalty_ratio,
+                )
+            ),
+        )
+        exclusion_cycles = max(
+            1,
+            self.config.settings.runtime.low_quality_market_exclusion_consecutive_cycles,
+        )
+        candidate_cycles = max(1, exclusion_cycles - 2)
+        if penalty >= candidate_cutoff and consecutive_bad_cycles >= candidate_cycles:
+            return MARKET_QUALITY_EXCLUSION_CANDIDATE
+        if penalty >= probation_cutoff:
+            return MARKET_QUALITY_PROBATION_EXTENDED
+        if penalty >= degraded_cutoff:
+            return MARKET_QUALITY_DEGRADED
+        return MARKET_QUALITY_HEALTHY
+
+    def _relaxed_market_filters_for_watched_floor(self) -> MarketFilterSettings:
+        relaxed_filters = self.config.settings.market_filters.model_copy(deep=True)
+        if self.config.settings.runtime.watched_floor_relax_activity_filters:
+            relaxed_filters.min_recent_activity = None
+            relaxed_filters.min_liquidity_proxy = None
+            relaxed_filters.min_volume_24h_proxy = None
+            relaxed_filters.require_recent_trade_within_minutes = None
+        return relaxed_filters
+
     def _runtime_low_quality_excluded_market_ids(self) -> set[str]:
         threshold = max(1, self.config.settings.runtime.low_quality_market_penalty_threshold)
         min_observations = max(0, self.config.settings.runtime.low_quality_market_min_observations)
+        exclusion_cycles = max(
+            1,
+            self.config.settings.runtime.low_quality_market_exclusion_consecutive_cycles,
+        )
+        candidate_cutoff = max(
+            threshold,
+            int(
+                threshold
+                * max(
+                    0.0,
+                    self.config.settings.runtime.low_quality_market_exclusion_candidate_penalty_ratio,
+                )
+            ),
+        )
         excluded: set[str] = set()
+        self.state.market_exclusion_reason_by_market = {}
         current_markets = set(self.markets_by_id.keys())
+        watched_floor = self._effective_watched_floor()
+        if (
+            self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+            and len(current_markets) > 0
+            and len(current_markets) <= watched_floor
+        ):
+            for market_id, penalty in self.state.market_quality_penalty_by_market.items():
+                consecutive_bad_cycles = self.state.market_low_quality_consecutive_cycles.get(
+                    market_id,
+                    0,
+                )
+                self.state.market_quality_stage_by_market[market_id] = self._market_quality_stage(
+                    penalty=penalty,
+                    consecutive_bad_cycles=consecutive_bad_cycles,
+                    excluded=False,
+                )
+            return excluded
         for market_id, penalty in self.state.market_quality_penalty_by_market.items():
             observed = self.state.market_refresh_observed_count.get(market_id, 0)
+            consecutive_bad_cycles = self.state.market_low_quality_consecutive_cycles.get(
+                market_id,
+                0,
+            )
+            should_exclude = (
+                observed >= min_observations
+                and penalty >= candidate_cutoff
+                and consecutive_bad_cycles >= exclusion_cycles
+            )
             if observed < min_observations:
+                self.state.market_quality_stage_by_market[market_id] = self._market_quality_stage(
+                    penalty=penalty,
+                    consecutive_bad_cycles=consecutive_bad_cycles,
+                    excluded=False,
+                )
                 continue
             is_current = market_id in current_markets
-            if penalty >= threshold * 2 or (penalty >= threshold and not is_current):
+            can_exclude_current = len(current_markets) > watched_floor
+            if should_exclude and (not is_current or can_exclude_current):
                 excluded.add(market_id)
+                self.state.market_exclusion_reason_by_market[market_id] = (
+                    f"stage={MARKET_QUALITY_EXCLUDED};penalty={penalty};"
+                    f"consecutive_bad_cycles={consecutive_bad_cycles};"
+                    f"observed={observed};is_current={int(is_current)}"
+                )
+                self.state.market_quality_stage_by_market[market_id] = MARKET_QUALITY_EXCLUDED
+                continue
+            self.state.market_quality_stage_by_market[market_id] = self._market_quality_stage(
+                penalty=penalty,
+                consecutive_bad_cycles=consecutive_bad_cycles,
+                excluded=False,
+            )
         return excluded
 
     async def _fetch_market_snapshot(self) -> MarketSnapshot:
@@ -270,6 +400,45 @@ class PolymarketStructureArbApp:
             preferred_market_ids=set(self.markets_by_id.keys()),
             runtime_excluded_market_ids=runtime_excluded_market_ids,
         )
+        watched_floor = self._effective_watched_floor()
+        if watched_floor > 0 and len(extraction.markets) < watched_floor:
+            relaxed_filters = self._relaxed_market_filters_for_watched_floor()
+            relaxed_runtime_excluded_ids = (
+                set()
+                if self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+                else runtime_excluded_market_ids
+            )
+            relaxed_extraction = extract_binary_markets_with_stats(
+                raw_markets=raw_markets,
+                market_filters=relaxed_filters,
+                markets_config=self.config.markets,
+                preferred_market_ids=set(self.markets_by_id.keys()),
+                runtime_excluded_market_ids=relaxed_runtime_excluded_ids,
+            )
+            needed = max(0, watched_floor - len(extraction.markets))
+            existing_market_ids = {market.market_id for market in extraction.markets}
+            supplements = [
+                market
+                for market in relaxed_extraction.markets
+                if market.market_id not in existing_market_ids
+            ][:needed]
+            if supplements:
+                extraction.markets = [*extraction.markets, *supplements]
+                extraction.excluded_counts["watched_floor_backfilled"] = (
+                    extraction.excluded_counts.get("watched_floor_backfilled", 0)
+                    + len(supplements)
+                )
+                self.logger.info(
+                    (
+                        "Watched floor backfill applied floor=%s base=%s added=%s "
+                        "runtime_exclusion_relaxed=%s activity_relaxed=%s"
+                    ),
+                    watched_floor,
+                    len(existing_market_ids),
+                    len(supplements),
+                    self.config.settings.runtime.watched_floor_relax_runtime_exclusion,
+                    self.config.settings.runtime.watched_floor_relax_activity_filters,
+                )
         markets_by_id = {market.market_id: market for market in extraction.markets}
         token_to_market_side: dict[str, tuple[str, str]] = {}
         for market in extraction.markets:
@@ -349,6 +518,21 @@ class PolymarketStructureArbApp:
             for market_id, ts in self.state.market_freshness_updated_at.items()
             if market_id in current_markets
         }
+        self.state.market_low_quality_consecutive_cycles = {
+            market_id: cycles
+            for market_id, cycles in self.state.market_low_quality_consecutive_cycles.items()
+            if market_id in current_markets
+        }
+        self.state.market_quality_stage_by_market = {
+            market_id: stage
+            for market_id, stage in self.state.market_quality_stage_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.market_exclusion_reason_by_market = {
+            market_id: reason
+            for market_id, reason in self.state.market_exclusion_reason_by_market.items()
+            if market_id in current_markets
+        }
         self.state.eligible_markets &= current_markets
         self.state.last_no_signal_reason_by_market = {
             market_id: reason
@@ -397,6 +581,12 @@ class PolymarketStructureArbApp:
             self.state.market_refresh_observed_count[market_id] = (
                 self.state.market_refresh_observed_count.get(market_id, 0) + 1
             )
+            self.state.market_quality_penalty_by_market.setdefault(market_id, 0)
+            self.state.market_low_quality_consecutive_cycles.setdefault(market_id, 0)
+            self.state.market_quality_stage_by_market.setdefault(
+                market_id,
+                MARKET_QUALITY_HEALTHY,
+            )
         self.state.last_signal_at_by_market = {
             market_id: ts
             for market_id, ts in self.state.last_signal_at_by_market.items()
@@ -413,7 +603,7 @@ class PolymarketStructureArbApp:
             (
                 "Loaded raw_markets=%s watched_markets(current/cumulative)=%s/%s "
                 "subscribed_assets(current/cumulative)=%s/%s changed=%s "
-                "added_assets=%s removed_assets=%s universe_limit=%s"
+                "added_assets=%s removed_assets=%s universe_limit=%s watched_floor=%s"
             ),
             snapshot.extraction_raw_market_count,
             self.state.watched_markets,
@@ -424,6 +614,7 @@ class PolymarketStructureArbApp:
             len(added_assets),
             len(removed_assets),
             self.config.settings.market_filters.max_markets_to_watch,
+            self._effective_watched_floor(),
         )
         self.logger.info(
             "Universe thresholds stale_asset_ms=%s book_resync_idle_ms=%s resync_cooldown_ms=%s",
@@ -741,6 +932,7 @@ class PolymarketStructureArbApp:
             "universe_cumulative_subscribed_assets": float(
                 len(self.state.cumulative_subscribed_asset_ids)
             ),
+            "universe_min_watched_markets_floor": float(self._effective_watched_floor()),
         }
         for name, value in metrics.items():
             self.sqlite_store.save_metric(
@@ -942,6 +1134,18 @@ class PolymarketStructureArbApp:
                     "ws_reconnect_reason": self.state.last_ws_reconnect_reason or "",
                 },
             )
+
+        if self.quote_manager.is_market_ready(market.market_id):
+            self._mark_asset_ready(market.yes_token_id)
+            self._mark_asset_ready(market.no_token_id)
+        if (
+            market.yes_token_id in self.state.ready_assets
+            and market.no_token_id in self.state.ready_assets
+        ):
+            self.state.asset_recovering_until.pop(market.yes_token_id, None)
+            self.state.asset_recovering_until.pop(market.no_token_id, None)
+            self.state.asset_recovering_started_at.pop(market.yes_token_id, None)
+            self.state.asset_recovering_started_at.pop(market.no_token_id, None)
 
         if self._is_asset_recovering(
             asset_id=market.yes_token_id,
@@ -2120,10 +2324,11 @@ class PolymarketStructureArbApp:
             return
 
         for asset_id in tracked_assets:
-            if self._is_asset_recovering(asset_id=asset_id, now_utc=now):
-                continue
             if self.quote_manager.is_asset_ready(asset_id):
                 self._mark_asset_ready(asset_id)
+                continue
+            if self._is_asset_recovering(asset_id=asset_id, now_utc=now):
+                continue
         missing_assets: list[str] = []
         missing_assets_by_reason: dict[str, list[str]] = {}
         for asset_id in tracked_assets:
@@ -2183,6 +2388,13 @@ class PolymarketStructureArbApp:
             self.config.settings.runtime.low_quality_market_penalty_increment,
         )
         penalty_decay = max(1, self.config.settings.runtime.low_quality_market_penalty_decay)
+        quality_stage_counts: dict[str, int] = {
+            MARKET_QUALITY_HEALTHY: 0,
+            MARKET_QUALITY_DEGRADED: 0,
+            MARKET_QUALITY_PROBATION_EXTENDED: 0,
+            MARKET_QUALITY_EXCLUSION_CANDIDATE: 0,
+            MARKET_QUALITY_EXCLUDED: 0,
+        }
         for market in self.markets_by_id.values():
             market_state, _ = self._resolve_market_freshness_state(market=market, now_utc=now)
             self._update_market_freshness_state(
@@ -2194,37 +2406,52 @@ class PolymarketStructureArbApp:
             yes_updates, no_updates = self._market_quote_update_counts(market)
             if market_state == MARKET_FRESHNESS_READY:
                 block_eligible_markets.add(market.market_id)
+            current_penalty = self.state.market_quality_penalty_by_market.get(market.market_id, 0)
+            current_bad_cycles = self.state.market_low_quality_consecutive_cycles.get(
+                market.market_id,
+                0,
+            )
             if (
                 market_state == MARKET_FRESHNESS_READY
                 and yes_updates >= min_updates
                 and no_updates >= min_updates
             ):
                 eligible_markets.add(market.market_id)
-                current_penalty = self.state.market_quality_penalty_by_market.get(
-                    market.market_id,
-                    0,
-                )
-                self.state.market_quality_penalty_by_market[market.market_id] = max(
+                updated_penalty = max(
                     0,
                     current_penalty - penalty_decay,
                 )
-                continue
-            current_penalty = self.state.market_quality_penalty_by_market.get(market.market_id, 0)
-            if market_state in {
+                updated_bad_cycles = max(0, current_bad_cycles - 1)
+            elif market_state in {
                 MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE,
                 MARKET_FRESHNESS_STALE_QUOTE_AGE,
-                MARKET_FRESHNESS_RECOVERING,
-                MARKET_FRESHNESS_NOT_READY,
             }:
-                self.state.market_quality_penalty_by_market[market.market_id] = min(
+                updated_penalty = min(
                     penalty_threshold * 3,
                     current_penalty + penalty_increment,
                 )
+                updated_bad_cycles = current_bad_cycles + 1
+            elif market_state in {MARKET_FRESHNESS_RECOVERING, MARKET_FRESHNESS_NOT_READY}:
+                updated_penalty = min(
+                    penalty_threshold * 3,
+                    current_penalty + max(1, penalty_increment // 2),
+                )
+                updated_bad_cycles = current_bad_cycles + 1
             else:
-                self.state.market_quality_penalty_by_market[market.market_id] = max(
+                updated_penalty = max(
                     0,
                     current_penalty - penalty_decay,
                 )
+                updated_bad_cycles = max(0, current_bad_cycles - 1)
+            self.state.market_quality_penalty_by_market[market.market_id] = updated_penalty
+            self.state.market_low_quality_consecutive_cycles[market.market_id] = updated_bad_cycles
+            quality_stage = self._market_quality_stage(
+                penalty=updated_penalty,
+                consecutive_bad_cycles=updated_bad_cycles,
+                excluded=False,
+            )
+            self.state.market_quality_stage_by_market[market.market_id] = quality_stage
+            quality_stage_counts[quality_stage] = quality_stage_counts.get(quality_stage, 0) + 1
         self.state.eligible_markets = eligible_markets
         missing_reasons_by_asset = self.state.last_book_missing_reason_by_asset
         blocking_missing_assets = {
@@ -2325,6 +2552,7 @@ class PolymarketStructureArbApp:
             now_utc=now,
         )
         market_state_metric_map = {
+            "market_state_watched_count": len(self.markets_by_id),
             "market_state_ready_count": market_state_counts.get(MARKET_FRESHNESS_READY, 0),
             "market_state_not_ready_count": market_state_counts.get(MARKET_FRESHNESS_NOT_READY, 0),
             "market_state_probation_count": market_state_counts.get(MARKET_FRESHNESS_PROBATION, 0),
@@ -2340,6 +2568,10 @@ class PolymarketStructureArbApp:
                 0,
             ),
             "market_state_eligible_count": len(eligible_markets),
+            "market_state_ready_ratio": (
+                market_state_counts.get(MARKET_FRESHNESS_READY, 0) / max(1, len(self.markets_by_id))
+            ),
+            "market_state_eligible_ratio": len(eligible_markets) / max(1, len(self.markets_by_id)),
         }
         for metric_name, metric_value in market_state_metric_map.items():
             self.sqlite_store.save_metric(
@@ -2355,6 +2587,25 @@ class PolymarketStructureArbApp:
                     "created_at": now.isoformat(),
                     "metric_name": metric_name,
                     "metric_value": metric_value,
+                    "tracked_markets": len(self.markets_by_id),
+                },
+                now_utc=now,
+            )
+        for stage_name, stage_value in quality_stage_counts.items():
+            metric_name = f"market_quality_stage_{stage_name}_count"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(stage_value),
+                details=f"tracked_markets={len(self.markets_by_id)}",
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": stage_value,
                     "tracked_markets": len(self.markets_by_id),
                 },
                 now_utc=now,
@@ -2378,6 +2629,31 @@ class PolymarketStructureArbApp:
                 "metric_name": "low_quality_market_count",
                 "metric_value": low_quality_market_count,
                 "threshold": penalty_threshold,
+            },
+            now_utc=now,
+        )
+        excluded_runtime_count = len(self.state.market_exclusion_reason_by_market)
+        exclusion_reason_summary = ",".join(
+            f"{market_id}:{reason}"
+            for market_id, reason in sorted(
+                self.state.market_exclusion_reason_by_market.items(),
+                key=lambda item: item[0],
+            )[:5]
+        )
+        self.sqlite_store.save_metric(
+            metric_name="low_quality_runtime_excluded_count",
+            metric_value=float(excluded_runtime_count),
+            details=exclusion_reason_summary,
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "low_quality_runtime_excluded_count",
+                "metric_value": excluded_runtime_count,
+                "details": exclusion_reason_summary,
             },
             now_utc=now,
         )
@@ -3208,13 +3484,14 @@ class PolymarketStructureArbApp:
             (
                 "Run startup universe watched_markets(current/cumulative)=%s/%s "
                 "subscribed_assets(current/cumulative)=%s/%s "
-                "universe_limit=%s stale_asset_ms=%s resync_idle_ms=%s"
+                "universe_limit=%s watched_floor=%s stale_asset_ms=%s resync_idle_ms=%s"
             ),
             self.state.watched_markets,
             len(self.state.cumulative_watched_market_ids),
             self.state.subscribed_assets,
             len(self.state.cumulative_subscribed_asset_ids),
             self.config.settings.market_filters.max_markets_to_watch,
+            self._effective_watched_floor(),
             self.config.settings.runtime.stale_asset_ms,
             self.config.settings.runtime.book_resync_idle_ms,
         )
