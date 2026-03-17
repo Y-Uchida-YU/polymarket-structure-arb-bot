@@ -2417,7 +2417,6 @@ class PolymarketStructureArbApp:
             MARKET_FRESHNESS_STALE_QUOTE_AGE: 0,
         }
         eligible_markets: set[str] = set()
-        block_eligible_markets: set[str] = set()
         min_updates = max(
             0,
             self.config.settings.runtime.market_eligibility_min_quote_updates_per_asset,
@@ -2447,8 +2446,6 @@ class PolymarketStructureArbApp:
             )
             market_state_counts[market_state] = market_state_counts.get(market_state, 0) + 1
             yes_updates, no_updates = self._market_quote_update_counts(market)
-            if market_state == MARKET_FRESHNESS_READY:
-                block_eligible_markets.add(market.market_id)
             current_penalty = self.state.market_quality_penalty_by_market.get(market.market_id, 0)
             current_bad_cycles = self.state.market_low_quality_consecutive_cycles.get(
                 market.market_id,
@@ -2508,20 +2505,11 @@ class PolymarketStructureArbApp:
                 "connection_recovering",
             }
         }
-        blocking_unhealthy_assets = set(effective_stale_assets) | blocking_missing_assets
+        health_unhealthy_assets = set(effective_stale_assets) | blocking_missing_assets
         if connection_recovering:
-            blocking_unhealthy_assets = set()
-        eligible_assets: set[str] = set()
-        for market_id in block_eligible_markets:
-            market = self.markets_by_id.get(market_id)
-            if market is None:
-                continue
-            eligible_assets.add(market.yes_token_id)
-            eligible_assets.add(market.no_token_id)
-        blocking_unhealthy_assets &= eligible_assets
-        unhealthy_assets = set(blocking_unhealthy_assets)
+            health_unhealthy_assets = set()
         tracked_count = max(1, len(tracked_assets))
-        unhealthy_ratio = len(unhealthy_assets) / tracked_count
+        unhealthy_ratio = len(health_unhealthy_assets) / tracked_count
         probation_market_count = market_state_counts.get(MARKET_FRESHNESS_PROBATION, 0)
 
         self.sqlite_store.save_metric(
@@ -2761,9 +2749,7 @@ class PolymarketStructureArbApp:
             )
 
         candidate_unhealthy_assets = (
-            blocking_unhealthy_assets
-            if len(blocking_unhealthy_assets) < len(tracked_assets)
-            else set()
+            health_unhealthy_assets if len(health_unhealthy_assets) < len(tracked_assets) else set()
         )
         if connection_recovering:
             candidate_unhealthy_assets = set()
@@ -2802,7 +2788,7 @@ class PolymarketStructureArbApp:
         candidate_global_reason = self._global_unhealthy_candidate_reason(
             tracked_assets=tracked_assets,
             stale_assets=effective_stale_assets,
-            unhealthy_assets=unhealthy_assets,
+            unhealthy_assets=health_unhealthy_assets,
         )
         if connection_recovering:
             candidate_global_reason = None
