@@ -271,6 +271,8 @@ def test_dashboard_loader_overview_includes_market_state_and_book_not_ready_pref
                 ("run-1", "market_state_stale_no_recent_quote_count", 1.0, "", now),
                 ("run-1", "market_state_stale_quote_age_count", 1.0, "", now),
                 ("run-1", "market_state_eligible_count", 4.0, "", now),
+                ("run-1", "market_state_ready_ratio", 0.45, "", now),
+                ("run-1", "market_state_eligible_ratio", 0.25, "", now),
                 ("run-1", "market_state_blocked_count", 1.0, "", now),
             ],
         )
@@ -285,4 +287,6 @@ def test_dashboard_loader_overview_includes_market_state_and_book_not_ready_pref
     assert overview["recovering_market_count"] == 2.0
     assert overview["stale_market_count"] == 2.0
     assert overview["eligible_market_count"] == 4.0
+    assert overview["ready_market_ratio"] == 0.45
+    assert overview["eligible_market_ratio"] == 0.25
     assert overview["blocked_market_count"] == 1.0

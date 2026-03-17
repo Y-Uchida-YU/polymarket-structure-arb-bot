@@ -134,6 +134,12 @@ class AppState:
     market_low_quality_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     market_quality_stage_by_market: dict[str, str] = field(default_factory=dict)
     market_exclusion_reason_by_market: dict[str, str] = field(default_factory=dict)
+    last_refresh_runtime_excluded_market_ids: set[str] = field(default_factory=set)
+    last_refresh_runtime_excluded_reason_by_market: dict[str, str] = field(
+        default_factory=dict
+    )
+    last_refresh_runtime_excluded_count: int = 0
+    last_refresh_runtime_excluded_at: datetime | None = None
     market_refresh_observed_count: dict[str, int] = field(default_factory=dict)
     eligible_markets: set[str] = field(default_factory=set)
     last_no_signal_reason_by_market: dict[str, str] = field(default_factory=dict)
@@ -272,15 +278,25 @@ class PolymarketStructureArbApp:
         degraded_cutoff = max(
             1,
             int(
-                threshold * max(0.0, self.config.settings.runtime.low_quality_market_degraded_penalty_ratio)
+                threshold
+                * max(
+                    0.0,
+                    self.config.settings.runtime.low_quality_market_degraded_penalty_ratio,
+                )
             ),
         )
         probation_cutoff = max(
             degraded_cutoff,
             int(
                 threshold
-                * max(0.0, self.config.settings.runtime.low_quality_market_probation_penalty_ratio)
+                * max(
+                    0.0,
+                    self.config.settings.runtime.low_quality_market_probation_penalty_ratio,
+                )
             ),
+        )
+        candidate_penalty_ratio = (
+            self.config.settings.runtime.low_quality_market_exclusion_candidate_penalty_ratio
         )
         candidate_cutoff = max(
             probation_cutoff,
@@ -288,7 +304,7 @@ class PolymarketStructureArbApp:
                 threshold
                 * max(
                     0.0,
-                    self.config.settings.runtime.low_quality_market_exclusion_candidate_penalty_ratio,
+                    candidate_penalty_ratio,
                 )
             ),
         )
@@ -314,12 +330,29 @@ class PolymarketStructureArbApp:
             relaxed_filters.require_recent_trade_within_minutes = None
         return relaxed_filters
 
+    def _save_last_refresh_runtime_exclusions(
+        self,
+        *,
+        excluded_market_ids: set[str],
+        reason_by_market: dict[str, str],
+    ) -> None:
+        self.state.last_refresh_runtime_excluded_market_ids = set(excluded_market_ids)
+        self.state.last_refresh_runtime_excluded_reason_by_market = dict(reason_by_market)
+        self.state.last_refresh_runtime_excluded_count = len(excluded_market_ids)
+        self.state.last_refresh_runtime_excluded_at = utc_now()
+
     def _runtime_low_quality_excluded_market_ids(self) -> set[str]:
         threshold = max(1, self.config.settings.runtime.low_quality_market_penalty_threshold)
-        min_observations = max(0, self.config.settings.runtime.low_quality_market_min_observations)
+        min_observations = max(
+            0,
+            self.config.settings.runtime.low_quality_market_min_observations,
+        )
         exclusion_cycles = max(
             1,
             self.config.settings.runtime.low_quality_market_exclusion_consecutive_cycles,
+        )
+        candidate_penalty_ratio = (
+            self.config.settings.runtime.low_quality_market_exclusion_candidate_penalty_ratio
         )
         candidate_cutoff = max(
             threshold,
@@ -327,12 +360,12 @@ class PolymarketStructureArbApp:
                 threshold
                 * max(
                     0.0,
-                    self.config.settings.runtime.low_quality_market_exclusion_candidate_penalty_ratio,
+                    candidate_penalty_ratio,
                 )
             ),
         )
         excluded: set[str] = set()
-        self.state.market_exclusion_reason_by_market = {}
+        exclusion_reason_by_market: dict[str, str] = {}
         current_markets = set(self.markets_by_id.keys())
         watched_floor = self._effective_watched_floor()
         if (
@@ -350,6 +383,11 @@ class PolymarketStructureArbApp:
                     consecutive_bad_cycles=consecutive_bad_cycles,
                     excluded=False,
                 )
+            self.state.market_exclusion_reason_by_market = exclusion_reason_by_market
+            self._save_last_refresh_runtime_exclusions(
+                excluded_market_ids=excluded,
+                reason_by_market=exclusion_reason_by_market,
+            )
             return excluded
         for market_id, penalty in self.state.market_quality_penalty_by_market.items():
             observed = self.state.market_refresh_observed_count.get(market_id, 0)
@@ -373,7 +411,7 @@ class PolymarketStructureArbApp:
             can_exclude_current = len(current_markets) > watched_floor
             if should_exclude and (not is_current or can_exclude_current):
                 excluded.add(market_id)
-                self.state.market_exclusion_reason_by_market[market_id] = (
+                exclusion_reason_by_market[market_id] = (
                     f"stage={MARKET_QUALITY_EXCLUDED};penalty={penalty};"
                     f"consecutive_bad_cycles={consecutive_bad_cycles};"
                     f"observed={observed};is_current={int(is_current)}"
@@ -385,6 +423,11 @@ class PolymarketStructureArbApp:
                 consecutive_bad_cycles=consecutive_bad_cycles,
                 excluded=False,
             )
+        self.state.market_exclusion_reason_by_market = exclusion_reason_by_market
+        self._save_last_refresh_runtime_exclusions(
+            excluded_market_ids=excluded,
+            reason_by_market=exclusion_reason_by_market,
+        )
         return excluded
 
     async def _fetch_market_snapshot(self) -> MarketSnapshot:
@@ -2632,11 +2675,11 @@ class PolymarketStructureArbApp:
             },
             now_utc=now,
         )
-        excluded_runtime_count = len(self.state.market_exclusion_reason_by_market)
+        excluded_runtime_count = self.state.last_refresh_runtime_excluded_count
         exclusion_reason_summary = ",".join(
             f"{market_id}:{reason}"
             for market_id, reason in sorted(
-                self.state.market_exclusion_reason_by_market.items(),
+                self.state.last_refresh_runtime_excluded_reason_by_market.items(),
                 key=lambda item: item[0],
             )[:5]
         )

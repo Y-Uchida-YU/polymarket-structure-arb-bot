@@ -1579,6 +1579,11 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
 
     assert set(app.markets_by_id.keys()) == {"m1"}
     assert app.resubscribe_event.is_set() is False
+    assert "m2" not in app.state.market_exclusion_reason_by_market
+    assert app.state.last_refresh_runtime_excluded_market_ids == {"m2"}
+    assert app.state.last_refresh_runtime_excluded_count == 1
+    assert "m2" in app.state.last_refresh_runtime_excluded_reason_by_market
+    assert app.state.last_refresh_runtime_excluded_at is not None
     row = app.sqlite_store.conn.execute(
         """
         SELECT details
@@ -1590,6 +1595,58 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
     ).fetchone()
     assert row is not None
     assert "low_quality_runtime" in str(row[0])
+
+    asyncio.run(app.shutdown())
+
+
+def test_freshness_metric_uses_last_refresh_runtime_exclusion_state(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_refresh_exclusion_metric_source")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "stale_asset_ms": 60_000,
+            "initial_market_data_grace_ms": 1,
+            "per_asset_book_grace_ms": 1,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.book_client = FakeBookClientNoData()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    now = datetime.now(tz=UTC)
+    app.state.ws_connected_at = now
+    app.state.subscription_started_at = now - timedelta(seconds=2)
+    app.state.first_quote_received_at = now
+    app.state.market_exclusion_reason_by_market = {}
+    app.state.last_refresh_runtime_excluded_market_ids = {"mx"}
+    app.state.last_refresh_runtime_excluded_reason_by_market = {
+        "mx": "stage=excluded;penalty=8"
+    }
+    app.state.last_refresh_runtime_excluded_count = 1
+    app.state.last_refresh_runtime_excluded_at = now
+
+    asyncio.run(app.check_data_freshness_and_resync())
+
+    row = app.sqlite_store.conn.execute(
+        """
+        SELECT metric_value, details
+        FROM metrics
+        WHERE metric_name = 'low_quality_runtime_excluded_count'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None
+    assert int(float(row[0])) == 1
+    assert "mx:stage=excluded;penalty=8" in str(row[1])
 
     asyncio.run(app.shutdown())
 

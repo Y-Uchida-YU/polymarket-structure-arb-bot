@@ -212,15 +212,17 @@ class DailyReportGenerator:
             run_id=run_id,
             metric_name="low_quality_runtime_excluded_count",
         )
-        ready_market_ratio = (
-            ready_market_count / max(1, watched_market_count_current)
-            if watched_market_count_current > 0
-            else 0.0
+        ready_market_ratio = self._latest_metric_float_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_ready_ratio",
         )
-        eligible_market_ratio = (
-            eligible_market_count / max(1, watched_market_count_current)
-            if watched_market_count_current > 0
-            else 0.0
+        eligible_market_ratio = self._latest_metric_float_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="market_state_eligible_ratio",
         )
         readiness_no_signal_total = (
             book_not_ready_count
@@ -238,9 +240,16 @@ class DailyReportGenerator:
             no_eligible_markets_causes.append("watched_too_small")
         if watched_market_count_current < max(1, min_watched_markets_floor):
             no_eligible_markets_causes.append("watched_too_small")
-        if watched_market_count_current > 0 and recovering_market_count >= watched_market_count_current:
+        if (
+            watched_market_count_current > 0
+            and recovering_market_count >= watched_market_count_current
+        ):
             no_eligible_markets_causes.append("all_markets_recovering")
-        if watched_market_count_current > 0 and ready_market_count == 0 and market_not_ready_count > 0:
+        if (
+            watched_market_count_current > 0
+            and ready_market_count == 0
+            and market_not_ready_count > 0
+        ):
             no_eligible_markets_causes.append("all_markets_not_ready")
         if watched_market_count_current > 0 and stale_market_count >= watched_market_count_current:
             no_eligible_markets_causes.append("all_markets_stale")
@@ -1077,6 +1086,23 @@ class DailyReportGenerator:
         run_id: str | None,
         metric_name: str,
     ) -> int:
+        return int(
+            self._latest_metric_float_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+
+    def _latest_metric_float_value(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+    ) -> float:
         query = """
         SELECT metric_value
         FROM metrics
@@ -1101,7 +1127,7 @@ class DailyReportGenerator:
                 fallback_params.append(run_id)
             fallback_query += " ORDER BY created_at DESC LIMIT 1"
             row = conn.execute(fallback_query, fallback_params).fetchone()
-        return int(float(row[0])) if row and row[0] is not None else 0
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     @staticmethod
     def _extract_kv_from_details(details: str, key: str) -> str | None:

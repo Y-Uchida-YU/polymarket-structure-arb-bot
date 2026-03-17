@@ -413,7 +413,10 @@ def test_daily_report_aggregates_book_not_ready_prefix_and_market_state_metrics(
                 ("run-1", "market_state_stale_no_recent_quote_count", 3.0, "", now),
                 ("run-1", "market_state_stale_quote_age_count", 1.0, "", now),
                 ("run-1", "market_state_eligible_count", 5.0, "", now),
+                ("run-1", "market_state_ready_ratio", 0.4, "", now),
+                ("run-1", "market_state_eligible_ratio", 0.3, "", now),
                 ("run-1", "market_state_blocked_count", 1.0, "", now),
+                ("run-1", "universe_current_watched_markets", 2.0, "", now),
             ],
         )
     store.close()
@@ -427,6 +430,8 @@ def test_daily_report_aggregates_book_not_ready_prefix_and_market_state_metrics(
     assert totals["recovering_market_count"] == 2
     assert totals["stale_market_count"] == 4
     assert totals["eligible_market_count"] == 5
+    assert totals["ready_market_ratio"] == 0.4
+    assert totals["eligible_market_ratio"] == 0.3
     assert totals["blocked_market_count"] == 1
 
 
