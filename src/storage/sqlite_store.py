@@ -19,6 +19,7 @@ class SQLiteStore:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._create_tables()
         self._migrate_tables()
+        self._create_indexes()
 
     def _create_tables(self) -> None:
         with self.conn:
@@ -293,6 +294,33 @@ class SQLiteStore:
         self._ensure_column("pnl_snapshots", "projected_matched_pnl", "REAL DEFAULT 0")
         self._ensure_column("pnl_snapshots", "unmatched_inventory_mtm", "REAL DEFAULT 0")
         self._ensure_column("pnl_snapshots", "total_projected_pnl", "REAL DEFAULT 0")
+
+    def _create_indexes(self) -> None:
+        with self.conn:
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_diagnostics_events_run_name_created
+                ON diagnostics_events (run_id, event_name, created_at)
+                """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_diagnostics_events_name_reason_created
+                ON diagnostics_events (event_name, reason, created_at)
+                """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_diagnostics_events_market_created
+                ON diagnostics_events (market_id, created_at)
+                """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_diagnostics_events_asset_created
+                ON diagnostics_events (asset_id, created_at)
+                """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_metrics_run_name_created
+                ON metrics (run_id, metric_name, created_at)
+                """)
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_resync_events_run_reason_created
+                ON resync_events (run_id, reason, created_at)
+                """)
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str) -> None:
         cursor = self.conn.execute(f"PRAGMA table_info({table_name})")

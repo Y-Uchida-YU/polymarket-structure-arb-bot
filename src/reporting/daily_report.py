@@ -225,6 +225,16 @@ class DailyReportGenerator:
             run_id=run_id,
             metric_name="market_state_eligible_ratio",
         )
+        eligibility_gate_breakdown = self._latest_metric_prefix_breakdown(
+            conn,
+            window,
+            run_id=run_id,
+            metric_prefix="eligibility_gate_reason:",
+        )
+        eligibility_gate_reason_map = {
+            str(item.get("reason", "")): int(round(float(item.get("count", 0.0))))
+            for item in eligibility_gate_breakdown
+        }
         readiness_no_signal_total = (
             book_not_ready_count
             + quote_too_old_count
@@ -256,6 +266,29 @@ class DailyReportGenerator:
             no_eligible_markets_causes.append("all_markets_stale")
         if low_quality_runtime_excluded_count >= max(1, watched_market_count_current):
             no_eligible_markets_causes.append("quality_penalty_excessive")
+        if (
+            watched_market_count_current > 0
+            and eligibility_gate_reason_map.get("connection_recovering", 0)
+            >= watched_market_count_current
+        ):
+            no_eligible_markets_causes.append("all_markets_connection_recovering")
+        if (
+            watched_market_count_current > 0
+            and eligibility_gate_reason_map.get("book_recovering", 0)
+            >= watched_market_count_current
+        ):
+            no_eligible_markets_causes.append("all_markets_book_recovering")
+        if (
+            watched_market_count_current > 0
+            and eligibility_gate_reason_map.get("stale_quote_freshness", 0)
+            >= watched_market_count_current
+        ):
+            no_eligible_markets_causes.append("all_markets_stale_freshness")
+        if (
+            watched_market_count_current > 0
+            and eligibility_gate_reason_map.get("blocked", 0) >= watched_market_count_current
+        ):
+            no_eligible_markets_causes.append("all_markets_blocked")
         if eligible_market_count == 0 and not no_eligible_markets_causes:
             no_eligible_markets_causes.append("eligibility_gate_unmet")
         book_no_signal_total = sum(
@@ -371,6 +404,31 @@ class DailyReportGenerator:
                 "eligible_market_count": eligible_market_count,
                 "eligible_market_ratio": eligible_market_ratio,
                 "blocked_market_count": blocked_market_count,
+                "eligibility_gate_connection_recovering_count": eligibility_gate_reason_map.get(
+                    "connection_recovering",
+                    0,
+                ),
+                "eligibility_gate_book_recovering_count": eligibility_gate_reason_map.get(
+                    "book_recovering",
+                    0,
+                ),
+                "eligibility_gate_stale_quote_freshness_count": eligibility_gate_reason_map.get(
+                    "stale_quote_freshness",
+                    0,
+                ),
+                "eligibility_gate_blocked_count": eligibility_gate_reason_map.get("blocked", 0),
+                "eligibility_gate_probation_count": eligibility_gate_reason_map.get(
+                    "probation",
+                    0,
+                ),
+                "eligibility_gate_low_quality_runtime_excluded_count": eligibility_gate_reason_map.get(
+                    "low_quality_runtime_excluded",
+                    0,
+                ),
+                "eligibility_gate_other_readiness_gate_count": eligibility_gate_reason_map.get(
+                    "other_readiness_gate",
+                    0,
+                ),
                 "min_watched_markets_floor": min_watched_markets_floor,
                 "low_quality_market_count": low_quality_market_count,
                 "low_quality_runtime_excluded_count": low_quality_runtime_excluded_count,
@@ -389,6 +447,7 @@ class DailyReportGenerator:
             "ws_connected_reasons": ws_connected_reason_breakdown,
             "no_signal_reasons": no_signal_reasons,
             "missing_book_state_reasons": missing_book_state_reasons,
+            "eligibility_gate_breakdown": eligibility_gate_breakdown,
             "recovery_diagnostics": recovery_diagnostics,
             "top_markets_by_signal_count": top_markets_by_signal,
             "top_markets_by_pnl": top_markets_by_pnl,
@@ -468,6 +527,16 @@ class DailyReportGenerator:
             f"eligible_market_count: {totals['eligible_market_count']}",
             f"eligible_market_ratio: {totals['eligible_market_ratio']:.3f}",
             f"blocked_market_count: {totals['blocked_market_count']}",
+            (
+                "eligibility_gate_breakdown(connection/book/stale/blocked/probation/low_quality/other): "
+                f"{totals.get('eligibility_gate_connection_recovering_count', 0)}/"
+                f"{totals.get('eligibility_gate_book_recovering_count', 0)}/"
+                f"{totals.get('eligibility_gate_stale_quote_freshness_count', 0)}/"
+                f"{totals.get('eligibility_gate_blocked_count', 0)}/"
+                f"{totals.get('eligibility_gate_probation_count', 0)}/"
+                f"{totals.get('eligibility_gate_low_quality_runtime_excluded_count', 0)}/"
+                f"{totals.get('eligibility_gate_other_readiness_gate_count', 0)}"
+            ),
             f"min_watched_markets_floor: {totals['min_watched_markets_floor']}",
             f"low_quality_market_count: {totals['low_quality_market_count']}",
             (
@@ -503,10 +572,23 @@ class DailyReportGenerator:
                 f"{int(recovery.get('recovery_market_ready_success_count', 0))}"
             ),
             (
+                "recovery_blocked(first_quote/book_ready/market_ready): "
+                f"{int(recovery.get('recovery_first_quote_blocked_count', 0))}/"
+                f"{int(recovery.get('recovery_book_ready_blocked_count', 0))}/"
+                f"{int(recovery.get('recovery_market_ready_blocked_count', 0))}"
+            ),
+            (
                 "recovery_success_rate(first/book/market): "
                 f"{float(recovery.get('recovery_first_quote_success_rate', 0.0)):.3f}/"
                 f"{float(recovery.get('recovery_book_ready_success_rate', 0.0)):.3f}/"
                 f"{float(recovery.get('recovery_market_ready_success_rate', 0.0)):.3f}"
+            ),
+            (
+                "recovery_universe_change_funnel(resync/first/book/market): "
+                f"{int(recovery.get('recovery_universe_change_resync_started_count', 0))}/"
+                f"{int(recovery.get('recovery_universe_change_first_quote_success_count', 0))}/"
+                f"{int(recovery.get('recovery_universe_change_book_ready_success_count', 0))}/"
+                f"{int(recovery.get('recovery_universe_change_market_ready_success_count', 0))}"
             ),
         ]
         if report.get("resyncs_by_reason"):
@@ -546,6 +628,30 @@ class DailyReportGenerator:
                 for item in report["missing_book_state_reasons"][:5]
             )
             lines.append(f"top_missing_book_state_reasons: {missing_summary}")
+        if report.get("eligibility_gate_breakdown"):
+            eligibility_summary = ", ".join(
+                f"{item['reason']}={int(float(item['count']))}"
+                for item in report["eligibility_gate_breakdown"][:7]
+            )
+            lines.append(f"eligibility_gate_breakdown: {eligibility_summary}")
+        if recovery.get("first_quote_blocked_reasons"):
+            first_quote_blocked = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["first_quote_blocked_reasons"][:5]
+            )
+            lines.append(f"top_recovery_first_quote_blocked_reasons: {first_quote_blocked}")
+        if recovery.get("book_ready_blocked_reasons"):
+            book_ready_blocked = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["book_ready_blocked_reasons"][:5]
+            )
+            lines.append(f"top_recovery_book_ready_blocked_reasons: {book_ready_blocked}")
+        if recovery.get("market_ready_blocked_reasons"):
+            market_ready_blocked = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["market_ready_blocked_reasons"][:5]
+            )
+            lines.append(f"top_recovery_market_ready_blocked_reasons: {market_ready_blocked}")
         if recovery.get("top_stale_assets"):
             stale_summary = ", ".join(
                 f"{item['asset_id']}={item['count']}" for item in recovery["top_stale_assets"][:5]
@@ -1162,6 +1268,54 @@ class DailyReportGenerator:
             row = conn.execute(fallback_query, fallback_params).fetchone()
         return float(row[0]) if row and row[0] is not None else 0.0
 
+    def _latest_metric_prefix_breakdown(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_prefix: str,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT metric_name, metric_value
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, f"{metric_prefix}%"]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC, id DESC"
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            fallback_query = """
+            SELECT metric_name, metric_value
+            FROM metrics
+            WHERE metric_name LIKE ?
+            """
+            fallback_params: list[object] = [f"{metric_prefix}%"]
+            if run_id is not None:
+                fallback_query += " AND run_id = ?"
+                fallback_params.append(run_id)
+            fallback_query += " ORDER BY created_at DESC, id DESC"
+            rows = conn.execute(fallback_query, fallback_params).fetchall()
+        latest_by_name: dict[str, float] = {}
+        for metric_name, metric_value in rows:
+            key = str(metric_name)
+            if key in latest_by_name:
+                continue
+            latest_by_name[key] = float(metric_value if metric_value is not None else 0.0)
+        breakdown = [
+            {
+                "reason": name.split(":", 1)[1] if ":" in name else name,
+                "count": value,
+            }
+            for name, value in latest_by_name.items()
+        ]
+        breakdown.sort(key=lambda item: float(item.get("count", 0.0)), reverse=True)
+        return breakdown
+
     @staticmethod
     def _extract_kv_from_details(details: str, key: str) -> str | None:
         compact = details.strip()
@@ -1195,15 +1349,34 @@ class DailyReportGenerator:
             "recovery_first_quote_success_count": 0,
             "recovery_book_ready_success_count": 0,
             "recovery_market_ready_success_count": 0,
+            "recovery_market_recovery_started_count": 0,
+            "recovery_first_quote_blocked_count": 0,
+            "recovery_book_ready_blocked_count": 0,
+            "recovery_market_ready_blocked_count": 0,
             "recovery_first_quote_success_rate": 0.0,
             "recovery_book_ready_success_rate": 0.0,
             "recovery_market_ready_success_rate": 0.0,
+            "recovery_stage_denominator": "resync_started_count",
             "avg_resync_to_first_quote_latency_ms": 0.0,
             "max_resync_to_first_quote_latency_ms": 0.0,
             "avg_resync_to_book_ready_latency_ms": 0.0,
             "max_resync_to_book_ready_latency_ms": 0.0,
             "avg_recovery_to_market_ready_latency_ms": 0.0,
             "max_recovery_to_market_ready_latency_ms": 0.0,
+            "first_quote_blocked_reasons": [],
+            "book_ready_blocked_reasons": [],
+            "market_ready_blocked_reasons": [],
+            "eligibility_gate_unmet_reasons": [],
+            "recovery_universe_change_resync_started_count": 0,
+            "recovery_universe_change_first_quote_success_count": 0,
+            "recovery_universe_change_book_ready_success_count": 0,
+            "recovery_universe_change_market_ready_success_count": 0,
+            "recovery_universe_change_first_quote_blocked_count": 0,
+            "recovery_universe_change_book_ready_blocked_count": 0,
+            "recovery_universe_change_market_ready_blocked_count": 0,
+            "recovery_universe_change_first_quote_success_rate": 0.0,
+            "recovery_universe_change_book_ready_success_rate": 0.0,
+            "recovery_universe_change_market_ready_success_rate": 0.0,
             "top_stale_assets": [],
             "top_missing_book_assets": [],
             "top_market_blocked_markets": [],
@@ -1268,21 +1441,48 @@ class DailyReportGenerator:
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         query = """
-        SELECT asset_id, COUNT(*) AS count
-        FROM diagnostics_events
-        WHERE created_at >= ? AND created_at < ?
-          AND event_name = ?
-          AND asset_id IS NOT NULL
-          AND asset_id != ''
+        WITH market_asset AS (
+          SELECT market_id, slug, question, yes_token_id AS asset_id, 'yes' AS side
+          FROM markets
+          UNION ALL
+          SELECT market_id, slug, question, no_token_id AS asset_id, 'no' AS side
+          FROM markets
+        )
+        SELECT
+          d.asset_id,
+          COUNT(*) AS count,
+          MAX(COALESCE(d.market_id, ma.market_id)) AS market_id,
+          MAX(COALESCE(ma.slug, m.slug, '')) AS market_slug,
+          MAX(COALESCE(ma.question, m.question, '')) AS market_question,
+          MAX(COALESCE(ma.side, '')) AS side
+        FROM diagnostics_events d
+        LEFT JOIN market_asset ma
+          ON ma.asset_id = d.asset_id
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = ?
+          AND d.asset_id IS NOT NULL
+          AND d.asset_id != ''
         """
         params: list[object] = [window.start_iso, window.end_iso, event_name]
         if run_id is not None:
-            query += " AND run_id = ?"
+            query += " AND d.run_id = ?"
             params.append(run_id)
-        query += " GROUP BY asset_id ORDER BY count DESC LIMIT ?"
+        query += " GROUP BY d.asset_id ORDER BY count DESC LIMIT ?"
         params.append(int(limit))
         rows = conn.execute(query, params).fetchall()
-        return [{"asset_id": str(row[0]), "count": int(row[1])} for row in rows]
+        return [
+            {
+                "asset_id": str(row[0]),
+                "count": int(row[1]),
+                "market_id": str(row[2]) if row[2] is not None else "",
+                "market_slug": str(row[3]) if row[3] is not None else "",
+                "market_question": str(row[4]) if row[4] is not None else "",
+                "side": str(row[5]) if row[5] is not None else "",
+            }
+            for row in rows
+        ]
 
     def _top_market_counts_for_event(
         self,
@@ -1294,21 +1494,35 @@ class DailyReportGenerator:
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         query = """
-        SELECT market_id, COUNT(*) AS count
-        FROM diagnostics_events
-        WHERE created_at >= ? AND created_at < ?
-          AND event_name = ?
-          AND market_id IS NOT NULL
-          AND market_id != ''
+        SELECT
+          d.market_id,
+          COUNT(*) AS count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = ?
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
         """
         params: list[object] = [window.start_iso, window.end_iso, event_name]
         if run_id is not None:
-            query += " AND run_id = ?"
+            query += " AND d.run_id = ?"
             params.append(run_id)
-        query += " GROUP BY market_id ORDER BY count DESC LIMIT ?"
+        query += " GROUP BY d.market_id ORDER BY count DESC LIMIT ?"
         params.append(int(limit))
         rows = conn.execute(query, params).fetchall()
-        return [{"market_id": str(row[0]), "count": int(row[1])} for row in rows]
+        return [
+            {
+                "market_id": str(row[0]),
+                "count": int(row[1]),
+                "market_slug": str(row[2]) if row[2] is not None else "",
+                "market_question": str(row[3]) if row[3] is not None else "",
+            }
+            for row in rows
+        ]
 
     def _top_slow_assets(
         self,
@@ -1319,19 +1533,41 @@ class DailyReportGenerator:
     ) -> list[dict[str, Any]]:
         def _query(event_name: str) -> list[tuple[object, object, object, object]]:
             query = """
-            SELECT asset_id, AVG(latency_ms), MAX(latency_ms), COUNT(*)
-            FROM diagnostics_events
-            WHERE created_at >= ? AND created_at < ?
-              AND event_name = ?
-              AND latency_ms IS NOT NULL
-              AND asset_id IS NOT NULL
-              AND asset_id != ''
+            WITH market_asset AS (
+              SELECT market_id, slug, question, yes_token_id AS asset_id, 'yes' AS side
+              FROM markets
+              UNION ALL
+              SELECT market_id, slug, question, no_token_id AS asset_id, 'no' AS side
+              FROM markets
+            )
+            SELECT
+              d.asset_id,
+              AVG(d.latency_ms),
+              MAX(d.latency_ms),
+              COUNT(*),
+              MAX(COALESCE(d.market_id, ma.market_id)),
+              MAX(COALESCE(ma.slug, m.slug, '')),
+              MAX(COALESCE(ma.question, m.question, '')),
+              MAX(COALESCE(ma.side, ''))
+            FROM diagnostics_events d
+            LEFT JOIN market_asset ma
+              ON ma.asset_id = d.asset_id
+            LEFT JOIN markets m
+              ON m.market_id = d.market_id
+            WHERE d.created_at >= ? AND d.created_at < ?
+              AND d.event_name = ?
+              AND d.latency_ms IS NOT NULL
+              AND d.asset_id IS NOT NULL
+              AND d.asset_id != ''
             """
             params: list[object] = [window.start_iso, window.end_iso, event_name]
             if run_id is not None:
-                query += " AND run_id = ?"
+                query += " AND d.run_id = ?"
                 params.append(run_id)
-            query += " GROUP BY asset_id ORDER BY MAX(latency_ms) DESC, AVG(latency_ms) DESC LIMIT 5"
+            query += (
+                " GROUP BY d.asset_id ORDER BY MAX(d.latency_ms) DESC, "
+                "AVG(d.latency_ms) DESC LIMIT 5"
+            )
             return conn.execute(query, params).fetchall()
 
         rows = _query("book_ready_after_resync")
@@ -1343,6 +1579,10 @@ class DailyReportGenerator:
                 "avg_latency_ms": float(row[1] if row[1] is not None else 0.0),
                 "max_latency_ms": float(row[2] if row[2] is not None else 0.0),
                 "success_count": int(row[3] if row[3] is not None else 0),
+                "market_id": str(row[4]) if row[4] is not None else "",
+                "market_slug": str(row[5]) if row[5] is not None else "",
+                "market_question": str(row[6]) if row[6] is not None else "",
+                "side": str(row[7]) if row[7] is not None else "",
             }
             for row in rows
         ]
@@ -1355,19 +1595,30 @@ class DailyReportGenerator:
         run_id: str | None,
     ) -> list[dict[str, Any]]:
         query = """
-        SELECT market_id, AVG(latency_ms), MAX(latency_ms), COUNT(*)
-        FROM diagnostics_events
-        WHERE created_at >= ? AND created_at < ?
-          AND event_name = 'market_ready_after_recovery'
-          AND latency_ms IS NOT NULL
-          AND market_id IS NOT NULL
-          AND market_id != ''
+        SELECT
+          d.market_id,
+          AVG(d.latency_ms),
+          MAX(d.latency_ms),
+          COUNT(*),
+          MAX(COALESCE(m.slug, '')),
+          MAX(COALESCE(m.question, ''))
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_ready_after_recovery'
+          AND d.latency_ms IS NOT NULL
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
         """
         params: list[object] = [window.start_iso, window.end_iso]
         if run_id is not None:
-            query += " AND run_id = ?"
+            query += " AND d.run_id = ?"
             params.append(run_id)
-        query += " GROUP BY market_id ORDER BY MAX(latency_ms) DESC, AVG(latency_ms) DESC LIMIT 5"
+        query += (
+            " GROUP BY d.market_id ORDER BY MAX(d.latency_ms) DESC, "
+            "AVG(d.latency_ms) DESC LIMIT 5"
+        )
         rows = conn.execute(query, params).fetchall()
         return [
             {
@@ -1375,6 +1626,84 @@ class DailyReportGenerator:
                 "avg_latency_ms": float(row[1] if row[1] is not None else 0.0),
                 "max_latency_ms": float(row[2] if row[2] is not None else 0.0),
                 "success_count": int(row[3] if row[3] is not None else 0),
+                "market_slug": str(row[4]) if row[4] is not None else "",
+                "market_question": str(row[5]) if row[5] is not None else "",
+            }
+            for row in rows
+        ]
+
+    def _count_diagnostics_event_with_reason(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_name: str,
+        reason: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+          AND reason = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name, reason]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_diagnostics_event_with_details_like(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_name: str,
+        details_like: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+          AND details LIKE ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name, details_like]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _diagnostics_reasons_for_event(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_name: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT reason, COUNT(*) AS count
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY reason ORDER BY count DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "reason": str(row[0]) if row[0] is not None else "unknown",
+                "count": int(row[1] if row[1] is not None else 0),
             }
             for row in rows
         ]
@@ -1419,6 +1748,24 @@ class DailyReportGenerator:
                 run_id=run_id,
                 event_name="market_ready_after_recovery",
             )
+            first_quote_blocked_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="first_quote_after_resync_blocked",
+            )
+            book_ready_blocked_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="book_ready_after_resync_blocked",
+            )
+            market_ready_blocked_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_ready_after_recovery_blocked",
+            )
             first_avg_ms, first_max_ms = self._diagnostics_latency_stats(
                 conn,
                 window,
@@ -1437,12 +1784,64 @@ class DailyReportGenerator:
                 run_id=run_id,
                 event_name="market_ready_after_recovery",
             )
-            market_rate_denominator = market_recovery_started_count or resync_started_count
+            universe_resync_started_count = self._count_diagnostics_event_with_reason(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="resync_started",
+                reason="market_universe_changed",
+            )
+            universe_first_quote_success_count = self._count_diagnostics_event_with_reason(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="first_quote_after_resync",
+                reason="market_universe_changed",
+            )
+            universe_book_ready_success_count = self._count_diagnostics_event_with_reason(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="book_ready_after_resync",
+                reason="market_universe_changed",
+            )
+            universe_market_ready_success_count = self._count_diagnostics_event_with_reason(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_ready_after_recovery",
+                reason="market_universe_changed",
+            )
+            universe_first_quote_blocked_count = self._count_diagnostics_event_with_details_like(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="first_quote_after_resync_blocked",
+                details_like="%recovery_reason=market_universe_changed%",
+            )
+            universe_book_ready_blocked_count = self._count_diagnostics_event_with_details_like(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="book_ready_after_resync_blocked",
+                details_like="%recovery_reason=market_universe_changed%",
+            )
+            universe_market_ready_blocked_count = self._count_diagnostics_event_with_details_like(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_ready_after_recovery_blocked",
+                details_like="%recovery_reason=market_universe_changed%",
+            )
             return {
                 "recovery_resync_started_count": resync_started_count,
                 "recovery_first_quote_success_count": first_quote_success_count,
                 "recovery_book_ready_success_count": book_ready_success_count,
                 "recovery_market_ready_success_count": market_ready_success_count,
+                "recovery_market_recovery_started_count": market_recovery_started_count,
+                "recovery_first_quote_blocked_count": first_quote_blocked_count,
+                "recovery_book_ready_blocked_count": book_ready_blocked_count,
+                "recovery_market_ready_blocked_count": market_ready_blocked_count,
                 "recovery_first_quote_success_rate": (
                     first_quote_success_count / resync_started_count
                     if resync_started_count > 0
@@ -1454,16 +1853,63 @@ class DailyReportGenerator:
                     else 0.0
                 ),
                 "recovery_market_ready_success_rate": (
-                    market_ready_success_count / market_rate_denominator
-                    if market_rate_denominator > 0
+                    market_ready_success_count / resync_started_count
+                    if resync_started_count > 0
                     else 0.0
                 ),
+                "recovery_stage_denominator": "resync_started_count",
                 "avg_resync_to_first_quote_latency_ms": first_avg_ms,
                 "max_resync_to_first_quote_latency_ms": first_max_ms,
                 "avg_resync_to_book_ready_latency_ms": book_avg_ms,
                 "max_resync_to_book_ready_latency_ms": book_max_ms,
                 "avg_recovery_to_market_ready_latency_ms": market_avg_ms,
                 "max_recovery_to_market_ready_latency_ms": market_max_ms,
+                "first_quote_blocked_reasons": self._diagnostics_reasons_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="first_quote_after_resync_blocked",
+                ),
+                "book_ready_blocked_reasons": self._diagnostics_reasons_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="book_ready_after_resync_blocked",
+                ),
+                "market_ready_blocked_reasons": self._diagnostics_reasons_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery_blocked",
+                ),
+                "eligibility_gate_unmet_reasons": self._diagnostics_reasons_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="eligibility_gate_unmet",
+                ),
+                "recovery_universe_change_resync_started_count": universe_resync_started_count,
+                "recovery_universe_change_first_quote_success_count": universe_first_quote_success_count,
+                "recovery_universe_change_book_ready_success_count": universe_book_ready_success_count,
+                "recovery_universe_change_market_ready_success_count": universe_market_ready_success_count,
+                "recovery_universe_change_first_quote_blocked_count": universe_first_quote_blocked_count,
+                "recovery_universe_change_book_ready_blocked_count": universe_book_ready_blocked_count,
+                "recovery_universe_change_market_ready_blocked_count": universe_market_ready_blocked_count,
+                "recovery_universe_change_first_quote_success_rate": (
+                    universe_first_quote_success_count / universe_resync_started_count
+                    if universe_resync_started_count > 0
+                    else 0.0
+                ),
+                "recovery_universe_change_book_ready_success_rate": (
+                    universe_book_ready_success_count / universe_resync_started_count
+                    if universe_resync_started_count > 0
+                    else 0.0
+                ),
+                "recovery_universe_change_market_ready_success_rate": (
+                    universe_market_ready_success_count / universe_resync_started_count
+                    if universe_resync_started_count > 0
+                    else 0.0
+                ),
                 "top_stale_assets": self._top_asset_counts_for_event(
                     conn,
                     window,

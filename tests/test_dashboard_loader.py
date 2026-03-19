@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from src.domain.market import BinaryMarket
 from src.dashboard.data_loader import DashboardDataLoader, resolve_window
+from src.reporting.daily_report import DailyReportGenerator
 from src.storage.sqlite_store import SQLiteStore
 
 
@@ -278,6 +280,13 @@ def test_dashboard_loader_overview_includes_market_state_and_book_not_ready_pref
                 ("run-1", "market_state_ready_ratio", 0.45, "", now),
                 ("run-1", "market_state_eligible_ratio", 0.25, "", now),
                 ("run-1", "market_state_blocked_count", 1.0, "", now),
+                ("run-1", "eligibility_gate_reason:connection_recovering", 2.0, "", now),
+                ("run-1", "eligibility_gate_reason:book_recovering", 3.0, "", now),
+                ("run-1", "eligibility_gate_reason:stale_quote_freshness", 1.0, "", now),
+                ("run-1", "eligibility_gate_reason:blocked", 0.0, "", now),
+                ("run-1", "eligibility_gate_reason:probation", 0.0, "", now),
+                ("run-1", "eligibility_gate_reason:low_quality_runtime_excluded", 4.0, "", now),
+                ("run-1", "eligibility_gate_reason:other_readiness_gate", 5.0, "", now),
             ],
         )
     store.close()
@@ -294,6 +303,11 @@ def test_dashboard_loader_overview_includes_market_state_and_book_not_ready_pref
     assert overview["ready_market_ratio"] == 0.45
     assert overview["eligible_market_ratio"] == 0.25
     assert overview["blocked_market_count"] == 1.0
+    assert overview["eligibility_gate_connection_recovering_count"] == 2.0
+    assert overview["eligibility_gate_book_recovering_count"] == 3.0
+    assert overview["eligibility_gate_stale_quote_freshness_count"] == 1.0
+    assert overview["eligibility_gate_low_quality_runtime_excluded_count"] == 4.0
+    assert overview["eligibility_gate_other_readiness_gate_count"] == 5.0
 
 
 def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
@@ -311,10 +325,86 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
             [
                 ("run-1", "resync_started", "a1", "m1", "missing_book_state", None, "", now),
                 ("run-1", "resync_started", "a2", "m1", "missing_book_state", None, "", now),
-                ("run-1", "first_quote_after_resync", "a1", "m1", "missing_book_state", 100.0, "", now),
-                ("run-1", "book_ready_after_resync", "a1", "m1", "missing_book_state", 250.0, "", now),
-                ("run-1", "market_recovery_started", None, "m1", "missing_book_state", None, "", now),
-                ("run-1", "market_ready_after_recovery", None, "m1", "missing_book_state", 900.0, "", now),
+                (
+                    "run-1",
+                    "first_quote_after_resync",
+                    "a1",
+                    "m1",
+                    "missing_book_state",
+                    100.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "book_ready_after_resync",
+                    "a1",
+                    "m1",
+                    "missing_book_state",
+                    250.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_recovery_started",
+                    None,
+                    "m1",
+                    "missing_book_state",
+                    None,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m1",
+                    "missing_book_state",
+                    900.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "first_quote_after_resync_blocked",
+                    "a2",
+                    "m1",
+                    "connection_recovering",
+                    120.0,
+                    "recovery_reason=missing_book_state",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "book_ready_after_resync_blocked",
+                    "a2",
+                    "m1",
+                    "book_recovering",
+                    80.0,
+                    "recovery_reason=missing_book_state",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery_blocked",
+                    None,
+                    "m1",
+                    "market_not_ready",
+                    70.0,
+                    "recovery_reason=missing_book_state",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "eligibility_gate_unmet",
+                    None,
+                    "m1",
+                    "book_not_ready",
+                    None,
+                    "category=other_readiness_gate",
+                    now,
+                ),
                 ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
                 ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
                 (
@@ -327,7 +417,16 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                     "",
                     now,
                 ),
-                ("run-1", "market_block_entered", None, "m1", "book_state_unhealthy", None, "", now),
+                (
+                    "run-1",
+                    "market_block_entered",
+                    None,
+                    "m1",
+                    "book_state_unhealthy",
+                    None,
+                    "",
+                    now,
+                ),
             ],
         )
     store.close()
@@ -341,8 +440,15 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert recovery["recovery_book_ready_success_count"] == 1.0
     assert recovery["recovery_market_ready_success_count"] == 1.0
     assert recovery["recovery_first_quote_success_rate"] == 0.5
+    assert recovery["recovery_market_ready_success_rate"] == 0.5
+    assert recovery["recovery_first_quote_blocked_count"] == 1.0
+    assert recovery["recovery_book_ready_blocked_count"] == 1.0
+    assert recovery["recovery_market_ready_blocked_count"] == 1.0
     assert recovery["avg_resync_to_first_quote_latency_ms"] == 100.0
     assert recovery["avg_recovery_to_market_ready_latency_ms"] == 900.0
+    assert not recovery["first_quote_blocked_reasons"].empty
+    assert str(recovery["first_quote_blocked_reasons"].iloc[0]["reason"]) == "connection_recovering"
+    assert not recovery["eligibility_gate_unmet_reasons"].empty
     top_stale_assets = recovery["top_stale_assets"]
     assert not top_stale_assets.empty
     assert str(top_stale_assets.iloc[0]["asset_id"]) == "a1"
