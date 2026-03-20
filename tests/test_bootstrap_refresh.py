@@ -408,34 +408,26 @@ def test_recovery_diagnostics_records_funnel_events_once_per_cycle(tmp_path: Pat
     asyncio.run(app.handle_ws_message(yes_payload))
     asyncio.run(app.handle_ws_message(no_payload))
 
-    resync_started = app.sqlite_store.conn.execute(
-        """
+    resync_started = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM diagnostics_events
         WHERE event_name = 'resync_started'
-        """
-    ).fetchone()
-    first_quote = app.sqlite_store.conn.execute(
-        """
+        """).fetchone()
+    first_quote = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM diagnostics_events
         WHERE event_name = 'first_quote_after_resync'
-        """
-    ).fetchone()
-    book_ready = app.sqlite_store.conn.execute(
-        """
+        """).fetchone()
+    book_ready = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM diagnostics_events
         WHERE event_name = 'book_ready_after_resync'
-        """
-    ).fetchone()
-    market_ready = app.sqlite_store.conn.execute(
-        """
+        """).fetchone()
+    market_ready = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM diagnostics_events
         WHERE event_name = 'market_ready_after_recovery'
-        """
-    ).fetchone()
+        """).fetchone()
     assert int(resync_started[0] if resync_started else 0) == 2
     assert int(first_quote[0] if first_quote else 0) == 2
     assert int(book_ready[0] if book_ready else 0) == 2
@@ -508,20 +500,16 @@ def test_recovery_diagnostics_first_quote_and_book_ready_increment_on_new_cycle(
     asyncio.run(app.handle_ws_message(yes_payload))
     asyncio.run(app.handle_ws_message(yes_payload))
 
-    first_quote = app.sqlite_store.conn.execute(
-        """
+    first_quote = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM diagnostics_events
         WHERE event_name = 'first_quote_after_resync'
-        """
-    ).fetchone()
-    book_ready = app.sqlite_store.conn.execute(
-        """
+        """).fetchone()
+    book_ready = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM diagnostics_events
         WHERE event_name = 'book_ready_after_resync'
-        """
-    ).fetchone()
+        """).fetchone()
     assert int(first_quote[0] if first_quote else 0) == 2
     assert int(book_ready[0] if book_ready else 0) == 2
 
@@ -1575,13 +1563,11 @@ def test_market_no_signal_reason_cooldown_suppresses_repeated_market_not_ready_l
     asyncio.run(app.handle_ws_message(yes_payload))
     asyncio.run(app.handle_ws_message(yes_payload))
 
-    row = app.sqlite_store.conn.execute(
-        """
+    row = app.sqlite_store.conn.execute("""
         SELECT COUNT(*)
         FROM metrics
         WHERE metric_name = 'no_signal_reason:market_not_ready'
-        """
-    ).fetchone()
+        """).fetchone()
     assert int(row[0] if row else 0) == 1
 
     asyncio.run(app.shutdown())
@@ -1770,15 +1756,13 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
     assert app.state.last_refresh_runtime_excluded_count == 1
     assert "m2" in app.state.last_refresh_runtime_excluded_reason_by_market
     assert app.state.last_refresh_runtime_excluded_at is not None
-    row = app.sqlite_store.conn.execute(
-        """
+    row = app.sqlite_store.conn.execute("""
         SELECT details
         FROM metrics
         WHERE metric_name = 'market_filter_exclusion_summary'
         ORDER BY created_at DESC
         LIMIT 1
-        """
-    ).fetchone()
+        """).fetchone()
     assert row is not None
     assert "low_quality_runtime" in str(row[0])
 
@@ -1813,23 +1797,19 @@ def test_freshness_metric_uses_last_refresh_runtime_exclusion_state(tmp_path: Pa
     app.state.first_quote_received_at = now
     app.state.market_exclusion_reason_by_market = {}
     app.state.last_refresh_runtime_excluded_market_ids = {"mx"}
-    app.state.last_refresh_runtime_excluded_reason_by_market = {
-        "mx": "stage=excluded;penalty=8"
-    }
+    app.state.last_refresh_runtime_excluded_reason_by_market = {"mx": "stage=excluded;penalty=8"}
     app.state.last_refresh_runtime_excluded_count = 1
     app.state.last_refresh_runtime_excluded_at = now
 
     asyncio.run(app.check_data_freshness_and_resync())
 
-    row = app.sqlite_store.conn.execute(
-        """
+    row = app.sqlite_store.conn.execute("""
         SELECT metric_value, details
         FROM metrics
         WHERE metric_name = 'low_quality_runtime_excluded_count'
         ORDER BY created_at DESC
         LIMIT 1
-        """
-    ).fetchone()
+        """).fetchone()
     assert row is not None
     assert int(float(row[0])) == 1
     assert "mx:stage=excluded;penalty=8" in str(row[1])
@@ -1977,15 +1957,13 @@ def test_market_can_be_watched_while_not_eligible(tmp_path: Path) -> None:
     assert app.state.watched_markets == 1
     assert len(app.markets_by_id) == 1
     assert "m1" not in app.state.eligible_markets
-    watched_metric = app.sqlite_store.conn.execute(
-        """
+    watched_metric = app.sqlite_store.conn.execute("""
         SELECT metric_value
         FROM metrics
         WHERE metric_name = 'market_state_watched_count'
         ORDER BY created_at DESC
         LIMIT 1
-        """
-    ).fetchone()
+        """).fetchone()
     assert watched_metric is not None
     assert int(float(watched_metric[0])) == 1
 

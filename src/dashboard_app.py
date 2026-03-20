@@ -117,7 +117,9 @@ def _evaluation_status(
     stale_market_count = float(overview.get("stale_market_count", 0.0))
     eligible_market_count = float(overview.get("eligible_market_count", 0.0))
     eligible_market_ratio = float(overview.get("eligible_market_ratio", 0.0))
-    low_quality_runtime_excluded_count = float(overview.get("low_quality_runtime_excluded_count", 0.0))
+    low_quality_runtime_excluded_count = float(
+        overview.get("low_quality_runtime_excluded_count", 0.0)
+    )
     readiness_friction_count = (
         float(overview.get("book_not_ready_count", 0.0))
         + float(overview.get("quote_too_old_count", 0.0))
@@ -153,7 +155,10 @@ def _evaluation_status(
         or blocking_ratio >= 0.5
         or (watched_markets_current > 0 and eligible_market_count <= 0)
         or (watched_markets_current > 0 and watched_markets_current < max(1.0, min_watched_floor))
-        or (watched_markets_current > 0 and low_quality_runtime_excluded_count >= watched_markets_current)
+        or (
+            watched_markets_current > 0
+            and low_quality_runtime_excluded_count >= watched_markets_current
+        )
         or stale_market_count > max(5.0, ready_market_count)
     )
     if not_ready:
@@ -181,6 +186,12 @@ def _no_eligible_causes(overview: dict[str, float]) -> list[str]:
     eligible_markets = int(float(overview.get("eligible_market_count", 0.0)))
     market_not_ready = int(float(overview.get("market_not_ready_count", 0.0)))
     low_quality_excluded = int(float(overview.get("low_quality_runtime_excluded_count", 0.0)))
+    gate_connection_recovering = int(
+        float(overview.get("eligibility_gate_connection_recovering_count", 0.0))
+    )
+    gate_book_recovering = int(float(overview.get("eligibility_gate_book_recovering_count", 0.0)))
+    gate_stale = int(float(overview.get("eligibility_gate_stale_quote_freshness_count", 0.0)))
+    gate_blocked = int(float(overview.get("eligibility_gate_blocked_count", 0.0)))
 
     causes: list[str] = []
     if watched_markets < max(1, min_floor):
@@ -193,6 +204,14 @@ def _no_eligible_causes(overview: dict[str, float]) -> list[str]:
         causes.append("all_markets_stale")
     if watched_markets > 0 and low_quality_excluded >= watched_markets:
         causes.append("quality_penalty_excessive")
+    if watched_markets > 0 and gate_connection_recovering >= watched_markets:
+        causes.append("all_markets_connection_recovering")
+    if watched_markets > 0 and gate_book_recovering >= watched_markets:
+        causes.append("all_markets_book_recovering")
+    if watched_markets > 0 and gate_stale >= watched_markets:
+        causes.append("all_markets_stale_freshness")
+    if watched_markets > 0 and gate_blocked >= watched_markets:
+        causes.append("all_markets_blocked")
     if eligible_markets <= 0 and not causes:
         causes.append("eligibility_gate_unmet")
     return sorted(set(causes))
@@ -274,6 +293,32 @@ def _overview_section(
     col34.metric(
         "Runtime Excluded",
         int(overview["low_quality_runtime_excluded_count"]),
+    )
+
+    col35, col36, col37, col38 = st.columns(4)
+    col35.metric(
+        "Gate: Conn Recovering",
+        int(overview["eligibility_gate_connection_recovering_count"]),
+    )
+    col36.metric(
+        "Gate: Book Recovering",
+        int(overview["eligibility_gate_book_recovering_count"]),
+    )
+    col37.metric(
+        "Gate: Stale/Freshness",
+        int(overview["eligibility_gate_stale_quote_freshness_count"]),
+    )
+    col38.metric(
+        "Gate: Other Readiness",
+        int(overview["eligibility_gate_other_readiness_gate_count"]),
+    )
+
+    col39, col40, col41 = st.columns(3)
+    col39.metric("Gate: Blocked", int(overview["eligibility_gate_blocked_count"]))
+    col40.metric("Gate: Probation", int(overview["eligibility_gate_probation_count"]))
+    col41.metric(
+        "Gate: Low-Quality Excluded",
+        int(overview["eligibility_gate_low_quality_runtime_excluded_count"]),
     )
 
     st.caption(
@@ -400,6 +445,15 @@ def _diagnostics_section(
             view = no_signals[["reason", "count"]]
             st.bar_chart(view.set_index("reason")["count"], use_container_width=True)
             st.dataframe(view, use_container_width=True, hide_index=True)
+    with col4:
+        st.markdown("**Eligibility Gate Breakdown (Latest Snapshot)**")
+        eligibility = breakdowns["eligibility_gate_breakdown"]
+        if eligibility.empty:
+            st.write("No data.")
+        else:
+            view = eligibility[["reason", "count"]]
+            st.bar_chart(view.set_index("reason")["count"], use_container_width=True)
+            st.dataframe(view, use_container_width=True, hide_index=True)
 
     col5, col6 = st.columns(2)
     with col5:
@@ -450,15 +504,15 @@ def _diagnostics_section(
         if not grouped_pivot.empty:
             st.markdown("**Reason Group Mix (Strategy vs Readiness vs Transport/Other)**")
             st.area_chart(grouped_pivot, use_container_width=True)
-    with col4:
-        st.markdown("**Missing Book State Reasons**")
-        missing = breakdowns["missing_book_state_reasons"]
-        if missing.empty:
-            st.write("No data.")
-        else:
-            view = missing[["reason", "count"]]
-            st.bar_chart(view.set_index("reason")["count"], use_container_width=True)
-            st.dataframe(view, use_container_width=True, hide_index=True)
+
+    st.markdown("**Missing Book State Reasons**")
+    missing = breakdowns["missing_book_state_reasons"]
+    if missing.empty:
+        st.write("No data.")
+    else:
+        view = missing[["reason", "count"]]
+        st.bar_chart(view.set_index("reason")["count"], use_container_width=True)
+        st.dataframe(view, use_container_width=True, hide_index=True)
 
 
 def _pnl_section(pnl_series: pd.DataFrame, timezone: ZoneInfo) -> None:
@@ -496,36 +550,86 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         int(float(recovery.get("recovery_market_ready_success_count", 0.0))),
     )
 
-    col5, col6, col7 = st.columns(3)
+    col5, col6, col7, col8 = st.columns(4)
     col5.metric(
+        "First Quote Blocked",
+        int(float(recovery.get("recovery_first_quote_blocked_count", 0.0))),
+    )
+    col6.metric(
+        "Book Ready Blocked",
+        int(float(recovery.get("recovery_book_ready_blocked_count", 0.0))),
+    )
+    col7.metric(
+        "Market Ready Blocked",
+        int(float(recovery.get("recovery_market_ready_blocked_count", 0.0))),
+    )
+    col8.metric(
+        "Market Recovery Started",
+        int(float(recovery.get("recovery_market_recovery_started_count", 0.0))),
+    )
+
+    col9, col10, col11 = st.columns(3)
+    col9.metric(
         "First Quote Success Rate",
         f"{float(recovery.get('recovery_first_quote_success_rate', 0.0)):.2%}",
     )
-    col6.metric(
+    col10.metric(
         "Book Ready Success Rate",
         f"{float(recovery.get('recovery_book_ready_success_rate', 0.0)):.2%}",
     )
-    col7.metric(
+    col11.metric(
         "Market Ready Success Rate",
         f"{float(recovery.get('recovery_market_ready_success_rate', 0.0)):.2%}",
     )
 
-    col8, col9, col10 = st.columns(3)
-    col8.metric(
+    col12, col13, col14, col15 = st.columns(4)
+    col12.metric(
+        "UC Resync Started",
+        int(float(recovery.get("recovery_universe_change_resync_started_count", 0.0))),
+    )
+    col13.metric(
+        "UC First Quote Success",
+        int(float(recovery.get("recovery_universe_change_first_quote_success_count", 0.0))),
+    )
+    col14.metric(
+        "UC Book Ready Success",
+        int(float(recovery.get("recovery_universe_change_book_ready_success_count", 0.0))),
+    )
+    col15.metric(
+        "UC Market Ready Success",
+        int(float(recovery.get("recovery_universe_change_market_ready_success_count", 0.0))),
+    )
+
+    col16, col17, col18 = st.columns(3)
+    col16.metric(
+        "UC First Quote Rate",
+        f"{float(recovery.get('recovery_universe_change_first_quote_success_rate', 0.0)):.2%}",
+    )
+    col17.metric(
+        "UC Book Ready Rate",
+        f"{float(recovery.get('recovery_universe_change_book_ready_success_rate', 0.0)):.2%}",
+    )
+    col18.metric(
+        "UC Market Ready Rate",
+        f"{float(recovery.get('recovery_universe_change_market_ready_success_rate', 0.0)):.2%}",
+    )
+
+    col19, col20, col21 = st.columns(3)
+    col19.metric(
         "Avg/Max Resync->FirstQuote (ms)",
         (
             f"{float(recovery.get('avg_resync_to_first_quote_latency_ms', 0.0)):.1f}"
             f" / {float(recovery.get('max_resync_to_first_quote_latency_ms', 0.0)):.1f}"
         ),
     )
-    col9.metric(
+    col20.metric(
         "Avg/Max Resync->BookReady (ms)",
         (
             f"{float(recovery.get('avg_resync_to_book_ready_latency_ms', 0.0)):.1f}"
             f" / {float(recovery.get('max_resync_to_book_ready_latency_ms', 0.0)):.1f}"
         ),
     )
-    col10.metric(
+    col21.metric(
         "Avg/Max Recovery->MarketReady (ms)",
         (
             f"{float(recovery.get('avg_recovery_to_market_ready_latency_ms', 0.0)):.1f}"
@@ -533,41 +637,96 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         ),
     )
 
-    col11, col12 = st.columns(2)
-    with col11:
+    col22, col23 = st.columns(2)
+    with col22:
+        st.markdown("**First Quote Blocked Reasons**")
+        blocked_first = _as_frame(
+            recovery.get("first_quote_blocked_reasons"),
+            columns=["reason", "count"],
+        )
+        if blocked_first.empty:
+            st.write("No data.")
+        else:
+            st.bar_chart(blocked_first.set_index("reason")["count"], use_container_width=True)
+            st.dataframe(blocked_first, use_container_width=True, hide_index=True)
+    with col23:
+        st.markdown("**Book/Market Ready Blocked Reasons**")
+        blocked_book = _as_frame(
+            recovery.get("book_ready_blocked_reasons"),
+            columns=["reason", "count"],
+        )
+        blocked_market = _as_frame(
+            recovery.get("market_ready_blocked_reasons"),
+            columns=["reason", "count"],
+        )
+        merged = pd.concat([blocked_book, blocked_market], ignore_index=True)
+        if merged.empty:
+            st.write("No data.")
+        else:
+            grouped = (
+                merged.groupby("reason", as_index=False)["count"]
+                .sum()
+                .sort_values("count", ascending=False)
+            )
+            st.bar_chart(grouped.set_index("reason")["count"], use_container_width=True)
+            st.dataframe(grouped, use_container_width=True, hide_index=True)
+
+    st.markdown("**Eligibility Gate Unmet Reasons (Diagnostics Events)**")
+    gate_unmet = _as_frame(
+        recovery.get("eligibility_gate_unmet_reasons"),
+        columns=["reason", "count"],
+    )
+    if gate_unmet.empty:
+        st.write("No data.")
+    else:
+        st.bar_chart(gate_unmet.set_index("reason")["count"], use_container_width=True)
+        st.dataframe(gate_unmet, use_container_width=True, hide_index=True)
+
+    col24, col25 = st.columns(2)
+    with col24:
         st.markdown("**Top Stale Assets**")
-        stale_assets = _as_frame(recovery.get("top_stale_assets"), columns=["asset_id", "count"])
+        stale_assets = _as_frame(
+            recovery.get("top_stale_assets"),
+            columns=["asset_id", "count", "market_slug", "side", "market_id"],
+        )
         if stale_assets.empty:
             st.write("No data.")
         else:
             st.dataframe(stale_assets, use_container_width=True, hide_index=True)
-    with col12:
+    with col25:
         st.markdown("**Top Missing Book Assets**")
         missing_assets = _as_frame(
             recovery.get("top_missing_book_assets"),
-            columns=["asset_id", "count"],
+            columns=["asset_id", "count", "market_slug", "side", "market_id"],
         )
         if missing_assets.empty:
             st.write("No data.")
         else:
             st.dataframe(missing_assets, use_container_width=True, hide_index=True)
 
-    col13, col14 = st.columns(2)
-    with col13:
+    col26, col27 = st.columns(2)
+    with col26:
         st.markdown("**Top Market Blocked Markets**")
         blocked_markets = _as_frame(
             recovery.get("top_market_blocked_markets"),
-            columns=["market_id", "count"],
+            columns=["market_id", "market_slug", "count"],
         )
         if blocked_markets.empty:
             st.write("No data.")
         else:
             st.dataframe(blocked_markets, use_container_width=True, hide_index=True)
-    with col14:
+    with col27:
         st.markdown("**Top Recovery Slow Assets**")
         slow_assets = _as_frame(
             recovery.get("top_recovery_slow_assets"),
-            columns=["asset_id", "avg_latency_ms", "max_latency_ms", "success_count"],
+            columns=[
+                "asset_id",
+                "side",
+                "market_slug",
+                "avg_latency_ms",
+                "max_latency_ms",
+                "success_count",
+            ],
         )
         if slow_assets.empty:
             st.write("No data.")
@@ -577,7 +736,7 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
     st.markdown("**Top Recovery Slow Markets**")
     slow_markets = _as_frame(
         recovery.get("top_recovery_slow_markets"),
-        columns=["market_id", "avg_latency_ms", "max_latency_ms", "success_count"],
+        columns=["market_id", "market_slug", "avg_latency_ms", "max_latency_ms", "success_count"],
     )
     if slow_markets.empty:
         st.write("No data.")

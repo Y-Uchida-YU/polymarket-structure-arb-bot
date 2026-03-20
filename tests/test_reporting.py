@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.domain.market import BinaryMarket
 from src.reporting.daily_report import DailyReportGenerator
 from src.storage.sqlite_store import SQLiteStore
 
@@ -518,9 +519,27 @@ def test_daily_report_includes_recovery_diagnostics_section(tmp_path: Path) -> N
                     "",
                     now,
                 ),
-                ("run-1", "market_recovery_started", None, "m1", "missing_book_state", None, "", now),
+                (
+                    "run-1",
+                    "market_recovery_started",
+                    None,
+                    "m1",
+                    "missing_book_state",
+                    None,
+                    "",
+                    now,
+                ),
                 ("run-1", "market_recovery_started", None, "m2", "stale_asset", None, "", now),
-                ("run-1", "market_ready_after_recovery", None, "m1", "missing_book_state", 1200.0, "", now),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m1",
+                    "missing_book_state",
+                    1200.0,
+                    "",
+                    now,
+                ),
                 ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
                 ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
                 ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
@@ -599,7 +618,7 @@ def test_daily_report_includes_recovery_diagnostics_section(tmp_path: Path) -> N
     assert recovery["recovery_market_ready_success_count"] == 1
     assert recovery["recovery_first_quote_success_rate"] == pytest.approx(2 / 3)
     assert recovery["recovery_book_ready_success_rate"] == pytest.approx(1 / 3)
-    assert recovery["recovery_market_ready_success_rate"] == pytest.approx(1 / 2)
+    assert recovery["recovery_market_ready_success_rate"] == pytest.approx(1 / 3)
     assert recovery["avg_resync_to_first_quote_latency_ms"] == pytest.approx(200.0)
     assert recovery["max_resync_to_first_quote_latency_ms"] == pytest.approx(300.0)
     assert recovery["avg_resync_to_book_ready_latency_ms"] == pytest.approx(500.0)
@@ -614,3 +633,179 @@ def test_daily_report_includes_recovery_diagnostics_section(tmp_path: Path) -> N
     assert recovery["top_market_blocked_markets"][0]["count"] == 2
     assert recovery["top_recovery_slow_assets"][0]["asset_id"] == "a1"
     assert recovery["top_recovery_slow_markets"][0]["market_id"] == "m1"
+
+
+def test_daily_report_eligibility_gate_breakdown_uses_saved_metrics(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "universe_current_watched_markets", 3.0, "", now),
+                ("run-1", "market_state_eligible_count", 0.0, "", now),
+                ("run-1", "eligibility_gate_reason:connection_recovering", 1.0, "", now),
+                ("run-1", "eligibility_gate_reason:book_recovering", 3.0, "", now),
+                ("run-1", "eligibility_gate_reason:stale_quote_freshness", 2.0, "", now),
+                ("run-1", "eligibility_gate_reason:blocked", 0.0, "", now),
+                ("run-1", "eligibility_gate_reason:probation", 0.0, "", now),
+                ("run-1", "eligibility_gate_reason:low_quality_runtime_excluded", 2.0, "", now),
+                ("run-1", "eligibility_gate_reason:other_readiness_gate", 4.0, "", now),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    totals = report["totals"]
+    assert totals["eligibility_gate_connection_recovering_count"] == 1
+    assert totals["eligibility_gate_book_recovering_count"] == 3
+    assert totals["eligibility_gate_stale_quote_freshness_count"] == 2
+    assert totals["eligibility_gate_low_quality_runtime_excluded_count"] == 2
+    assert totals["eligibility_gate_other_readiness_gate_count"] == 4
+    reasons = {
+        item["reason"]: int(round(float(item["count"])))
+        for item in report["eligibility_gate_breakdown"]
+    }
+    assert reasons["book_recovering"] == 3
+    assert reasons["other_readiness_gate"] == 4
+    assert "all_markets_book_recovering" in report["no_eligible_market_causes"]
+
+
+def test_daily_report_recovery_top_diagnostics_include_market_and_side(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now_dt = datetime.now(tz=UTC)
+    now = now_dt.isoformat()
+    store.upsert_market(
+        BinaryMarket(
+            market_id="m1",
+            question="Will test market resolve yes?",
+            slug="market-1",
+            category="test",
+            end_time=None,
+            condition_id="cond-m1",
+            yes_token_id="a1",
+            no_token_id="a2",
+            raw={},
+        ),
+        updated_at_iso=now,
+    )
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
+                (
+                    "run-1",
+                    "missing_book_state_detected",
+                    "a2",
+                    "m1",
+                    "book_not_ready",
+                    None,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_block_entered",
+                    None,
+                    "m1",
+                    "book_state_unhealthy",
+                    None,
+                    "",
+                    now,
+                ),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+    recovery = report["recovery_diagnostics"]
+
+    assert recovery["top_stale_assets"][0]["asset_id"] == "a1"
+    assert recovery["top_stale_assets"][0]["market_slug"] == "market-1"
+    assert recovery["top_stale_assets"][0]["side"] == "yes"
+    assert recovery["top_missing_book_assets"][0]["asset_id"] == "a2"
+    assert recovery["top_missing_book_assets"][0]["side"] == "no"
+    assert recovery["top_market_blocked_markets"][0]["market_slug"] == "market-1"
+
+
+def test_daily_report_recovery_universe_change_funnel_counts(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "resync_started", "a1", "m1", "market_universe_changed", None, "", now),
+                ("run-1", "resync_started", "a2", "m1", "market_universe_changed", None, "", now),
+                (
+                    "run-1",
+                    "first_quote_after_resync",
+                    "a1",
+                    "m1",
+                    "market_universe_changed",
+                    120.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "book_ready_after_resync",
+                    "a1",
+                    "m1",
+                    "market_universe_changed",
+                    220.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m1",
+                    "market_universe_changed",
+                    500.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "first_quote_after_resync_blocked",
+                    "a2",
+                    "m1",
+                    "connection_recovering",
+                    80.0,
+                    "recovery_reason=market_universe_changed;stage=first_quote_after_resync_blocked",
+                    now,
+                ),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+    recovery = report["recovery_diagnostics"]
+
+    assert recovery["recovery_universe_change_resync_started_count"] == 2
+    assert recovery["recovery_universe_change_first_quote_success_count"] == 1
+    assert recovery["recovery_universe_change_book_ready_success_count"] == 1
+    assert recovery["recovery_universe_change_market_ready_success_count"] == 1
+    assert recovery["recovery_universe_change_first_quote_blocked_count"] == 1
+    assert recovery["recovery_universe_change_first_quote_success_rate"] == pytest.approx(0.5)

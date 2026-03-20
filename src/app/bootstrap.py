@@ -65,8 +65,12 @@ MARKET_QUALITY_EXCLUDED = "excluded"
 DIAG_EVENT_RESYNC_STARTED = "resync_started"
 DIAG_EVENT_FIRST_QUOTE_AFTER_RESYNC = "first_quote_after_resync"
 DIAG_EVENT_BOOK_READY_AFTER_RESYNC = "book_ready_after_resync"
+DIAG_EVENT_FIRST_QUOTE_AFTER_RESYNC_BLOCKED = "first_quote_after_resync_blocked"
+DIAG_EVENT_BOOK_READY_AFTER_RESYNC_BLOCKED = "book_ready_after_resync_blocked"
 DIAG_EVENT_MARKET_RECOVERY_STARTED = "market_recovery_started"
 DIAG_EVENT_MARKET_READY_AFTER_RECOVERY = "market_ready_after_recovery"
+DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED = "market_ready_after_recovery_blocked"
+DIAG_EVENT_ELIGIBILITY_GATE_UNMET = "eligibility_gate_unmet"
 DIAG_EVENT_STALE_ASSET_DETECTED = "stale_asset_detected"
 DIAG_EVENT_MISSING_BOOK_STATE_DETECTED = "missing_book_state_detected"
 DIAG_EVENT_MARKET_BLOCK_ENTERED = "market_block_entered"
@@ -138,6 +142,8 @@ class AppState:
     asset_recovery_started_at: dict[str, datetime] = field(default_factory=dict)
     asset_first_quote_after_recovery_at: dict[str, datetime] = field(default_factory=dict)
     asset_recovery_reason_by_asset: dict[str, str] = field(default_factory=dict)
+    asset_first_quote_block_reason_by_asset: dict[str, str] = field(default_factory=dict)
+    asset_book_ready_block_reason_by_asset: dict[str, str] = field(default_factory=dict)
     asset_unhealthy_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     last_book_missing_reason_by_asset: dict[str, str] = field(default_factory=dict)
     market_probation_until: dict[str, datetime] = field(default_factory=dict)
@@ -148,9 +154,7 @@ class AppState:
     market_quality_stage_by_market: dict[str, str] = field(default_factory=dict)
     market_exclusion_reason_by_market: dict[str, str] = field(default_factory=dict)
     last_refresh_runtime_excluded_market_ids: set[str] = field(default_factory=set)
-    last_refresh_runtime_excluded_reason_by_market: dict[str, str] = field(
-        default_factory=dict
-    )
+    last_refresh_runtime_excluded_reason_by_market: dict[str, str] = field(default_factory=dict)
     last_refresh_runtime_excluded_count: int = 0
     last_refresh_runtime_excluded_at: datetime | None = None
     market_refresh_observed_count: dict[str, int] = field(default_factory=dict)
@@ -186,6 +190,9 @@ class AppState:
     market_block_started_at: dict[str, datetime] = field(default_factory=dict)
     market_recovery_started_at_for_diagnostics: dict[str, datetime] = field(default_factory=dict)
     market_recovery_reason_by_market: dict[str, str] = field(default_factory=dict)
+    market_ready_block_reason_by_market: dict[str, str] = field(default_factory=dict)
+    eligibility_gate_reason_by_market: dict[str, str] = field(default_factory=dict)
+    eligibility_gate_reason_at_by_market: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -483,8 +490,7 @@ class PolymarketStructureArbApp:
             if supplements:
                 extraction.markets = [*extraction.markets, *supplements]
                 extraction.excluded_counts["watched_floor_backfilled"] = (
-                    extraction.excluded_counts.get("watched_floor_backfilled", 0)
-                    + len(supplements)
+                    extraction.excluded_counts.get("watched_floor_backfilled", 0) + len(supplements)
                 )
                 self.logger.info(
                     (
@@ -627,6 +633,16 @@ class PolymarketStructureArbApp:
             for asset_id, reason in self.state.asset_recovery_reason_by_asset.items()
             if asset_id in current_asset_ids
         }
+        self.state.asset_first_quote_block_reason_by_asset = {
+            asset_id: reason
+            for asset_id, reason in self.state.asset_first_quote_block_reason_by_asset.items()
+            if asset_id in current_asset_ids
+        }
+        self.state.asset_book_ready_block_reason_by_asset = {
+            asset_id: reason
+            for asset_id, reason in self.state.asset_book_ready_block_reason_by_asset.items()
+            if asset_id in current_asset_ids
+        }
         self.state.last_book_missing_reason_by_asset = {
             asset_id: reason
             for asset_id, reason in self.state.last_book_missing_reason_by_asset.items()
@@ -650,6 +666,21 @@ class PolymarketStructureArbApp:
         self.state.market_recovery_reason_by_market = {
             market_id: reason
             for market_id, reason in self.state.market_recovery_reason_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.market_ready_block_reason_by_market = {
+            market_id: reason
+            for market_id, reason in self.state.market_ready_block_reason_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.eligibility_gate_reason_by_market = {
+            market_id: reason
+            for market_id, reason in self.state.eligibility_gate_reason_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.eligibility_gate_reason_at_by_market = {
+            market_id: ts
+            for market_id, ts in self.state.eligibility_gate_reason_at_by_market.items()
             if market_id in current_markets
         }
         for asset_id in asset_ids:
@@ -1071,6 +1102,7 @@ class PolymarketStructureArbApp:
             return
         self.state.market_recovery_started_at_for_diagnostics[market_id] = now_utc
         self.state.market_recovery_reason_by_market[market_id] = reason
+        self.state.market_ready_block_reason_by_market.pop(market_id, None)
         self._save_diagnostics_event(
             event_name=DIAG_EVENT_MARKET_RECOVERY_STARTED,
             now_utc=now_utc,
@@ -1078,10 +1110,14 @@ class PolymarketStructureArbApp:
             reason=reason,
         )
 
-    def _start_asset_recovery_tracking(self, *, asset_id: str, reason: str, now_utc: datetime) -> None:
+    def _start_asset_recovery_tracking(
+        self, *, asset_id: str, reason: str, now_utc: datetime
+    ) -> None:
         self.state.asset_recovery_started_at[asset_id] = now_utc
         self.state.asset_first_quote_after_recovery_at.pop(asset_id, None)
         self.state.asset_recovery_reason_by_asset[asset_id] = reason
+        self.state.asset_first_quote_block_reason_by_asset.pop(asset_id, None)
+        self.state.asset_book_ready_block_reason_by_asset.pop(asset_id, None)
         mapping = self.token_to_market_side.get(asset_id)
         market_id = mapping[0] if mapping is not None else None
         if market_id:
@@ -1099,6 +1135,7 @@ class PolymarketStructureArbApp:
             return
         latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
         self.state.asset_first_quote_after_recovery_at[asset_id] = now_utc
+        self.state.asset_first_quote_block_reason_by_asset.pop(asset_id, None)
         mapping = self.token_to_market_side.get(asset_id)
         market_id = mapping[0] if mapping is not None else None
         self._save_diagnostics_event(
@@ -1114,6 +1151,8 @@ class PolymarketStructureArbApp:
         self.state.asset_recovery_started_at.pop(asset_id, None)
         self.state.asset_first_quote_after_recovery_at.pop(asset_id, None)
         self.state.asset_recovery_reason_by_asset.pop(asset_id, None)
+        self.state.asset_first_quote_block_reason_by_asset.pop(asset_id, None)
+        self.state.asset_book_ready_block_reason_by_asset.pop(asset_id, None)
 
     def _record_book_ready_after_resync(self, *, asset_id: str, now_utc: datetime) -> None:
         started_at = self.state.asset_recovery_started_at.get(asset_id)
@@ -1121,6 +1160,7 @@ class PolymarketStructureArbApp:
             return
         # Book-ready can happen in the same update as first quote.
         self._record_first_quote_after_resync(asset_id=asset_id, now_utc=now_utc)
+        self.state.asset_book_ready_block_reason_by_asset.pop(asset_id, None)
         latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
         mapping = self.token_to_market_side.get(asset_id)
         market_id = mapping[0] if mapping is not None else None
@@ -1140,6 +1180,7 @@ class PolymarketStructureArbApp:
             return
         latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
         reason = self.state.market_recovery_reason_by_market.get(market_id)
+        self.state.market_ready_block_reason_by_market.pop(market_id, None)
         self._save_diagnostics_event(
             event_name=DIAG_EVENT_MARKET_READY_AFTER_RECOVERY,
             now_utc=now_utc,
@@ -1149,6 +1190,151 @@ class PolymarketStructureArbApp:
         )
         self.state.market_recovery_started_at_for_diagnostics.pop(market_id, None)
         self.state.market_recovery_reason_by_market.pop(market_id, None)
+
+    def _record_asset_recovery_blocked_stage(
+        self,
+        *,
+        asset_id: str,
+        event_name: str,
+        reason: str,
+        now_utc: datetime,
+        latency_anchor: datetime,
+        stage_map: dict[str, str],
+    ) -> None:
+        normalized_reason = (reason or "unknown").strip() or "unknown"
+        previous_reason = stage_map.get(asset_id)
+        if previous_reason == normalized_reason:
+            return
+        stage_map[asset_id] = normalized_reason
+        recovery_reason = self.state.asset_recovery_reason_by_asset.get(asset_id)
+        mapping = self.token_to_market_side.get(asset_id)
+        market_id = mapping[0] if mapping is not None else None
+        side = mapping[1] if mapping is not None else ""
+        latency_ms = max(0.0, (now_utc - latency_anchor).total_seconds() * 1000.0)
+        self._save_diagnostics_event(
+            event_name=event_name,
+            now_utc=now_utc,
+            asset_id=asset_id,
+            market_id=market_id,
+            reason=normalized_reason,
+            latency_ms=latency_ms,
+            details=(
+                f"recovery_reason={recovery_reason or ''};" f"side={side};" f"stage={event_name}"
+            ),
+        )
+
+    def _record_first_quote_after_resync_blocked(self, *, asset_id: str, now_utc: datetime) -> None:
+        started_at = self.state.asset_recovery_started_at.get(asset_id)
+        if started_at is None:
+            return
+        if asset_id in self.state.asset_first_quote_after_recovery_at:
+            return
+        reason = self._classify_missing_book_reason(asset_id=asset_id, now_utc=now_utc)
+        self._record_asset_recovery_blocked_stage(
+            asset_id=asset_id,
+            event_name=DIAG_EVENT_FIRST_QUOTE_AFTER_RESYNC_BLOCKED,
+            reason=reason,
+            now_utc=now_utc,
+            latency_anchor=started_at,
+            stage_map=self.state.asset_first_quote_block_reason_by_asset,
+        )
+
+    def _record_book_ready_after_resync_blocked(self, *, asset_id: str, now_utc: datetime) -> None:
+        first_quote_at = self.state.asset_first_quote_after_recovery_at.get(asset_id)
+        if first_quote_at is None:
+            return
+        if self.quote_manager.is_asset_ready(asset_id):
+            return
+        reason = self._classify_missing_book_reason(asset_id=asset_id, now_utc=now_utc)
+        self._record_asset_recovery_blocked_stage(
+            asset_id=asset_id,
+            event_name=DIAG_EVENT_BOOK_READY_AFTER_RESYNC_BLOCKED,
+            reason=reason,
+            now_utc=now_utc,
+            latency_anchor=first_quote_at,
+            stage_map=self.state.asset_book_ready_block_reason_by_asset,
+        )
+
+    def _record_market_ready_after_recovery_blocked(
+        self,
+        *,
+        market_id: str,
+        reason: str,
+        now_utc: datetime,
+    ) -> None:
+        started_at = self.state.market_recovery_started_at_for_diagnostics.get(market_id)
+        if started_at is None:
+            return
+        normalized_reason = (reason or "unknown").strip() or "unknown"
+        previous_reason = self.state.market_ready_block_reason_by_market.get(market_id)
+        if previous_reason == normalized_reason:
+            return
+        self.state.market_ready_block_reason_by_market[market_id] = normalized_reason
+        recovery_reason = self.state.market_recovery_reason_by_market.get(market_id)
+        latency_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=normalized_reason,
+            latency_ms=latency_ms,
+            details=f"recovery_reason={recovery_reason or ''};stage={DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED}",
+        )
+
+    @staticmethod
+    def _eligibility_gate_bucket(reason: str) -> str:
+        normalized_reason = (reason or "unknown").strip() or "unknown"
+        if normalized_reason == "connection_recovering":
+            return "connection_recovering"
+        if normalized_reason in {"book_recovering", "market_recovering"}:
+            return "book_recovering"
+        if (
+            normalized_reason.startswith("market_quote_stale")
+            or normalized_reason == "quote_too_old"
+        ):
+            return "stale_quote_freshness"
+        if normalized_reason.startswith("safe_mode_blocked_"):
+            return "blocked"
+        if normalized_reason in {"market_probation", "asset_warming_up"}:
+            return "probation"
+        if normalized_reason.startswith("book_not_ready") or normalized_reason in {
+            "market_not_ready"
+        }:
+            return "other_readiness_gate"
+        return "other_readiness_gate"
+
+    def _record_eligibility_gate_diagnostic(
+        self,
+        *,
+        market_id: str,
+        reason: str,
+        category: str,
+        now_utc: datetime,
+    ) -> None:
+        normalized_reason = (reason or "unknown").strip() or "unknown"
+        previous_reason = self.state.eligibility_gate_reason_by_market.get(market_id)
+        previous_ts = self.state.eligibility_gate_reason_at_by_market.get(market_id)
+        cooldown_ms = max(
+            0,
+            self.config.settings.runtime.market_no_signal_reason_cooldown_ms,
+        )
+        now_ts = now_utc.timestamp()
+        if (
+            previous_reason == normalized_reason
+            and previous_ts is not None
+            and cooldown_ms > 0
+            and (now_ts - previous_ts) * 1000.0 < cooldown_ms
+        ):
+            return
+        self.state.eligibility_gate_reason_by_market[market_id] = normalized_reason
+        self.state.eligibility_gate_reason_at_by_market[market_id] = now_ts
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_ELIGIBILITY_GATE_UNMET,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=normalized_reason,
+            details=f"category={category}",
+        )
 
     def _mark_asset_ready(self, asset_id: str) -> None:
         if not self.quote_manager.is_asset_ready(asset_id):
@@ -2563,6 +2749,10 @@ class PolymarketStructureArbApp:
                 market_id=market_id,
                 reason=self.state.last_book_missing_reason_by_asset.get(asset_id),
             )
+        for asset_id in list(self.state.asset_recovery_started_at.keys()):
+            self._record_first_quote_after_resync_blocked(asset_id=asset_id, now_utc=now)
+        for asset_id in list(self.state.asset_first_quote_after_recovery_at.keys()):
+            self._record_book_ready_after_resync_blocked(asset_id=asset_id, now_utc=now)
 
         stale_assets = self.healthcheck.stale_assets(
             tracked_assets=tracked_assets,
@@ -2628,6 +2818,15 @@ class PolymarketStructureArbApp:
             MARKET_QUALITY_EXCLUSION_CANDIDATE: 0,
             MARKET_QUALITY_EXCLUDED: 0,
         }
+        eligibility_gate_counts: dict[str, int] = {
+            "connection_recovering": 0,
+            "book_recovering": 0,
+            "stale_quote_freshness": 0,
+            "blocked": 0,
+            "probation": 0,
+            "low_quality_runtime_excluded": 0,
+            "other_readiness_gate": 0,
+        }
         for market in self.markets_by_id.values():
             market_state, _ = self._resolve_market_freshness_state(market=market, now_utc=now)
             self._update_market_freshness_state(
@@ -2636,6 +2835,12 @@ class PolymarketStructureArbApp:
                 now_utc=now,
             )
             market_state_counts[market_state] = market_state_counts.get(market_state, 0) + 1
+            if market_state != MARKET_FRESHNESS_READY:
+                self._record_market_ready_after_recovery_blocked(
+                    market_id=market.market_id,
+                    reason=self._market_freshness_to_no_signal_reason(market_state),
+                    now_utc=now,
+                )
             yes_updates, no_updates = self._market_quote_update_counts(market)
             current_penalty = self.state.market_quality_penalty_by_market.get(market.market_id, 0)
             current_bad_cycles = self.state.market_low_quality_consecutive_cycles.get(
@@ -2683,7 +2888,32 @@ class PolymarketStructureArbApp:
             )
             self.state.market_quality_stage_by_market[market.market_id] = quality_stage
             quality_stage_counts[quality_stage] = quality_stage_counts.get(quality_stage, 0) + 1
+
+            eligibility_ok, eligibility_reason, _ = self._evaluate_market_signal_eligibility(
+                market=market,
+                now_utc=now,
+            )
+            if eligibility_ok:
+                continue
+            gate_category = self._eligibility_gate_bucket(eligibility_reason)
+            if (
+                market.market_id in self.state.safe_mode_blocked_markets
+                or self.state.safe_mode_active
+            ):
+                gate_category = "blocked"
+            eligibility_gate_counts[gate_category] = (
+                eligibility_gate_counts.get(gate_category, 0) + 1
+            )
+            self._record_eligibility_gate_diagnostic(
+                market_id=market.market_id,
+                reason=eligibility_reason,
+                category=gate_category,
+                now_utc=now,
+            )
         self.state.eligible_markets = eligible_markets
+        eligibility_gate_counts["low_quality_runtime_excluded"] = (
+            self.state.last_refresh_runtime_excluded_count
+        )
         missing_reasons_by_asset = self.state.last_book_missing_reason_by_asset
         blocking_missing_assets = {
             asset_id
@@ -2829,6 +3059,29 @@ class PolymarketStructureArbApp:
                     "metric_name": metric_name,
                     "metric_value": stage_value,
                     "tracked_markets": len(self.markets_by_id),
+                },
+                now_utc=now,
+            )
+        for category, count in sorted(eligibility_gate_counts.items()):
+            metric_name = f"eligibility_gate_reason:{category}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=(
+                    f"watched_markets={len(self.markets_by_id)};"
+                    f"eligible_markets={len(eligible_markets)}"
+                ),
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "watched_markets": len(self.markets_by_id),
+                    "eligible_markets": len(eligible_markets),
                 },
                 now_utc=now,
             )

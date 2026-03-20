@@ -276,6 +276,16 @@ class DashboardDataLoader:
                 run_id=run_id,
                 metric_name="market_state_eligible_ratio",
             )
+            eligibility_gate_breakdown = self._latest_metric_prefix_breakdown(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_prefix="eligibility_gate_reason:",
+            )
+            eligibility_gate_reason_map = {
+                str(item.get("reason", "")): int(round(float(item.get("count", 0.0))))
+                for item in eligibility_gate_breakdown
+            }
             resync_count = self._count(
                 conn=conn,
                 table="resync_events",
@@ -327,6 +337,25 @@ class DashboardDataLoader:
             "eligible_market_count": float(eligible_market_count),
             "eligible_market_ratio": float(eligible_market_ratio),
             "blocked_market_count": float(blocked_market_count),
+            "eligibility_gate_connection_recovering_count": float(
+                eligibility_gate_reason_map.get("connection_recovering", 0)
+            ),
+            "eligibility_gate_book_recovering_count": float(
+                eligibility_gate_reason_map.get("book_recovering", 0)
+            ),
+            "eligibility_gate_stale_quote_freshness_count": float(
+                eligibility_gate_reason_map.get("stale_quote_freshness", 0)
+            ),
+            "eligibility_gate_blocked_count": float(eligibility_gate_reason_map.get("blocked", 0)),
+            "eligibility_gate_probation_count": float(
+                eligibility_gate_reason_map.get("probation", 0)
+            ),
+            "eligibility_gate_low_quality_runtime_excluded_count": float(
+                eligibility_gate_reason_map.get("low_quality_runtime_excluded", 0)
+            ),
+            "eligibility_gate_other_readiness_gate_count": float(
+                eligibility_gate_reason_map.get("other_readiness_gate", 0)
+            ),
             "min_watched_markets_floor": float(min_watched_markets_floor),
             "low_quality_market_count": float(low_quality_market_count),
             "low_quality_runtime_excluded_count": float(low_quality_runtime_excluded_count),
@@ -428,6 +457,20 @@ class DashboardDataLoader:
             missing_book_reasons["reason"] = (
                 missing_book_reasons["metric_name"].astype(str).str.split(":", n=1).str[-1]
             )
+        eligibility_breakdown_rows: list[dict[str, float | str]] = []
+        if self.has_database():
+            with self._connect() as conn:
+                if conn is not None:
+                    eligibility_breakdown_rows = self._latest_metric_prefix_breakdown(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        metric_prefix="eligibility_gate_reason:",
+                    )
+        eligibility_breakdown = pd.DataFrame(
+            eligibility_breakdown_rows,
+            columns=["reason", "count"],
+        )
 
         return {
             "resyncs_by_reason": self._query_df(
@@ -458,6 +501,7 @@ class DashboardDataLoader:
                 run_id=run_id,
                 metric_name="ws_connected_event",
             ),
+            "eligibility_gate_breakdown": eligibility_breakdown,
         }
 
     def load_pnl_timeseries(self, *, window: DashboardWindow, run_id: str | None) -> pd.DataFrame:
@@ -842,6 +886,24 @@ class DashboardDataLoader:
                     run_id=run_id,
                     event_name="market_ready_after_recovery",
                 )
+                first_quote_blocked_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="first_quote_after_resync_blocked",
+                )
+                book_ready_blocked_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="book_ready_after_resync_blocked",
+                )
+                market_ready_blocked_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery_blocked",
+                )
                 first_avg_ms, first_max_ms = self._diagnostics_latency_stats(
                     conn=conn,
                     window=window,
@@ -860,12 +922,68 @@ class DashboardDataLoader:
                     run_id=run_id,
                     event_name="market_ready_after_recovery",
                 )
-                market_rate_denominator = market_recovery_started_count or resync_started_count
+                universe_resync_started_count = self._count_diagnostics_event_with_reason(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="resync_started",
+                    reason="market_universe_changed",
+                )
+                universe_first_quote_success_count = self._count_diagnostics_event_with_reason(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="first_quote_after_resync",
+                    reason="market_universe_changed",
+                )
+                universe_book_ready_success_count = self._count_diagnostics_event_with_reason(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="book_ready_after_resync",
+                    reason="market_universe_changed",
+                )
+                universe_market_ready_success_count = self._count_diagnostics_event_with_reason(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery",
+                    reason="market_universe_changed",
+                )
+                universe_first_quote_blocked_count = (
+                    self._count_diagnostics_event_with_details_like(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="first_quote_after_resync_blocked",
+                        details_like="%recovery_reason=market_universe_changed%",
+                    )
+                )
+                universe_book_ready_blocked_count = self._count_diagnostics_event_with_details_like(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="book_ready_after_resync_blocked",
+                    details_like="%recovery_reason=market_universe_changed%",
+                )
+                universe_market_ready_blocked_count = (
+                    self._count_diagnostics_event_with_details_like(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="market_ready_after_recovery_blocked",
+                        details_like="%recovery_reason=market_universe_changed%",
+                    )
+                )
                 return {
                     "recovery_resync_started_count": float(resync_started_count),
                     "recovery_first_quote_success_count": float(first_quote_success_count),
                     "recovery_book_ready_success_count": float(book_ready_success_count),
                     "recovery_market_ready_success_count": float(market_ready_success_count),
+                    "recovery_market_recovery_started_count": float(market_recovery_started_count),
+                    "recovery_first_quote_blocked_count": float(first_quote_blocked_count),
+                    "recovery_book_ready_blocked_count": float(book_ready_blocked_count),
+                    "recovery_market_ready_blocked_count": float(market_ready_blocked_count),
                     "recovery_first_quote_success_rate": (
                         float(first_quote_success_count / resync_started_count)
                         if resync_started_count > 0
@@ -877,16 +995,77 @@ class DashboardDataLoader:
                         else 0.0
                     ),
                     "recovery_market_ready_success_rate": (
-                        float(market_ready_success_count / market_rate_denominator)
-                        if market_rate_denominator > 0
+                        float(market_ready_success_count / resync_started_count)
+                        if resync_started_count > 0
                         else 0.0
                     ),
+                    "recovery_stage_denominator": "resync_started_count",
                     "avg_resync_to_first_quote_latency_ms": first_avg_ms,
                     "max_resync_to_first_quote_latency_ms": first_max_ms,
                     "avg_resync_to_book_ready_latency_ms": book_avg_ms,
                     "max_resync_to_book_ready_latency_ms": book_max_ms,
                     "avg_recovery_to_market_ready_latency_ms": market_avg_ms,
                     "max_recovery_to_market_ready_latency_ms": market_max_ms,
+                    "first_quote_blocked_reasons": self._diagnostics_reasons_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="first_quote_after_resync_blocked",
+                    ),
+                    "book_ready_blocked_reasons": self._diagnostics_reasons_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="book_ready_after_resync_blocked",
+                    ),
+                    "market_ready_blocked_reasons": self._diagnostics_reasons_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="market_ready_after_recovery_blocked",
+                    ),
+                    "eligibility_gate_unmet_reasons": self._diagnostics_reasons_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="eligibility_gate_unmet",
+                    ),
+                    "recovery_universe_change_resync_started_count": float(
+                        universe_resync_started_count
+                    ),
+                    "recovery_universe_change_first_quote_success_count": float(
+                        universe_first_quote_success_count
+                    ),
+                    "recovery_universe_change_book_ready_success_count": float(
+                        universe_book_ready_success_count
+                    ),
+                    "recovery_universe_change_market_ready_success_count": float(
+                        universe_market_ready_success_count
+                    ),
+                    "recovery_universe_change_first_quote_blocked_count": float(
+                        universe_first_quote_blocked_count
+                    ),
+                    "recovery_universe_change_book_ready_blocked_count": float(
+                        universe_book_ready_blocked_count
+                    ),
+                    "recovery_universe_change_market_ready_blocked_count": float(
+                        universe_market_ready_blocked_count
+                    ),
+                    "recovery_universe_change_first_quote_success_rate": (
+                        float(universe_first_quote_success_count / universe_resync_started_count)
+                        if universe_resync_started_count > 0
+                        else 0.0
+                    ),
+                    "recovery_universe_change_book_ready_success_rate": (
+                        float(universe_book_ready_success_count / universe_resync_started_count)
+                        if universe_resync_started_count > 0
+                        else 0.0
+                    ),
+                    "recovery_universe_change_market_ready_success_rate": (
+                        float(universe_market_ready_success_count / universe_resync_started_count)
+                        if universe_resync_started_count > 0
+                        else 0.0
+                    ),
                     "top_stale_assets": self._top_diagnostics_counts(
                         conn=conn,
                         window=window,
@@ -1097,6 +1276,52 @@ class DashboardDataLoader:
         row = conn.execute(query, params).fetchone()
         return int(row[0] if row else 0)
 
+    def _count_diagnostics_event_with_reason(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+        reason: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+          AND reason = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name, reason]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_diagnostics_event_with_details_like(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+        details_like: str,
+    ) -> int:
+        query = """
+        SELECT COUNT(*)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+          AND details LIKE ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name, details_like]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
     def _count_metric_like(
         self,
         *,
@@ -1117,6 +1342,33 @@ class DashboardDataLoader:
             params.append(run_id)
         row = conn.execute(query, params).fetchone()
         return int(row[0] if row else 0)
+
+    def _diagnostics_reasons_for_event(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+        limit: int = 10,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT reason, COUNT(*) AS count
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY reason ORDER BY count DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        frame = pd.read_sql_query(query, conn, params=params)
+        if frame.empty:
+            return pd.DataFrame(columns=["reason", "count"])
+        frame["reason"] = frame["reason"].fillna("unknown")
+        return frame
 
     def _sum_metric(
         self,
@@ -1176,19 +1428,57 @@ class DashboardDataLoader:
     ) -> pd.DataFrame:
         if entity_column not in {"asset_id", "market_id"}:
             return pd.DataFrame(columns=[entity_column, "count"])
-        query = f"""
-        SELECT {entity_column}, COUNT(*) AS count
-        FROM diagnostics_events
-        WHERE created_at >= ? AND created_at < ?
-          AND event_name = ?
-          AND {entity_column} IS NOT NULL
-          AND {entity_column} != ''
+        if entity_column == "asset_id":
+            query = """
+            WITH market_asset AS (
+              SELECT market_id, slug, question, yes_token_id AS asset_id, 'yes' AS side
+              FROM markets
+              UNION ALL
+              SELECT market_id, slug, question, no_token_id AS asset_id, 'no' AS side
+              FROM markets
+            )
+            SELECT
+              d.asset_id,
+              COUNT(*) AS count,
+              MAX(COALESCE(d.market_id, ma.market_id)) AS market_id,
+              MAX(COALESCE(ma.slug, m.slug, '')) AS market_slug,
+              MAX(COALESCE(ma.question, m.question, '')) AS market_question,
+              MAX(COALESCE(ma.side, '')) AS side
+            FROM diagnostics_events d
+            LEFT JOIN market_asset ma
+              ON ma.asset_id = d.asset_id
+            LEFT JOIN markets m
+              ON m.market_id = d.market_id
+            WHERE d.created_at >= ? AND d.created_at < ?
+              AND d.event_name = ?
+              AND d.asset_id IS NOT NULL
+              AND d.asset_id != ''
+            """
+            params: list[object] = [window.start_iso, window.end_iso, event_name]
+            if run_id is not None:
+                query += " AND d.run_id = ?"
+                params.append(run_id)
+            query += " GROUP BY d.asset_id ORDER BY count DESC LIMIT 5"
+            return pd.read_sql_query(query, conn, params=params)
+        query = """
+        SELECT
+          d.market_id,
+          COUNT(*) AS count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = ?
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
         """
-        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        params = [window.start_iso, window.end_iso, event_name]
         if run_id is not None:
-            query += " AND run_id = ?"
+            query += " AND d.run_id = ?"
             params.append(run_id)
-        query += f" GROUP BY {entity_column} ORDER BY count DESC LIMIT 5"
+        query += " GROUP BY d.market_id ORDER BY count DESC LIMIT 5"
         return pd.read_sql_query(query, conn, params=params)
 
     def _top_slow_assets(
@@ -1200,23 +1490,40 @@ class DashboardDataLoader:
     ) -> pd.DataFrame:
         def _query(event_name: str) -> pd.DataFrame:
             query = """
+            WITH market_asset AS (
+              SELECT market_id, slug, question, yes_token_id AS asset_id, 'yes' AS side
+              FROM markets
+              UNION ALL
+              SELECT market_id, slug, question, no_token_id AS asset_id, 'no' AS side
+              FROM markets
+            )
             SELECT
-              asset_id,
-              AVG(latency_ms) AS avg_latency_ms,
-              MAX(latency_ms) AS max_latency_ms,
-              COUNT(*) AS success_count
-            FROM diagnostics_events
-            WHERE created_at >= ? AND created_at < ?
-              AND event_name = ?
-              AND latency_ms IS NOT NULL
-              AND asset_id IS NOT NULL
-              AND asset_id != ''
+              d.asset_id,
+              AVG(d.latency_ms) AS avg_latency_ms,
+              MAX(d.latency_ms) AS max_latency_ms,
+              COUNT(*) AS success_count,
+              MAX(COALESCE(d.market_id, ma.market_id)) AS market_id,
+              MAX(COALESCE(ma.slug, m.slug, '')) AS market_slug,
+              MAX(COALESCE(ma.question, m.question, '')) AS market_question,
+              MAX(COALESCE(ma.side, '')) AS side
+            FROM diagnostics_events d
+            LEFT JOIN market_asset ma
+              ON ma.asset_id = d.asset_id
+            LEFT JOIN markets m
+              ON m.market_id = d.market_id
+            WHERE d.created_at >= ? AND d.created_at < ?
+              AND d.event_name = ?
+              AND d.latency_ms IS NOT NULL
+              AND d.asset_id IS NOT NULL
+              AND d.asset_id != ''
             """
             params: list[object] = [window.start_iso, window.end_iso, event_name]
             if run_id is not None:
-                query += " AND run_id = ?"
+                query += " AND d.run_id = ?"
                 params.append(run_id)
-            query += " GROUP BY asset_id ORDER BY max_latency_ms DESC, avg_latency_ms DESC LIMIT 5"
+            query += (
+                " GROUP BY d.asset_id ORDER BY max_latency_ms DESC, " "avg_latency_ms DESC LIMIT 5"
+            )
             return pd.read_sql_query(query, conn, params=params)
 
         frame = _query("book_ready_after_resync")
@@ -1233,22 +1540,26 @@ class DashboardDataLoader:
     ) -> pd.DataFrame:
         query = """
         SELECT
-          market_id,
-          AVG(latency_ms) AS avg_latency_ms,
-          MAX(latency_ms) AS max_latency_ms,
-          COUNT(*) AS success_count
-        FROM diagnostics_events
-        WHERE created_at >= ? AND created_at < ?
-          AND event_name = 'market_ready_after_recovery'
-          AND latency_ms IS NOT NULL
-          AND market_id IS NOT NULL
-          AND market_id != ''
+          d.market_id,
+          AVG(d.latency_ms) AS avg_latency_ms,
+          MAX(d.latency_ms) AS max_latency_ms,
+          COUNT(*) AS success_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_ready_after_recovery'
+          AND d.latency_ms IS NOT NULL
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
         """
         params: list[object] = [window.start_iso, window.end_iso]
         if run_id is not None:
-            query += " AND run_id = ?"
+            query += " AND d.run_id = ?"
             params.append(run_id)
-        query += " GROUP BY market_id ORDER BY max_latency_ms DESC, avg_latency_ms DESC LIMIT 5"
+        query += " GROUP BY d.market_id ORDER BY max_latency_ms DESC, avg_latency_ms DESC LIMIT 5"
         return pd.read_sql_query(query, conn, params=params)
 
     def _count_resync_reason(
@@ -1408,6 +1719,54 @@ class DashboardDataLoader:
             row = conn.execute(fallback_query, fallback_params).fetchone()
         return float(row[0]) if row and row[0] is not None else 0.0
 
+    def _latest_metric_prefix_breakdown(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_prefix: str,
+    ) -> list[dict[str, float | str]]:
+        query = """
+        SELECT metric_name, metric_value
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, f"{metric_prefix}%"]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC, id DESC"
+        rows = conn.execute(query, params).fetchall()
+        if not rows:
+            fallback_query = """
+            SELECT metric_name, metric_value
+            FROM metrics
+            WHERE metric_name LIKE ?
+            """
+            fallback_params: list[object] = [f"{metric_prefix}%"]
+            if run_id is not None:
+                fallback_query += " AND run_id = ?"
+                fallback_params.append(run_id)
+            fallback_query += " ORDER BY created_at DESC, id DESC"
+            rows = conn.execute(fallback_query, fallback_params).fetchall()
+        latest_by_name: dict[str, float] = {}
+        for metric_name, metric_value in rows:
+            key = str(metric_name)
+            if key in latest_by_name:
+                continue
+            latest_by_name[key] = float(metric_value if metric_value is not None else 0.0)
+        breakdown = [
+            {
+                "reason": name.split(":", 1)[1] if ":" in name else name,
+                "count": value,
+            }
+            for name, value in latest_by_name.items()
+        ]
+        breakdown.sort(key=lambda item: float(item.get("count", 0.0)), reverse=True)
+        return breakdown
+
     @staticmethod
     def _extract_kv(details: str, key: str) -> str | None:
         prefix = f"{key}="
@@ -1500,23 +1859,78 @@ class DashboardDataLoader:
             "recovery_first_quote_success_count": 0.0,
             "recovery_book_ready_success_count": 0.0,
             "recovery_market_ready_success_count": 0.0,
+            "recovery_market_recovery_started_count": 0.0,
+            "recovery_first_quote_blocked_count": 0.0,
+            "recovery_book_ready_blocked_count": 0.0,
+            "recovery_market_ready_blocked_count": 0.0,
             "recovery_first_quote_success_rate": 0.0,
             "recovery_book_ready_success_rate": 0.0,
             "recovery_market_ready_success_rate": 0.0,
+            "recovery_stage_denominator": "resync_started_count",
             "avg_resync_to_first_quote_latency_ms": 0.0,
             "max_resync_to_first_quote_latency_ms": 0.0,
             "avg_resync_to_book_ready_latency_ms": 0.0,
             "max_resync_to_book_ready_latency_ms": 0.0,
             "avg_recovery_to_market_ready_latency_ms": 0.0,
             "max_recovery_to_market_ready_latency_ms": 0.0,
-            "top_stale_assets": pd.DataFrame(columns=["asset_id", "count"]),
-            "top_missing_book_assets": pd.DataFrame(columns=["asset_id", "count"]),
-            "top_market_blocked_markets": pd.DataFrame(columns=["market_id", "count"]),
+            "first_quote_blocked_reasons": pd.DataFrame(columns=["reason", "count"]),
+            "book_ready_blocked_reasons": pd.DataFrame(columns=["reason", "count"]),
+            "market_ready_blocked_reasons": pd.DataFrame(columns=["reason", "count"]),
+            "eligibility_gate_unmet_reasons": pd.DataFrame(columns=["reason", "count"]),
+            "recovery_universe_change_resync_started_count": 0.0,
+            "recovery_universe_change_first_quote_success_count": 0.0,
+            "recovery_universe_change_book_ready_success_count": 0.0,
+            "recovery_universe_change_market_ready_success_count": 0.0,
+            "recovery_universe_change_first_quote_blocked_count": 0.0,
+            "recovery_universe_change_book_ready_blocked_count": 0.0,
+            "recovery_universe_change_market_ready_blocked_count": 0.0,
+            "recovery_universe_change_first_quote_success_rate": 0.0,
+            "recovery_universe_change_book_ready_success_rate": 0.0,
+            "recovery_universe_change_market_ready_success_rate": 0.0,
+            "top_stale_assets": pd.DataFrame(
+                columns=[
+                    "asset_id",
+                    "count",
+                    "market_id",
+                    "market_slug",
+                    "market_question",
+                    "side",
+                ]
+            ),
+            "top_missing_book_assets": pd.DataFrame(
+                columns=[
+                    "asset_id",
+                    "count",
+                    "market_id",
+                    "market_slug",
+                    "market_question",
+                    "side",
+                ]
+            ),
+            "top_market_blocked_markets": pd.DataFrame(
+                columns=["market_id", "count", "market_slug", "market_question"]
+            ),
             "top_recovery_slow_assets": pd.DataFrame(
-                columns=["asset_id", "avg_latency_ms", "max_latency_ms", "success_count"]
+                columns=[
+                    "asset_id",
+                    "avg_latency_ms",
+                    "max_latency_ms",
+                    "success_count",
+                    "market_id",
+                    "market_slug",
+                    "market_question",
+                    "side",
+                ]
             ),
             "top_recovery_slow_markets": pd.DataFrame(
-                columns=["market_id", "avg_latency_ms", "max_latency_ms", "success_count"]
+                columns=[
+                    "market_id",
+                    "avg_latency_ms",
+                    "max_latency_ms",
+                    "success_count",
+                    "market_slug",
+                    "market_question",
+                ]
             ),
         }
 
@@ -1552,6 +1966,13 @@ class DashboardDataLoader:
             "eligible_market_count": 0.0,
             "eligible_market_ratio": 0.0,
             "blocked_market_count": 0.0,
+            "eligibility_gate_connection_recovering_count": 0.0,
+            "eligibility_gate_book_recovering_count": 0.0,
+            "eligibility_gate_stale_quote_freshness_count": 0.0,
+            "eligibility_gate_blocked_count": 0.0,
+            "eligibility_gate_probation_count": 0.0,
+            "eligibility_gate_low_quality_runtime_excluded_count": 0.0,
+            "eligibility_gate_other_readiness_gate_count": 0.0,
             "min_watched_markets_floor": 0.0,
             "low_quality_market_count": 0.0,
             "low_quality_runtime_excluded_count": 0.0,
