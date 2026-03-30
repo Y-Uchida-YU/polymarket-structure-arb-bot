@@ -352,6 +352,8 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                     "market_id=m1;stale_reason_key=no_recent_quote;stale_side=no",
                     now,
                 ),
+                ("run-1", "chronic_stale_excluded_market_count", 1.0, "m1", now),
+                ("run-1", "chronic_stale_exclusion_active_count", 1.0, "m1", now),
             ],
         )
         store.conn.executemany(
@@ -498,6 +500,26 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 (
                     "run-1",
+                    "market_chronic_stale_exclusion_entered",
+                    None,
+                    "m1",
+                    "repeated_stale_enters",
+                    None,
+                    "stale_enter_count=12;max_stale_duration_ms=450000;market_slug=market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_chronic_stale_exclusion_cleared",
+                    None,
+                    "m1",
+                    "repeated_stale_enters",
+                    120000.0,
+                    "cleared_reason=cooldown_elapsed;market_slug=market-1",
+                    now,
+                ),
+                (
+                    "run-1",
                     "eligibility_gate_unmet",
                     None,
                     "m1",
@@ -527,6 +549,16 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                     "a2",
                     "m1",
                     "book_not_resynced_yet",
+                    None,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "missing_book_state_detected",
+                    "a1",
+                    "m1",
+                    "quote_missing_after_resync",
                     None,
                     "",
                     now,
@@ -564,6 +596,9 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert recovery["market_stale_recover_count"] == 1.0
     assert recovery["avg_market_stale_duration_ms"] == 900.0
     assert recovery["market_stale_universe_change_enter_count"] == 1.0
+    assert recovery["chronic_stale_exclusion_enter_count"] == 1.0
+    assert recovery["chronic_stale_exclusion_active_count"] == 1.0
+    assert recovery["chronic_stale_exclusion_cleared_count"] == 1.0
     assert not recovery["first_quote_blocked_reasons"].empty
     assert str(recovery["first_quote_blocked_reasons"].iloc[0]["reason"]) == "connection_recovering"
     assert not recovery["eligibility_gate_unmet_reasons"].empty
@@ -582,6 +617,69 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     top_slow_markets = recovery["top_recovery_slow_markets"]
     assert not top_slow_markets.empty
     assert str(top_slow_markets.iloc[0]["market_id"]) == "m1"
+    top_chronic_markets = recovery["top_chronic_stale_markets"]
+    assert not top_chronic_markets.empty
+    assert str(top_chronic_markets.iloc[0]["market_slug"]) == "market-1"
+    top_quote_missing = recovery["top_quote_missing_after_resync_assets"]
+    assert not top_quote_missing.empty
+    assert str(top_quote_missing.iloc[0]["asset_id"]) == "a1"
+    top_repeated_missing = recovery["top_repeated_missing_book_markets"]
+    assert not top_repeated_missing.empty
+    assert str(top_repeated_missing.iloc[0]["market_id"]) == "m1"
     top_long_stale = recovery["top_long_stale_markets"]
     assert not top_long_stale.empty
     assert str(top_long_stale.iloc[0]["market_id"]) == "m1"
+
+
+def test_dashboard_loader_universe_change_funnel_is_monotonic(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_dashboard_data(db_path)
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "resync_started", "a1", "m1", "market_universe_changed", None, "", now),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m1",
+                    "market_universe_changed",
+                    500.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m2",
+                    "market_universe_changed",
+                    550.0,
+                    "",
+                    now,
+                ),
+            ],
+        )
+    store.close()
+
+    loader = DashboardDataLoader(db_path=db_path)
+    window = resolve_window(last_hours=24)
+    recovery = loader.load_recovery_diagnostics(window=window, run_id="run-1")
+
+    resync_count = int(float(recovery["recovery_universe_change_resync_started_count"]))
+    first_count = int(float(recovery["recovery_universe_change_first_quote_success_count"]))
+    book_count = int(float(recovery["recovery_universe_change_book_ready_success_count"]))
+    market_count = int(float(recovery["recovery_universe_change_market_ready_success_count"]))
+
+    assert resync_count == 1
+    assert first_count == 1
+    assert book_count == 1
+    assert market_count == 1
+    assert market_count <= book_count <= first_count <= resync_count

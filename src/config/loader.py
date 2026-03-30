@@ -100,6 +100,10 @@ class RuntimeSettings(BaseModel):
     low_quality_market_degraded_penalty_ratio: float = 0.5
     low_quality_market_probation_penalty_ratio: float = 1.0
     low_quality_market_exclusion_candidate_penalty_ratio: float = 1.5
+    market_stale_exclusion_window_minutes: int = 60
+    market_stale_exclusion_min_enter_count: int = 10
+    market_stale_exclusion_max_single_duration_ms: int = 300_000
+    market_stale_exclusion_cooldown_ms: int = 1_800_000
     min_watched_markets_floor: int = 8
     watched_floor_relax_activity_filters: bool = True
     watched_floor_relax_runtime_exclusion: bool = True

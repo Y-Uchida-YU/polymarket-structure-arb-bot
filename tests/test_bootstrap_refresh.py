@@ -1867,6 +1867,183 @@ def test_runtime_low_quality_market_not_excluded_on_temporary_deterioration(tmp_
     asyncio.run(app.shutdown())
 
 
+def test_chronic_stale_exclusion_triggered_by_repeated_enters(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_chronic_stale_exclusion_repeated")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_stale_exclusion_window_minutes": 60,
+            "market_stale_exclusion_min_enter_count": 2,
+            "market_stale_exclusion_max_single_duration_ms": 999_999,
+            "market_stale_exclusion_cooldown_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+    asyncio.run(app.load_markets())
+
+    now = datetime.now(tz=UTC)
+    with app.sqlite_store.conn:
+        app.sqlite_store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    app.state.run_id,
+                    "market_stale_entered",
+                    None,
+                    "m1",
+                    "quote_age_exceeded",
+                    None,
+                    "",
+                    now.isoformat(),
+                ),
+                (
+                    app.state.run_id,
+                    "market_stale_entered",
+                    None,
+                    "m1",
+                    "no_recent_quote",
+                    None,
+                    "",
+                    now.isoformat(),
+                ),
+            ],
+        )
+
+    summary = app._refresh_chronic_stale_runtime_exclusions(now_utc=now + timedelta(milliseconds=1))
+    assert "m1" in summary.active_market_ids
+    assert "m1" in summary.entered_market_ids
+    assert app.state.market_chronic_stale_reason_by_market["m1"] == "repeated_stale_enters"
+
+    market = app.markets_by_id["m1"]
+    eligibility_ok, eligibility_reason, _ = app._evaluate_market_signal_eligibility(
+        market=market,
+        now_utc=now,
+    )
+    assert eligibility_ok is False
+    assert eligibility_reason == "chronic_stale_excluded"
+
+    row = app.sqlite_store.conn.execute("""
+        SELECT reason
+        FROM diagnostics_events
+        WHERE event_name = 'market_chronic_stale_exclusion_entered'
+        ORDER BY id DESC
+        LIMIT 1
+        """).fetchone()
+    assert row is not None
+    assert str(row[0]) == "repeated_stale_enters"
+
+    asyncio.run(app.shutdown())
+
+
+def test_chronic_stale_exclusion_triggered_by_long_duration(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_chronic_stale_exclusion_long_duration")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_stale_exclusion_window_minutes": 60,
+            "market_stale_exclusion_min_enter_count": 99,
+            "market_stale_exclusion_max_single_duration_ms": 300_000,
+            "market_stale_exclusion_cooldown_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+    asyncio.run(app.load_markets())
+
+    now = datetime.now(tz=UTC)
+    with app.sqlite_store.conn:
+        app.sqlite_store.conn.execute(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                app.state.run_id,
+                "market_stale_recovered",
+                None,
+                "m1",
+                "leg_timestamp_mismatch",
+                450_000.0,
+                "",
+                now.isoformat(),
+            ),
+        )
+
+    summary = app._refresh_chronic_stale_runtime_exclusions(now_utc=now + timedelta(milliseconds=1))
+    assert "m1" in summary.active_market_ids
+    assert app.state.market_chronic_stale_reason_by_market["m1"] == "long_single_stale_duration"
+
+    asyncio.run(app.shutdown())
+
+
+def test_chronic_stale_exclusion_clears_after_cooldown(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_chronic_stale_exclusion_clears_after_cooldown")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_stale_exclusion_window_minutes": 60,
+            "market_stale_exclusion_min_enter_count": 99,
+            "market_stale_exclusion_max_single_duration_ms": 999_999,
+            "market_stale_exclusion_cooldown_ms": 1_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+    asyncio.run(app.load_markets())
+
+    now = datetime.now(tz=UTC)
+    app.state.market_chronic_stale_excluded_until["m1"] = now - timedelta(seconds=1)
+    app.state.market_chronic_stale_exclusion_started_at["m1"] = now - timedelta(minutes=1)
+    app.state.market_chronic_stale_reason_by_market["m1"] = "repeated_stale_enters"
+    app.state.market_chronic_stale_details_by_market["m1"] = {
+        "market_id": "m1",
+        "market_slug": "event-m1",
+    }
+
+    summary = app._refresh_chronic_stale_runtime_exclusions(now_utc=now)
+    assert "m1" not in summary.active_market_ids
+    assert "m1" in summary.cleared_market_ids
+
+    row = app.sqlite_store.conn.execute("""
+        SELECT event_name
+        FROM diagnostics_events
+        WHERE event_name = 'market_chronic_stale_exclusion_cleared'
+        ORDER BY id DESC
+        LIMIT 1
+        """).fetchone()
+    assert row is not None
+    assert str(row[0]) == "market_chronic_stale_exclusion_cleared"
+
+    asyncio.run(app.shutdown())
+
+
 def test_watched_market_floor_prevents_extreme_universe_shrink(tmp_path: Path) -> None:
     logger = logging.getLogger("test_watched_floor")
     logger.handlers.clear()

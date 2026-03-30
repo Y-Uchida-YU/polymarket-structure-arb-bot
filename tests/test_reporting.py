@@ -803,12 +803,68 @@ def test_daily_report_recovery_universe_change_funnel_counts(tmp_path: Path) -> 
     report = generator.generate(date=None, last_hours=24, run_id="run-1")
     recovery = report["recovery_diagnostics"]
 
-    assert recovery["recovery_universe_change_resync_started_count"] == 2
+    assert recovery["recovery_universe_change_resync_started_count"] == 1
     assert recovery["recovery_universe_change_first_quote_success_count"] == 1
     assert recovery["recovery_universe_change_book_ready_success_count"] == 1
     assert recovery["recovery_universe_change_market_ready_success_count"] == 1
     assert recovery["recovery_universe_change_first_quote_blocked_count"] == 1
-    assert recovery["recovery_universe_change_first_quote_success_rate"] == pytest.approx(0.5)
+    assert recovery["recovery_universe_change_first_quote_success_rate"] == pytest.approx(1.0)
+
+
+def test_daily_report_recovery_universe_change_funnel_is_monotonic(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "resync_started", "a1", "m1", "market_universe_changed", None, "", now),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m1",
+                    "market_universe_changed",
+                    500.0,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery",
+                    None,
+                    "m2",
+                    "market_universe_changed",
+                    550.0,
+                    "",
+                    now,
+                ),
+            ],
+        )
+    store.close()
+
+    report = DailyReportGenerator(db_path=db_path, export_dir=tmp_path).generate(
+        date=None,
+        last_hours=24,
+        run_id="run-1",
+    )
+    recovery = report["recovery_diagnostics"]
+
+    resync_count = int(recovery["recovery_universe_change_resync_started_count"])
+    first_count = int(recovery["recovery_universe_change_first_quote_success_count"])
+    book_count = int(recovery["recovery_universe_change_book_ready_success_count"])
+    market_count = int(recovery["recovery_universe_change_market_ready_success_count"])
+
+    assert resync_count == 1
+    assert first_count == 1
+    assert book_count == 1
+    assert market_count == 1
+    assert market_count <= book_count <= first_count <= resync_count
 
 
 def test_daily_report_includes_market_stale_reason_duration_and_leg_diagnostics(
@@ -1028,4 +1084,131 @@ def test_daily_report_includes_market_stale_reason_duration_and_leg_diagnostics(
     )
     assert any(
         item["side"] == "no" and item["asset_id"] == "a2" for item in recovery["top_stale_legs"]
+    )
+
+
+def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    store.upsert_market(
+        BinaryMarket(
+            market_id="m1",
+            question="Will chronic stale market 1 resolve yes?",
+            slug="chronic-market-1",
+            category="test",
+            end_time=None,
+            condition_id="cond-m1",
+            yes_token_id="a1",
+            no_token_id="a2",
+            raw={},
+        ),
+        updated_at_iso=now,
+    )
+    store.upsert_market(
+        BinaryMarket(
+            market_id="m2",
+            question="Will chronic stale market 2 resolve yes?",
+            slug="chronic-market-2",
+            category="test",
+            end_time=None,
+            condition_id="cond-m2",
+            yes_token_id="b1",
+            no_token_id="b2",
+            raw={},
+        ),
+        updated_at_iso=now,
+    )
+
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "chronic_stale_excluded_market_count", 1.0, "m1", now),
+                ("run-1", "chronic_stale_exclusion_active_count", 1.0, "m1", now),
+            ],
+        )
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "run-1",
+                    "market_chronic_stale_exclusion_entered",
+                    None,
+                    "m1",
+                    "repeated_stale_enters",
+                    None,
+                    "stale_enter_count=12;max_stale_duration_ms=450000;market_slug=chronic-market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_chronic_stale_exclusion_cleared",
+                    None,
+                    "m1",
+                    "repeated_stale_enters",
+                    120000.0,
+                    "cleared_reason=cooldown_elapsed;market_slug=chronic-market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "missing_book_state_detected",
+                    "a1",
+                    "m1",
+                    "quote_missing_after_resync",
+                    None,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "missing_book_state_detected",
+                    "a1",
+                    "m1",
+                    "quote_missing_after_resync",
+                    None,
+                    "",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "missing_book_state_detected",
+                    "b2",
+                    "m2",
+                    "book_recovering",
+                    None,
+                    "",
+                    now,
+                ),
+            ],
+        )
+    store.close()
+
+    report = DailyReportGenerator(db_path=db_path, export_dir=tmp_path).generate(
+        date=None,
+        last_hours=24,
+        run_id="run-1",
+    )
+    recovery = report["recovery_diagnostics"]
+
+    assert report["totals"]["chronic_stale_excluded_market_count"] == 1
+    assert report["totals"]["chronic_stale_exclusion_active_count"] == 1
+    assert report["totals"]["chronic_stale_exclusion_enter_count"] == 1
+    assert report["totals"]["chronic_stale_exclusion_cleared_count"] == 1
+    assert recovery["chronic_stale_reason_breakdown"][0]["reason"] == "repeated_stale_enters"
+    assert recovery["top_chronic_stale_markets"][0]["market_slug"] == "chronic-market-1"
+    assert recovery["top_quote_missing_after_resync_assets"][0]["asset_id"] == "a1"
+    assert recovery["top_quote_missing_after_resync_assets"][0]["side"] == "yes"
+    assert recovery["top_repeated_missing_book_markets"][0]["market_id"] == "m1"
+    assert (
+        recovery["top_repeated_missing_book_markets"][0]["dominant_reason"]
+        == "quote_missing_after_resync"
     )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.config.loader import MarketFilterSettings, MarketsConfig
-from src.strategy.filters import extract_binary_markets
+from src.strategy.filters import extract_binary_markets, extract_binary_markets_with_stats
 
 
 def make_raw_market(
@@ -246,3 +246,26 @@ def test_extract_binary_markets_excludes_runtime_low_quality_market_ids() -> Non
         runtime_excluded_market_ids={"2"},
     )
     assert {market.market_id for market in result} == {"1"}
+
+
+def test_extract_binary_markets_with_stats_tracks_runtime_exclusion_reason() -> None:
+    markets = [
+        make_raw_market("1", enable_order_book=True),
+        make_raw_market("2", enable_order_book=True),
+    ]
+    filters = MarketFilterSettings(
+        min_recent_activity=0.0,
+        min_liquidity_proxy=0.0,
+        min_volume_24h_proxy=0.0,
+        min_days_to_expiry=0.0,
+        max_days_to_expiry=3650.0,
+    )
+    result = extract_binary_markets_with_stats(
+        raw_markets=markets,
+        market_filters=filters,
+        markets_config=MarketsConfig(),
+        runtime_excluded_market_ids={"2"},
+        runtime_excluded_reason_by_market={"2": "chronic_stale_runtime"},
+    )
+    assert {market.market_id for market in result.markets} == {"1"}
+    assert result.excluded_counts["chronic_stale_runtime"] == 1
