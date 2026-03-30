@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from src.dashboard.data_loader import DashboardDataLoader, resolve_window
+from src.domain.market import BinaryMarket
 from src.storage.sqlite_store import SQLiteStore
 
 
@@ -167,7 +168,10 @@ def test_dashboard_loader_empty_state(tmp_path: Path) -> None:
     assert overview["min_watched_markets_floor"] == 0.0
     assert recovery["recovery_resync_started_count"] == 0.0
     assert recovery["recovery_first_quote_success_rate"] == 0.0
+    assert recovery["market_stale_enter_count"] == 0.0
+    assert recovery["avg_market_stale_duration_ms"] == 0.0
     assert recovery["top_stale_assets"].empty
+    assert recovery["top_stale_legs"].empty
     assert loader.load_run_ids() == []
     assert loader.load_pnl_timeseries(window=window, run_id=None).empty
 
@@ -313,7 +317,43 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     _seed_dashboard_data(db_path)
     store = SQLiteStore(db_path=db_path)
     now = datetime.now(tz=UTC).isoformat()
+    store.upsert_market(
+        BinaryMarket(
+            market_id="m1",
+            question="Will dashboard stale diagnostics market resolve yes?",
+            slug="market-1",
+            category="test",
+            end_time=None,
+            condition_id="cond-m1",
+            yes_token_id="a1",
+            no_token_id="a2",
+            raw={},
+        ),
+        updated_at_iso=now,
+    )
     with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "run-1",
+                    "no_signal_reason:market_quote_stale_quote_age",
+                    1.0,
+                    "market_id=m1;stale_reason_key=quote_age_exceeded;stale_side=yes",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "no_signal_reason:market_quote_stale_no_recent_quote",
+                    1.0,
+                    "market_id=m1;stale_reason_key=no_recent_quote;stale_side=no",
+                    now,
+                ),
+            ],
+        )
         store.conn.executemany(
             """
             INSERT INTO diagnostics_events
@@ -395,12 +435,74 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 (
                     "run-1",
+                    "market_stale_entered",
+                    None,
+                    "m1",
+                    "quote_age_exceeded",
+                    None,
+                    (
+                        "stale_reason_key=quote_age_exceeded;stale_side=yes;"
+                        "stale_asset_id=a1;stale_asset_ids=a1;universe_change_related=0"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_recovered",
+                    None,
+                    "m1",
+                    "quote_age_exceeded",
+                    1200.0,
+                    "stale_reason_key=quote_age_exceeded;stale_side=yes;stale_asset_ids=a1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_entered",
+                    None,
+                    "m1",
+                    "no_recent_quote",
+                    None,
+                    (
+                        "stale_reason_key=no_recent_quote;stale_side=no;"
+                        "stale_asset_id=a2;stale_asset_ids=a2;universe_change_related=1"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery_blocked",
+                    None,
+                    "m1",
+                    "market_quote_stale_quote_age",
+                    80.0,
+                    (
+                        "recovery_reason=market_universe_changed;"
+                        "stale_reason_key=leg_timestamp_mismatch;stale_side=both;stale_asset_ids=a1,a2"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
                     "eligibility_gate_unmet",
                     None,
                     "m1",
                     "book_not_ready",
                     None,
                     "category=other_readiness_gate",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "eligibility_gate_unmet",
+                    None,
+                    "m1",
+                    "market_quote_stale_quote_age",
+                    None,
+                    (
+                        "category=stale_quote_freshness;stale_reason_key=quote_age_exceeded;"
+                        "stale_side=yes;stale_asset_ids=a1"
+                    ),
                     now,
                 ),
                 ("run-1", "stale_asset_detected", "a1", "m1", "stale_asset", None, "", now),
@@ -441,15 +543,31 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert recovery["recovery_market_ready_success_rate"] == 0.5
     assert recovery["recovery_first_quote_blocked_count"] == 1.0
     assert recovery["recovery_book_ready_blocked_count"] == 1.0
-    assert recovery["recovery_market_ready_blocked_count"] == 1.0
+    assert recovery["recovery_market_ready_blocked_count"] == 2.0
     assert recovery["avg_resync_to_first_quote_latency_ms"] == 100.0
     assert recovery["avg_recovery_to_market_ready_latency_ms"] == 900.0
+    assert recovery["market_stale_enter_count"] == 2.0
+    assert recovery["market_stale_recover_count"] == 1.0
+    assert recovery["avg_market_stale_duration_ms"] == 1200.0
+    assert recovery["market_stale_universe_change_enter_count"] == 1.0
     assert not recovery["first_quote_blocked_reasons"].empty
     assert str(recovery["first_quote_blocked_reasons"].iloc[0]["reason"]) == "connection_recovering"
     assert not recovery["eligibility_gate_unmet_reasons"].empty
+    assert not recovery["market_stale_reason_breakdown"].empty
+    assert str(recovery["market_stale_reason_breakdown"].iloc[0]["reason"]) in {
+        "quote_age_exceeded",
+        "no_recent_quote",
+    }
+    assert not recovery["no_signal_stale_reason_breakdown"].empty
+    assert not recovery["market_ready_blocked_stale_reason_breakdown"].empty
+    assert not recovery["eligibility_gate_stale_reason_breakdown"].empty
+    assert not recovery["top_stale_legs"].empty
     top_stale_assets = recovery["top_stale_assets"]
     assert not top_stale_assets.empty
     assert str(top_stale_assets.iloc[0]["asset_id"]) == "a1"
     top_slow_markets = recovery["top_recovery_slow_markets"]
     assert not top_slow_markets.empty
     assert str(top_slow_markets.iloc[0]["market_id"]) == "m1"
+    top_long_stale = recovery["top_long_stale_markets"]
+    assert not top_long_stale.empty
+    assert str(top_long_stale.iloc[0]["market_id"]) == "m1"

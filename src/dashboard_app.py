@@ -637,8 +637,29 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         ),
     )
 
-    col22, col23 = st.columns(2)
-    with col22:
+    col22, col23, col24, col25 = st.columns(4)
+    col22.metric(
+        "Stale Enter",
+        int(float(recovery.get("market_stale_enter_count", 0.0))),
+    )
+    col23.metric(
+        "Stale Recover",
+        int(float(recovery.get("market_stale_recover_count", 0.0))),
+    )
+    col24.metric(
+        "Avg/Max Stale Duration (ms)",
+        (
+            f"{float(recovery.get('avg_market_stale_duration_ms', 0.0)):.1f}"
+            f" / {float(recovery.get('max_market_stale_duration_ms', 0.0)):.1f}"
+        ),
+    )
+    col25.metric(
+        "UC Stale Enter",
+        int(float(recovery.get("market_stale_universe_change_enter_count", 0.0))),
+    )
+
+    col26, col27 = st.columns(2)
+    with col26:
         st.markdown("**First Quote Blocked Reasons**")
         blocked_first = _as_frame(
             recovery.get("first_quote_blocked_reasons"),
@@ -649,7 +670,7 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         else:
             st.bar_chart(blocked_first.set_index("reason")["count"], use_container_width=True)
             st.dataframe(blocked_first, use_container_width=True, hide_index=True)
-    with col23:
+    with col27:
         st.markdown("**Book/Market Ready Blocked Reasons**")
         blocked_book = _as_frame(
             recovery.get("book_ready_blocked_reasons"),
@@ -671,6 +692,63 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.bar_chart(grouped.set_index("reason")["count"], use_container_width=True)
             st.dataframe(grouped, use_container_width=True, hide_index=True)
 
+    col28, col29 = st.columns(2)
+    with col28:
+        st.markdown("**Market Stale Reason Breakdown**")
+        stale_breakdown = _as_frame(
+            recovery.get("market_stale_reason_breakdown"),
+            columns=["reason", "count"],
+        )
+        if stale_breakdown.empty:
+            st.write("No data.")
+        else:
+            st.bar_chart(stale_breakdown.set_index("reason")["count"], use_container_width=True)
+            st.dataframe(stale_breakdown, use_container_width=True, hide_index=True)
+    with col29:
+        st.markdown("**Market Stale Side Breakdown**")
+        stale_side_breakdown = _as_frame(
+            recovery.get("market_stale_side_breakdown"),
+            columns=["reason", "count"],
+        )
+        if stale_side_breakdown.empty:
+            st.write("No data.")
+        else:
+            st.bar_chart(
+                stale_side_breakdown.set_index("reason")["count"], use_container_width=True
+            )
+            st.dataframe(stale_side_breakdown, use_container_width=True, hide_index=True)
+
+    col30, col31 = st.columns(2)
+    with col30:
+        st.markdown("**No-Signal Stale Reason Breakdown**")
+        no_signal_stale = _as_frame(
+            recovery.get("no_signal_stale_reason_breakdown"),
+            columns=["reason", "count"],
+        )
+        if no_signal_stale.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(no_signal_stale, use_container_width=True, hide_index=True)
+    with col31:
+        st.markdown("**Recovery Blocked Stale Reason Breakdown**")
+        blocked_stale = _as_frame(
+            recovery.get("market_ready_blocked_stale_reason_breakdown"),
+            columns=["reason", "count"],
+        )
+        universe_blocked_stale = _as_frame(
+            recovery.get("universe_change_market_ready_blocked_stale_reason_breakdown"),
+            columns=["reason", "count"],
+        )
+        if blocked_stale.empty and universe_blocked_stale.empty:
+            st.write("No data.")
+        else:
+            if not blocked_stale.empty:
+                st.markdown("All Recovery Blocked")
+                st.dataframe(blocked_stale, use_container_width=True, hide_index=True)
+            if not universe_blocked_stale.empty:
+                st.markdown("Universe-Change Recovery Blocked")
+                st.dataframe(universe_blocked_stale, use_container_width=True, hide_index=True)
+
     st.markdown("**Eligibility Gate Unmet Reasons (Diagnostics Events)**")
     gate_unmet = _as_frame(
         recovery.get("eligibility_gate_unmet_reasons"),
@@ -682,8 +760,18 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         st.bar_chart(gate_unmet.set_index("reason")["count"], use_container_width=True)
         st.dataframe(gate_unmet, use_container_width=True, hide_index=True)
 
-    col24, col25 = st.columns(2)
-    with col24:
+    st.markdown("**Eligibility Gate Stale Reason Breakdown**")
+    gate_stale = _as_frame(
+        recovery.get("eligibility_gate_stale_reason_breakdown"),
+        columns=["reason", "count"],
+    )
+    if gate_stale.empty:
+        st.write("No data.")
+    else:
+        st.dataframe(gate_stale, use_container_width=True, hide_index=True)
+
+    col32, col33 = st.columns(2)
+    with col32:
         st.markdown("**Top Stale Assets**")
         stale_assets = _as_frame(
             recovery.get("top_stale_assets"),
@@ -693,7 +781,26 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.write("No data.")
         else:
             st.dataframe(stale_assets, use_container_width=True, hide_index=True)
-    with col25:
+    with col33:
+        st.markdown("**Top Stale Legs/Outcomes**")
+        stale_legs = _as_frame(
+            recovery.get("top_stale_legs"),
+            columns=[
+                "market_slug",
+                "market_id",
+                "side",
+                "asset_id",
+                "stale_reason_key",
+                "count",
+            ],
+        )
+        if stale_legs.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(stale_legs, use_container_width=True, hide_index=True)
+
+    col34, col35 = st.columns(2)
+    with col34:
         st.markdown("**Top Missing Book Assets**")
         missing_assets = _as_frame(
             recovery.get("top_missing_book_assets"),
@@ -703,9 +810,7 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.write("No data.")
         else:
             st.dataframe(missing_assets, use_container_width=True, hide_index=True)
-
-    col26, col27 = st.columns(2)
-    with col26:
+    with col35:
         st.markdown("**Top Market Blocked Markets**")
         blocked_markets = _as_frame(
             recovery.get("top_market_blocked_markets"),
@@ -715,7 +820,37 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.write("No data.")
         else:
             st.dataframe(blocked_markets, use_container_width=True, hide_index=True)
-    with col27:
+
+    col36, col37 = st.columns(2)
+    with col36:
+        st.markdown("**Top Long Stale Markets**")
+        top_long_stale = _as_frame(
+            recovery.get("top_long_stale_markets"),
+            columns=[
+                "market_slug",
+                "market_id",
+                "recover_count",
+                "avg_stale_duration_ms",
+                "max_stale_duration_ms",
+            ],
+        )
+        if top_long_stale.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(top_long_stale, use_container_width=True, hide_index=True)
+    with col37:
+        st.markdown("**Top Repeated Stale Markets**")
+        top_repeated_stale = _as_frame(
+            recovery.get("top_repeated_stale_markets"),
+            columns=["market_slug", "market_id", "enter_count", "recover_count"],
+        )
+        if top_repeated_stale.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(top_repeated_stale, use_container_width=True, hide_index=True)
+
+    col38, col39 = st.columns(2)
+    with col38:
         st.markdown("**Top Recovery Slow Assets**")
         slow_assets = _as_frame(
             recovery.get("top_recovery_slow_assets"),
@@ -732,16 +867,22 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.write("No data.")
         else:
             st.dataframe(slow_assets, use_container_width=True, hide_index=True)
-
-    st.markdown("**Top Recovery Slow Markets**")
-    slow_markets = _as_frame(
-        recovery.get("top_recovery_slow_markets"),
-        columns=["market_id", "market_slug", "avg_latency_ms", "max_latency_ms", "success_count"],
-    )
-    if slow_markets.empty:
-        st.write("No data.")
-    else:
-        st.dataframe(slow_markets, use_container_width=True, hide_index=True)
+    with col39:
+        st.markdown("**Top Recovery Slow Markets**")
+        slow_markets = _as_frame(
+            recovery.get("top_recovery_slow_markets"),
+            columns=[
+                "market_id",
+                "market_slug",
+                "avg_latency_ms",
+                "max_latency_ms",
+                "success_count",
+            ],
+        )
+        if slow_markets.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(slow_markets, use_container_width=True, hide_index=True)
 
 
 def _market_asset_section(markets: pd.DataFrame, assets: pd.DataFrame, timezone: ZoneInfo) -> None:

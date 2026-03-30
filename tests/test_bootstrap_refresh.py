@@ -6,6 +6,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from src.app.bootstrap import PolymarketStructureArbApp
 from src.config.loader import AppConfig, MarketsConfig, Settings
 from src.domain.book import BookSummary, TickSizeUpdate
@@ -1966,5 +1968,99 @@ def test_market_can_be_watched_while_not_eligible(tmp_path: Path) -> None:
         """).fetchone()
     assert watched_metric is not None
     assert int(float(watched_metric[0])) == 1
+
+    asyncio.run(app.shutdown())
+
+
+def test_market_stale_transition_events_record_reason_side_and_duration(tmp_path: Path) -> None:
+    logger = logging.getLogger("test_market_stale_transition_events")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_probation_ms": 0,
+            "market_no_signal_reason_cooldown_ms": 0,
+        },
+        strategy={
+            "max_quote_age_ms_for_signal": 100,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+
+    asyncio.run(app.load_markets())
+    market = app.markets_by_id["m1"]
+    base_now = datetime.now(tz=UTC)
+
+    yes_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "yes1",
+            "ask": "0.47",
+            "bid": "0.46",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    no_payload = json.dumps(
+        {
+            "event_type": "best_bid_ask",
+            "asset_id": "no1",
+            "ask": "0.53",
+            "bid": "0.52",
+            "ask_size": "100",
+            "bid_size": "100",
+        }
+    )
+    asyncio.run(app.handle_ws_message(yes_payload))
+    asyncio.run(app.handle_ws_message(no_payload))
+
+    ready_ok, _, _ = app._evaluate_market_readiness(market=market, now_utc=base_now)
+    assert ready_ok is True
+
+    yes_quote, no_quote = app.quote_manager.get_market_quotes("m1")
+    assert yes_quote is not None
+    assert no_quote is not None
+    yes_quote.timestamp = base_now - timedelta(seconds=10)
+    no_quote.timestamp = base_now - timedelta(seconds=2)
+
+    stale_started_at = base_now + timedelta(seconds=1)
+    stale_ok, stale_reason, stale_details = app._evaluate_market_readiness(
+        market=market,
+        now_utc=stale_started_at,
+    )
+    assert stale_ok is False
+    assert stale_reason == "market_quote_stale_quote_age"
+    assert stale_details["stale_reason_key"] == "leg_timestamp_mismatch"
+    assert stale_details["stale_side"] == "yes"
+
+    stale_recovered_at = stale_started_at + timedelta(seconds=3)
+    yes_quote.timestamp = stale_recovered_at
+    no_quote.timestamp = stale_recovered_at
+    recovered_ok, _, _ = app._evaluate_market_readiness(
+        market=market,
+        now_utc=stale_recovered_at,
+    )
+    assert recovered_ok is True
+
+    rows = app.sqlite_store.conn.execute("""
+        SELECT event_name, reason, latency_ms, details
+        FROM diagnostics_events
+        WHERE event_name IN ('market_stale_entered', 'market_stale_recovered')
+        ORDER BY id ASC
+        """).fetchall()
+    assert len(rows) == 2
+    assert str(rows[0][0]) == "market_stale_entered"
+    assert str(rows[0][1]) == "leg_timestamp_mismatch"
+    assert "stale_side=yes" in str(rows[0][3] or "")
+    assert str(rows[1][0]) == "market_stale_recovered"
+    assert str(rows[1][1]) == "leg_timestamp_mismatch"
+    assert float(rows[1][2] or 0.0) == pytest.approx(3000.0, abs=1.0)
 
     asyncio.run(app.shutdown())
