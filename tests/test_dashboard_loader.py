@@ -3,9 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from src.domain.market import BinaryMarket
 from src.dashboard.data_loader import DashboardDataLoader, resolve_window
-from src.reporting.daily_report import DailyReportGenerator
 from src.storage.sqlite_store import SQLiteStore
 
 
