@@ -25,6 +25,12 @@ class ReportWindow:
     label: str
 
 
+STALE_DURATION_EVENT_NAMES: tuple[str, ...] = (
+    "market_stale_recovered",
+    "market_stale_episode_closed",
+)
+
+
 class DailyReportGenerator:
     def __init__(self, db_path: Path, export_dir: Path) -> None:
         self.db_path = db_path
@@ -1549,6 +1555,36 @@ class DailyReportGenerator:
         max_value = float(row[1]) if row[1] is not None else 0.0
         return avg_value, max_value
 
+    def _diagnostics_latency_stats_for_events(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_names: tuple[str, ...],
+    ) -> tuple[float, float]:
+        names = [name for name in event_names if name]
+        if not names:
+            return 0.0, 0.0
+        placeholders = ", ".join("?" for _ in names)
+        query = f"""
+        SELECT AVG(latency_ms), MAX(latency_ms)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name IN ({placeholders})
+          AND latency_ms IS NOT NULL
+        """
+        params: list[object] = [window.start_iso, window.end_iso, *names]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return 0.0, 0.0
+        avg_value = float(row[0]) if row[0] is not None else 0.0
+        max_value = float(row[1]) if row[1] is not None else 0.0
+        return avg_value, max_value
+
     def _top_asset_counts_for_event(
         self,
         conn: sqlite3.Connection,
@@ -1925,7 +1961,7 @@ class DailyReportGenerator:
         LEFT JOIN markets m
           ON m.market_id = d.market_id
         WHERE d.created_at >= ? AND d.created_at < ?
-          AND d.event_name = 'market_stale_recovered'
+          AND d.event_name IN ('market_stale_recovered', 'market_stale_episode_closed')
           AND d.market_id IS NOT NULL
           AND d.market_id != ''
           AND d.latency_ms IS NOT NULL
@@ -2212,11 +2248,11 @@ class DailyReportGenerator:
                 run_id=run_id,
                 event_name="market_stale_recovered",
             )
-            stale_avg_ms, stale_max_ms = self._diagnostics_latency_stats(
+            stale_avg_ms, stale_max_ms = self._diagnostics_latency_stats_for_events(
                 conn,
                 window,
                 run_id=run_id,
-                event_name="market_stale_recovered",
+                event_names=STALE_DURATION_EVENT_NAMES,
             )
             market_stale_universe_change_enter_count = (
                 self._count_diagnostics_event_with_details_like(

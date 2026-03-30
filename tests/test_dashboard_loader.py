@@ -471,6 +471,20 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 (
                     "run-1",
+                    "market_stale_episode_closed",
+                    None,
+                    "m1",
+                    "no_recent_quote",
+                    600.0,
+                    (
+                        "stale_reason_key=no_recent_quote;stale_side=no;stale_asset_id=a2;"
+                        "stale_asset_ids=a2;episode_closed_reason=reason_changed;"
+                        "next_state=stale_quote_age"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
                     "market_ready_after_recovery_blocked",
                     None,
                     "m1",
@@ -548,7 +562,7 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert recovery["avg_recovery_to_market_ready_latency_ms"] == 900.0
     assert recovery["market_stale_enter_count"] == 2.0
     assert recovery["market_stale_recover_count"] == 1.0
-    assert recovery["avg_market_stale_duration_ms"] == 1200.0
+    assert recovery["avg_market_stale_duration_ms"] == 900.0
     assert recovery["market_stale_universe_change_enter_count"] == 1.0
     assert not recovery["first_quote_blocked_reasons"].empty
     assert str(recovery["first_quote_blocked_reasons"].iloc[0]["reason"]) == "connection_recovering"

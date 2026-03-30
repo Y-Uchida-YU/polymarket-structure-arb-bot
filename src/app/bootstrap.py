@@ -97,6 +97,7 @@ DIAG_EVENT_MARKET_BLOCK_ENTERED = "market_block_entered"
 DIAG_EVENT_MARKET_BLOCK_CLEARED = "market_block_cleared"
 DIAG_EVENT_MARKET_STALE_ENTERED = "market_stale_entered"
 DIAG_EVENT_MARKET_STALE_RECOVERED = "market_stale_recovered"
+DIAG_EVENT_MARKET_STALE_EPISODE_CLOSED = "market_stale_episode_closed"
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -1777,6 +1778,117 @@ class PolymarketStructureArbApp:
 
         return MARKET_FRESHNESS_READY, context
 
+    @staticmethod
+    def _normalize_stale_asset_ids(value: object) -> str:
+        tokens = [token.strip() for token in str(value or "").split(",") if token.strip()]
+        if not tokens:
+            return ""
+        return ",".join(sorted(dict.fromkeys(tokens)))
+
+    def _market_stale_episode_signature(self, details: dict[str, object]) -> tuple[str, str, str]:
+        reason_key = normalize_stale_reason_key(str(details.get("stale_reason_key", "")))
+        stale_side = normalize_stale_side(str(details.get("stale_side", "")))
+        stale_asset_ids = self._normalize_stale_asset_ids(details.get("stale_asset_ids", ""))
+        return reason_key, stale_side, stale_asset_ids
+
+    def _open_market_stale_episode(
+        self,
+        *,
+        market_id: str,
+        stale_state: str,
+        previous_state: str,
+        details: dict[str, object],
+        now_utc: datetime,
+    ) -> None:
+        stale_reason_key = normalize_stale_reason_key(str(details.get("stale_reason_key", "")))
+        episode_details = dict(details)
+        episode_details["stale_reason_key"] = stale_reason_key
+        episode_details["stale_side"] = normalize_stale_side(
+            str(episode_details.get("stale_side", ""))
+        )
+        episode_details["stale_asset_ids"] = self._normalize_stale_asset_ids(
+            episode_details.get("stale_asset_ids", "")
+        )
+        self.state.market_stale_started_at_by_market[market_id] = now_utc
+        self.state.market_stale_reason_by_market[market_id] = stale_reason_key
+        self.state.market_stale_details_by_market[market_id] = episode_details
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_MARKET_STALE_ENTERED,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=stale_reason_key,
+            details=format_kv_details(
+                {
+                    "stale_state": stale_state,
+                    "previous_state": previous_state,
+                    "stale_reason_key": stale_reason_key,
+                    "stale_side": str(episode_details.get("stale_side", "")),
+                    "stale_asset_id": str(episode_details.get("stale_asset_id", "")),
+                    "stale_asset_ids": str(episode_details.get("stale_asset_ids", "")),
+                    "no_signal_reason": self._market_freshness_to_no_signal_reason(
+                        stale_state,
+                        details=episode_details,
+                    ),
+                    "quote_age_ms": episode_details.get("quote_age_ms"),
+                    "quote_age_threshold_ms": episode_details.get("quote_age_threshold_ms"),
+                    "leg_timestamp_diff_ms": episode_details.get("leg_timestamp_diff_ms"),
+                    "market_slug": str(episode_details.get("market_slug", "")),
+                    "market_question": str(episode_details.get("market_question", "")),
+                    "yes_asset_id": str(episode_details.get("yes_asset_id", "")),
+                    "no_asset_id": str(episode_details.get("no_asset_id", "")),
+                    "universe_change_related": str(
+                        episode_details.get("universe_change_related", 0)
+                    ),
+                }
+            ),
+        )
+
+    def _close_market_stale_episode(
+        self,
+        *,
+        market_id: str,
+        previous_state: str,
+        now_utc: datetime,
+        next_state: str,
+        close_event_name: str = DIAG_EVENT_MARKET_STALE_RECOVERED,
+        close_reason: str = "recovered",
+    ) -> None:
+        stale_started_at = self.state.market_stale_started_at_by_market.pop(market_id, None)
+        stale_reason_key = normalize_stale_reason_key(
+            self.state.market_stale_reason_by_market.pop(market_id, STALE_REASON_UNKNOWN)
+        )
+        stale_details = self.state.market_stale_details_by_market.pop(market_id, {})
+        stale_duration_ms = None
+        if stale_started_at is not None:
+            stale_duration_ms = max(0.0, (now_utc - stale_started_at).total_seconds() * 1000.0)
+        self._save_diagnostics_event(
+            event_name=close_event_name,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=stale_reason_key,
+            latency_ms=stale_duration_ms,
+            details=format_kv_details(
+                {
+                    "previous_state": previous_state,
+                    "next_state": next_state,
+                    "recovered_state": next_state if close_reason == "recovered" else "",
+                    "episode_closed_reason": close_reason,
+                    "stale_reason_key": stale_reason_key,
+                    "stale_side": str(stale_details.get("stale_side", "")),
+                    "stale_asset_id": str(stale_details.get("stale_asset_id", "")),
+                    "stale_asset_ids": str(stale_details.get("stale_asset_ids", "")),
+                    "market_slug": str(stale_details.get("market_slug", "")),
+                    "market_question": str(stale_details.get("market_question", "")),
+                    "yes_asset_id": str(stale_details.get("yes_asset_id", "")),
+                    "no_asset_id": str(stale_details.get("no_asset_id", "")),
+                    "stale_duration_ms": (
+                        round(stale_duration_ms, 3) if stale_duration_ms is not None else None
+                    ),
+                    "universe_change_related": str(stale_details.get("universe_change_related", 0)),
+                }
+            ),
+        )
+
     def _update_market_freshness_state(
         self,
         *,
@@ -1785,8 +1897,8 @@ class PolymarketStructureArbApp:
         details: dict[str, object],
         now_utc: datetime,
     ) -> None:
-        previous_state = self.state.market_freshness_state_by_market.get(market_id)
-        previous_stale = self._is_market_stale_state(previous_state or "")
+        previous_state = self.state.market_freshness_state_by_market.get(market_id, "")
+        previous_stale = self._is_market_stale_state(previous_state)
         current_stale = self._is_market_stale_state(state)
         normalized_details = dict(details)
         if current_stale:
@@ -1796,84 +1908,50 @@ class PolymarketStructureArbApp:
             normalized_details["stale_side"] = normalize_stale_side(
                 str(normalized_details.get("stale_side", ""))
             )
+            normalized_details["stale_asset_ids"] = self._normalize_stale_asset_ids(
+                normalized_details.get("stale_asset_ids", "")
+            )
         self.state.market_freshness_state_by_market[market_id] = state
         self.state.market_freshness_details_by_market[market_id] = normalized_details
         self.state.market_freshness_updated_at[market_id] = now_utc
         if current_stale:
-            stale_reason_key = str(normalized_details.get("stale_reason_key", STALE_REASON_UNKNOWN))
-            self.state.market_stale_reason_by_market[market_id] = stale_reason_key
-            self.state.market_stale_details_by_market[market_id] = normalized_details
             if not previous_stale:
-                self.state.market_stale_started_at_by_market[market_id] = now_utc
-                self._save_diagnostics_event(
-                    event_name=DIAG_EVENT_MARKET_STALE_ENTERED,
-                    now_utc=now_utc,
+                self._open_market_stale_episode(
                     market_id=market_id,
-                    reason=stale_reason_key,
-                    details=format_kv_details(
-                        {
-                            "stale_state": state,
-                            "previous_state": previous_state or "",
-                            "stale_reason_key": stale_reason_key,
-                            "stale_side": str(normalized_details.get("stale_side", "")),
-                            "stale_asset_id": str(normalized_details.get("stale_asset_id", "")),
-                            "stale_asset_ids": str(normalized_details.get("stale_asset_ids", "")),
-                            "no_signal_reason": self._market_freshness_to_no_signal_reason(
-                                state,
-                                details=normalized_details,
-                            ),
-                            "quote_age_ms": normalized_details.get("quote_age_ms"),
-                            "quote_age_threshold_ms": normalized_details.get(
-                                "quote_age_threshold_ms"
-                            ),
-                            "leg_timestamp_diff_ms": normalized_details.get(
-                                "leg_timestamp_diff_ms"
-                            ),
-                            "market_slug": str(normalized_details.get("market_slug", "")),
-                            "market_question": str(normalized_details.get("market_question", "")),
-                            "yes_asset_id": str(normalized_details.get("yes_asset_id", "")),
-                            "no_asset_id": str(normalized_details.get("no_asset_id", "")),
-                            "universe_change_related": str(
-                                normalized_details.get("universe_change_related", 0)
-                            ),
-                        }
-                    ),
+                    stale_state=state,
+                    previous_state=previous_state,
+                    details=normalized_details,
+                    now_utc=now_utc,
                 )
+            else:
+                previous_episode_details = self.state.market_stale_details_by_market.get(
+                    market_id,
+                    {},
+                )
+                previous_signature = self._market_stale_episode_signature(previous_episode_details)
+                current_signature = self._market_stale_episode_signature(normalized_details)
+                if current_signature != previous_signature:
+                    self._close_market_stale_episode(
+                        market_id=market_id,
+                        previous_state=previous_state,
+                        now_utc=now_utc,
+                        next_state=state,
+                        close_event_name=DIAG_EVENT_MARKET_STALE_EPISODE_CLOSED,
+                        close_reason="reason_changed",
+                    )
+                    self._open_market_stale_episode(
+                        market_id=market_id,
+                        stale_state=state,
+                        previous_state=previous_state,
+                        details=normalized_details,
+                        now_utc=now_utc,
+                    )
         elif previous_stale:
-            stale_started_at = self.state.market_stale_started_at_by_market.pop(market_id, None)
-            stale_reason_key = normalize_stale_reason_key(
-                self.state.market_stale_reason_by_market.pop(market_id, STALE_REASON_UNKNOWN)
-            )
-            stale_details = self.state.market_stale_details_by_market.pop(market_id, {})
-            stale_duration_ms = None
-            if stale_started_at is not None:
-                stale_duration_ms = max(0.0, (now_utc - stale_started_at).total_seconds() * 1000.0)
-            self._save_diagnostics_event(
-                event_name=DIAG_EVENT_MARKET_STALE_RECOVERED,
-                now_utc=now_utc,
+            self._close_market_stale_episode(
                 market_id=market_id,
-                reason=stale_reason_key,
-                latency_ms=stale_duration_ms,
-                details=format_kv_details(
-                    {
-                        "previous_state": previous_state or "",
-                        "recovered_state": state,
-                        "stale_reason_key": stale_reason_key,
-                        "stale_side": str(stale_details.get("stale_side", "")),
-                        "stale_asset_id": str(stale_details.get("stale_asset_id", "")),
-                        "stale_asset_ids": str(stale_details.get("stale_asset_ids", "")),
-                        "market_slug": str(stale_details.get("market_slug", "")),
-                        "market_question": str(stale_details.get("market_question", "")),
-                        "yes_asset_id": str(stale_details.get("yes_asset_id", "")),
-                        "no_asset_id": str(stale_details.get("no_asset_id", "")),
-                        "stale_duration_ms": (
-                            round(stale_duration_ms, 3) if stale_duration_ms is not None else None
-                        ),
-                        "universe_change_related": str(
-                            stale_details.get("universe_change_related", 0)
-                        ),
-                    }
-                ),
+                previous_state=previous_state,
+                now_utc=now_utc,
+                next_state=state,
             )
         if state == MARKET_FRESHNESS_READY:
             self._record_market_ready_after_recovery(market_id=market_id, now_utc=now_utc)

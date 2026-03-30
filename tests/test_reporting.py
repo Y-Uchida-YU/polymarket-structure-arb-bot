@@ -937,6 +937,20 @@ def test_daily_report_includes_market_stale_reason_duration_and_leg_diagnostics(
                 ),
                 (
                     "run-1",
+                    "market_stale_episode_closed",
+                    None,
+                    "m2",
+                    "leg_timestamp_mismatch",
+                    500.0,
+                    (
+                        "stale_reason_key=leg_timestamp_mismatch;stale_side=both;"
+                        "stale_asset_ids=b1,b2;episode_closed_reason=reason_changed;"
+                        "next_state=stale_no_recent_quote"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
                     "market_ready_after_recovery_blocked",
                     None,
                     "m2",
@@ -971,7 +985,7 @@ def test_daily_report_includes_market_stale_reason_duration_and_leg_diagnostics(
 
     assert report["totals"]["market_stale_enter_count"] == 3
     assert report["totals"]["market_stale_recover_count"] == 2
-    assert report["totals"]["avg_market_stale_duration_ms"] == pytest.approx(1000.0)
+    assert report["totals"]["avg_market_stale_duration_ms"] == pytest.approx(833.333, abs=0.01)
     assert report["totals"]["max_market_stale_duration_ms"] == pytest.approx(1200.0)
     assert report["totals"]["market_stale_universe_change_enter_count"] == 1
 
