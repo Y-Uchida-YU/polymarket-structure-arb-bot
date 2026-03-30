@@ -809,3 +809,223 @@ def test_daily_report_recovery_universe_change_funnel_counts(tmp_path: Path) -> 
     assert recovery["recovery_universe_change_market_ready_success_count"] == 1
     assert recovery["recovery_universe_change_first_quote_blocked_count"] == 1
     assert recovery["recovery_universe_change_first_quote_success_rate"] == pytest.approx(0.5)
+
+
+def test_daily_report_includes_market_stale_reason_duration_and_leg_diagnostics(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    store.upsert_market(
+        BinaryMarket(
+            market_id="m1",
+            question="Will stale diagnostics market 1 resolve yes?",
+            slug="stale-market-1",
+            category="test",
+            end_time=None,
+            condition_id="cond-m1",
+            yes_token_id="a1",
+            no_token_id="a2",
+            raw={},
+        ),
+        updated_at_iso=now,
+    )
+    store.upsert_market(
+        BinaryMarket(
+            market_id="m2",
+            question="Will stale diagnostics market 2 resolve yes?",
+            slug="stale-market-2",
+            category="test",
+            end_time=None,
+            condition_id="cond-m2",
+            yes_token_id="b1",
+            no_token_id="b2",
+            raw={},
+        ),
+        updated_at_iso=now,
+    )
+
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "run-1",
+                    "no_signal_reason:market_quote_stale_quote_age",
+                    1.0,
+                    "market_id=m1;stale_reason_key=quote_age_exceeded;stale_side=yes",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "no_signal_reason:market_quote_stale_no_recent_quote",
+                    1.0,
+                    "market_id=m1;stale_reason_key=no_recent_quote;stale_side=no",
+                    now,
+                ),
+            ],
+        )
+        store.conn.executemany(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "run-1",
+                    "market_stale_entered",
+                    None,
+                    "m1",
+                    "quote_age_exceeded",
+                    None,
+                    (
+                        "stale_reason_key=quote_age_exceeded;stale_side=yes;"
+                        "stale_asset_id=a1;stale_asset_ids=a1;universe_change_related=0"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_recovered",
+                    None,
+                    "m1",
+                    "quote_age_exceeded",
+                    1200.0,
+                    "stale_reason_key=quote_age_exceeded;stale_side=yes;stale_asset_ids=a1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_entered",
+                    None,
+                    "m1",
+                    "no_recent_quote",
+                    None,
+                    (
+                        "stale_reason_key=no_recent_quote;stale_side=no;"
+                        "stale_asset_id=a2;stale_asset_ids=a2;universe_change_related=0"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_recovered",
+                    None,
+                    "m1",
+                    "no_recent_quote",
+                    800.0,
+                    "stale_reason_key=no_recent_quote;stale_side=no;stale_asset_ids=a2",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_entered",
+                    None,
+                    "m2",
+                    "leg_timestamp_mismatch",
+                    None,
+                    (
+                        "stale_reason_key=leg_timestamp_mismatch;stale_side=both;"
+                        "stale_asset_ids=b1,b2;universe_change_related=1"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_stale_episode_closed",
+                    None,
+                    "m2",
+                    "leg_timestamp_mismatch",
+                    500.0,
+                    (
+                        "stale_reason_key=leg_timestamp_mismatch;stale_side=both;"
+                        "stale_asset_ids=b1,b2;episode_closed_reason=reason_changed;"
+                        "next_state=stale_no_recent_quote"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_ready_after_recovery_blocked",
+                    None,
+                    "m2",
+                    "market_quote_stale_quote_age",
+                    300.0,
+                    (
+                        "recovery_reason=market_universe_changed;stage=market_ready_after_recovery_blocked;"
+                        "stale_reason_key=leg_timestamp_mismatch;stale_side=both;stale_asset_ids=b1,b2"
+                    ),
+                    now,
+                ),
+                (
+                    "run-1",
+                    "eligibility_gate_unmet",
+                    None,
+                    "m1",
+                    "market_quote_stale_quote_age",
+                    None,
+                    (
+                        "category=stale_quote_freshness;stale_reason_key=quote_age_exceeded;"
+                        "stale_side=yes;stale_asset_ids=a1"
+                    ),
+                    now,
+                ),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+    recovery = report["recovery_diagnostics"]
+
+    assert report["totals"]["market_stale_enter_count"] == 3
+    assert report["totals"]["market_stale_recover_count"] == 2
+    assert report["totals"]["avg_market_stale_duration_ms"] == pytest.approx(833.333, abs=0.01)
+    assert report["totals"]["max_market_stale_duration_ms"] == pytest.approx(1200.0)
+    assert report["totals"]["market_stale_universe_change_enter_count"] == 1
+
+    stale_reason_map = {
+        item["reason"]: int(item["count"]) for item in recovery["market_stale_reason_breakdown"]
+    }
+    assert stale_reason_map["quote_age_exceeded"] == 1
+    assert stale_reason_map["no_recent_quote"] == 1
+    assert stale_reason_map["leg_timestamp_mismatch"] == 1
+
+    stale_side_map = {
+        item["reason"]: int(item["count"]) for item in recovery["market_stale_side_breakdown"]
+    }
+    assert stale_side_map["yes"] == 1
+    assert stale_side_map["no"] == 1
+    assert stale_side_map["both"] == 1
+
+    blocked_stale_map = {
+        item["reason"]: int(item["count"])
+        for item in recovery["market_ready_blocked_stale_reason_breakdown"]
+    }
+    assert blocked_stale_map["leg_timestamp_mismatch"] == 1
+
+    gate_stale_map = {
+        item["reason"]: int(item["count"])
+        for item in recovery["eligibility_gate_stale_reason_breakdown"]
+    }
+    assert gate_stale_map["quote_age_exceeded"] == 1
+
+    no_signal_stale_map = {
+        item["reason"]: int(item["count"]) for item in recovery["no_signal_stale_reason_breakdown"]
+    }
+    assert no_signal_stale_map["quote_age_exceeded"] == 1
+    assert no_signal_stale_map["no_recent_quote"] == 1
+
+    assert recovery["top_long_stale_markets"][0]["market_slug"] == "stale-market-1"
+    assert recovery["top_repeated_stale_markets"][0]["enter_count"] == 2
+    assert any(
+        item["side"] == "yes" and item["asset_id"] == "a1" for item in recovery["top_stale_legs"]
+    )
+    assert any(
+        item["side"] == "no" and item["asset_id"] == "a2" for item in recovery["top_stale_legs"]
+    )

@@ -33,6 +33,22 @@ from src.storage.sqlite_store import SQLiteStore
 from src.strategy.complement_arb import ComplementArbConfig, ComplementArbStrategy
 from src.strategy.filters import extract_binary_markets_with_stats
 from src.utils.clock import utc_now
+from src.utils.stale_diagnostics import (
+    STALE_NO_SIGNAL_REASON_NO_RECENT_QUOTE,
+    STALE_NO_SIGNAL_REASON_QUOTE_AGE,
+    STALE_REASON_LEG_TIMESTAMP_MISMATCH,
+    STALE_REASON_MISSING_LEG_QUOTE,
+    STALE_REASON_NO_RECENT_QUOTE,
+    STALE_REASON_QUOTE_AGE_EXCEEDED,
+    STALE_REASON_UNKNOWN,
+    STALE_SIDE_BOTH,
+    STALE_SIDE_NO,
+    STALE_SIDE_UNKNOWN,
+    STALE_SIDE_YES,
+    format_kv_details,
+    normalize_stale_reason_key,
+    normalize_stale_side,
+)
 
 RESYNC_REASON_WS_CONNECTED = "ws_connected"
 RESYNC_REASON_WS_RECONNECT = "ws_reconnect"
@@ -55,6 +71,10 @@ MARKET_FRESHNESS_PROBATION = "probation"
 MARKET_FRESHNESS_RECOVERING = "recovering"
 MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE = "stale_no_recent_quote"
 MARKET_FRESHNESS_STALE_QUOTE_AGE = "stale_quote_age"
+MARKET_STALE_STATES = {
+    MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE,
+    MARKET_FRESHNESS_STALE_QUOTE_AGE,
+}
 
 MARKET_QUALITY_HEALTHY = "healthy"
 MARKET_QUALITY_DEGRADED = "degraded"
@@ -75,6 +95,9 @@ DIAG_EVENT_STALE_ASSET_DETECTED = "stale_asset_detected"
 DIAG_EVENT_MISSING_BOOK_STATE_DETECTED = "missing_book_state_detected"
 DIAG_EVENT_MARKET_BLOCK_ENTERED = "market_block_entered"
 DIAG_EVENT_MARKET_BLOCK_CLEARED = "market_block_cleared"
+DIAG_EVENT_MARKET_STALE_ENTERED = "market_stale_entered"
+DIAG_EVENT_MARKET_STALE_RECOVERED = "market_stale_recovered"
+DIAG_EVENT_MARKET_STALE_EPISODE_CLOSED = "market_stale_episode_closed"
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -148,7 +171,11 @@ class AppState:
     last_book_missing_reason_by_asset: dict[str, str] = field(default_factory=dict)
     market_probation_until: dict[str, datetime] = field(default_factory=dict)
     market_freshness_state_by_market: dict[str, str] = field(default_factory=dict)
+    market_freshness_details_by_market: dict[str, dict[str, object]] = field(default_factory=dict)
     market_freshness_updated_at: dict[str, datetime] = field(default_factory=dict)
+    market_stale_started_at_by_market: dict[str, datetime] = field(default_factory=dict)
+    market_stale_reason_by_market: dict[str, str] = field(default_factory=dict)
+    market_stale_details_by_market: dict[str, dict[str, object]] = field(default_factory=dict)
     market_quality_penalty_by_market: dict[str, int] = field(default_factory=dict)
     market_low_quality_consecutive_cycles: dict[str, int] = field(default_factory=dict)
     market_quality_stage_by_market: dict[str, str] = field(default_factory=dict)
@@ -577,9 +604,29 @@ class PolymarketStructureArbApp:
             for market_id, state in self.state.market_freshness_state_by_market.items()
             if market_id in current_markets
         }
+        self.state.market_freshness_details_by_market = {
+            market_id: details
+            for market_id, details in self.state.market_freshness_details_by_market.items()
+            if market_id in current_markets
+        }
         self.state.market_freshness_updated_at = {
             market_id: ts
             for market_id, ts in self.state.market_freshness_updated_at.items()
+            if market_id in current_markets
+        }
+        self.state.market_stale_started_at_by_market = {
+            market_id: started_at
+            for market_id, started_at in self.state.market_stale_started_at_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.market_stale_reason_by_market = {
+            market_id: reason
+            for market_id, reason in self.state.market_stale_reason_by_market.items()
+            if market_id in current_markets
+        }
+        self.state.market_stale_details_by_market = {
+            market_id: details
+            for market_id, details in self.state.market_stale_details_by_market.items()
             if market_id in current_markets
         }
         self.state.market_low_quality_consecutive_cycles = {
@@ -1220,8 +1267,12 @@ class PolymarketStructureArbApp:
             market_id=market_id,
             reason=normalized_reason,
             latency_ms=latency_ms,
-            details=(
-                f"recovery_reason={recovery_reason or ''};" f"side={side};" f"stage={event_name}"
+            details=format_kv_details(
+                {
+                    "recovery_reason": recovery_reason or "",
+                    "side": side,
+                    "stage": event_name,
+                }
             ),
         )
 
@@ -1262,6 +1313,7 @@ class PolymarketStructureArbApp:
         *,
         market_id: str,
         reason: str,
+        details: dict[str, object] | None,
         now_utc: datetime,
     ) -> None:
         started_at = self.state.market_recovery_started_at_for_diagnostics.get(market_id)
@@ -1280,10 +1332,16 @@ class PolymarketStructureArbApp:
             market_id=market_id,
             reason=normalized_reason,
             latency_ms=latency_ms,
-            details=(
-                "recovery_reason="
-                f"{recovery_reason or ''};"
-                f"stage={DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED}"
+            details=format_kv_details(
+                {
+                    "recovery_reason": recovery_reason or "",
+                    "stage": DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED,
+                    "stale_reason_key": normalize_stale_reason_key(
+                        str((details or {}).get("stale_reason_key", ""))
+                    ),
+                    "stale_side": normalize_stale_side(str((details or {}).get("stale_side", ""))),
+                    "stale_asset_ids": str((details or {}).get("stale_asset_ids", "")),
+                }
             ),
         )
 
@@ -1315,6 +1373,7 @@ class PolymarketStructureArbApp:
         market_id: str,
         reason: str,
         category: str,
+        details: dict[str, object] | None,
         now_utc: datetime,
     ) -> None:
         normalized_reason = (reason or "unknown").strip() or "unknown"
@@ -1339,7 +1398,16 @@ class PolymarketStructureArbApp:
             now_utc=now_utc,
             market_id=market_id,
             reason=normalized_reason,
-            details=f"category={category}",
+            details=format_kv_details(
+                {
+                    "category": category,
+                    "stale_reason_key": normalize_stale_reason_key(
+                        str((details or {}).get("stale_reason_key", ""))
+                    ),
+                    "stale_side": normalize_stale_side(str((details or {}).get("stale_side", ""))),
+                    "stale_asset_ids": str((details or {}).get("stale_asset_ids", "")),
+                }
+            ),
         )
 
     def _mark_asset_ready(self, asset_id: str) -> None:
@@ -1501,18 +1569,69 @@ class PolymarketStructureArbApp:
         no_updates = self.state.asset_quote_update_count.get(market.no_token_id, 0)
         return yes_updates, no_updates
 
+    @staticmethod
+    def _is_market_stale_state(state: str) -> bool:
+        return state in MARKET_STALE_STATES
+
+    @staticmethod
+    def _stale_side_from_assets(*, yes_stale: bool, no_stale: bool) -> str:
+        if yes_stale and no_stale:
+            return STALE_SIDE_BOTH
+        if yes_stale:
+            return STALE_SIDE_YES
+        if no_stale:
+            return STALE_SIDE_NO
+        return STALE_SIDE_UNKNOWN
+
+    def _market_context_details(self, market: BinaryMarket) -> dict[str, object]:
+        return {
+            "market_id": market.market_id,
+            "market_slug": market.slug,
+            "market_question": market.question,
+            "yes_asset_id": market.yes_token_id,
+            "no_asset_id": market.no_token_id,
+        }
+
+    def _market_universe_change_related(self, *, market: BinaryMarket, now_utc: datetime) -> bool:
+        if (
+            self.state.market_recovery_reason_by_market.get(market.market_id)
+            == RESYNC_REASON_MARKET_UNIVERSE_CHANGED
+        ):
+            return True
+        lookback_ms = max(
+            1,
+            self.config.settings.runtime.resync_recovery_grace_ms,
+        )
+        now_ts = now_utc.timestamp()
+        for asset_id in (market.yes_token_id, market.no_token_id):
+            if (
+                self.state.last_resync_reason_by_asset.get(asset_id)
+                != RESYNC_REASON_MARKET_UNIVERSE_CHANGED
+            ):
+                continue
+            resync_ts = self.state.last_resync_at_by_asset.get(asset_id)
+            if resync_ts is None:
+                continue
+            if (now_ts - resync_ts) * 1000.0 <= lookback_ms:
+                return True
+        return False
+
     def _resolve_market_freshness_state(
         self,
         *,
         market: BinaryMarket,
         now_utc: datetime,
     ) -> tuple[str, dict[str, object]]:
+        context = self._market_context_details(market)
+        context["universe_change_related"] = int(
+            self._market_universe_change_related(market=market, now_utc=now_utc)
+        )
         if self._is_market_in_probation(market=market, now_utc=now_utc):
             probation_until = self.state.market_probation_until.get(market.market_id)
             return (
                 MARKET_FRESHNESS_PROBATION,
                 {
-                    "market_id": market.market_id,
+                    **context,
                     "probation_until": probation_until.isoformat() if probation_until else "",
                 },
             )
@@ -1521,7 +1640,7 @@ class PolymarketStructureArbApp:
             return (
                 MARKET_FRESHNESS_RECOVERING,
                 {
-                    "market_id": market.market_id,
+                    **context,
                     "recovery_reason": "connection_recovering",
                     "ws_reconnect_reason": self.state.last_ws_reconnect_reason or "",
                 },
@@ -1549,7 +1668,7 @@ class PolymarketStructureArbApp:
             return (
                 MARKET_FRESHNESS_RECOVERING,
                 {
-                    "market_id": market.market_id,
+                    **context,
                     "recovery_reason": "asset_recovering",
                 },
             )
@@ -1564,63 +1683,298 @@ class PolymarketStructureArbApp:
             return (
                 MARKET_FRESHNESS_NOT_READY,
                 {
-                    "market_id": market.market_id,
+                    **context,
                     "missing_reasons": ",".join(missing_reasons),
                 },
             )
 
         yes_quote, no_quote = self.quote_manager.get_market_quotes(market.market_id)
         if yes_quote is None or no_quote is None:
-            return MARKET_FRESHNESS_NOT_READY, {"market_id": market.market_id}
+            missing_side = (
+                STALE_SIDE_YES
+                if yes_quote is None and no_quote is not None
+                else (
+                    STALE_SIDE_NO if no_quote is None and yes_quote is not None else STALE_SIDE_BOTH
+                )
+            )
+            return (
+                MARKET_FRESHNESS_NOT_READY,
+                {
+                    **context,
+                    "stale_reason_key": STALE_REASON_MISSING_LEG_QUOTE,
+                    "stale_side": missing_side,
+                },
+            )
 
-        if (
-            market.yes_token_id in self.state.stale_assets
-            or market.no_token_id in self.state.stale_assets
-        ):
+        yes_quote_age_ms = max(0.0, (now_utc - yes_quote.timestamp).total_seconds() * 1000.0)
+        no_quote_age_ms = max(0.0, (now_utc - no_quote.timestamp).total_seconds() * 1000.0)
+        leg_timestamp_diff_ms = abs(
+            (yes_quote.timestamp - no_quote.timestamp).total_seconds() * 1000.0
+        )
+        quote_age_ms = max(yes_quote_age_ms, no_quote_age_ms)
+        max_quote_age_ms = max(1, self.config.settings.strategy.max_quote_age_ms_for_signal)
+        stale_detail_base = {
+            **context,
+            "quote_age_ms": round(quote_age_ms, 3),
+            "quote_age_threshold_ms": max_quote_age_ms,
+            "yes_quote_age_ms": round(yes_quote_age_ms, 3),
+            "no_quote_age_ms": round(no_quote_age_ms, 3),
+            "leg_timestamp_diff_ms": round(leg_timestamp_diff_ms, 3),
+        }
+
+        yes_stale = market.yes_token_id in self.state.stale_assets
+        no_stale = market.no_token_id in self.state.stale_assets
+        if yes_stale or no_stale:
+            stale_asset_ids = [
+                asset_id
+                for asset_id, is_stale in (
+                    (market.yes_token_id, yes_stale),
+                    (market.no_token_id, no_stale),
+                )
+                if is_stale
+            ]
             return (
                 MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE,
                 {
-                    "market_id": market.market_id,
+                    **stale_detail_base,
+                    "stale_reason_key": STALE_REASON_NO_RECENT_QUOTE,
+                    "stale_side": self._stale_side_from_assets(
+                        yes_stale=yes_stale,
+                        no_stale=no_stale,
+                    ),
+                    "stale_asset_id": stale_asset_ids[0] if len(stale_asset_ids) == 1 else "",
+                    "stale_asset_ids": ",".join(stale_asset_ids),
+                    "no_signal_reason": STALE_NO_SIGNAL_REASON_NO_RECENT_QUOTE,
                 },
             )
 
-        max_quote_age_ms = max(1, self.config.settings.strategy.max_quote_age_ms_for_signal)
-        quote_age_ms = max(
-            (now_utc - yes_quote.timestamp).total_seconds() * 1000.0,
-            (now_utc - no_quote.timestamp).total_seconds() * 1000.0,
-        )
         if quote_age_ms > max_quote_age_ms:
+            if abs(yes_quote_age_ms - no_quote_age_ms) <= 1.0:
+                stale_side = STALE_SIDE_BOTH
+                stale_asset_ids = f"{market.yes_token_id},{market.no_token_id}"
+                stale_asset_id = ""
+            elif yes_quote_age_ms > no_quote_age_ms:
+                stale_side = STALE_SIDE_YES
+                stale_asset_ids = market.yes_token_id
+                stale_asset_id = market.yes_token_id
+            else:
+                stale_side = STALE_SIDE_NO
+                stale_asset_ids = market.no_token_id
+                stale_asset_id = market.no_token_id
+            stale_reason_key = STALE_REASON_QUOTE_AGE_EXCEEDED
+            if leg_timestamp_diff_ms > max_quote_age_ms:
+                stale_reason_key = STALE_REASON_LEG_TIMESTAMP_MISMATCH
             return (
                 MARKET_FRESHNESS_STALE_QUOTE_AGE,
                 {
-                    "market_id": market.market_id,
-                    "quote_age_ms": round(quote_age_ms, 3),
+                    **stale_detail_base,
+                    "stale_reason_key": stale_reason_key,
+                    "stale_side": stale_side,
+                    "stale_asset_id": stale_asset_id,
+                    "stale_asset_ids": stale_asset_ids,
+                    "no_signal_reason": STALE_NO_SIGNAL_REASON_QUOTE_AGE,
                 },
             )
 
-        return MARKET_FRESHNESS_READY, {"market_id": market.market_id}
+        return MARKET_FRESHNESS_READY, context
+
+    @staticmethod
+    def _normalize_stale_asset_ids(value: object) -> str:
+        tokens = [token.strip() for token in str(value or "").split(",") if token.strip()]
+        if not tokens:
+            return ""
+        return ",".join(sorted(dict.fromkeys(tokens)))
+
+    def _market_stale_episode_signature(self, details: dict[str, object]) -> tuple[str, str, str]:
+        reason_key = normalize_stale_reason_key(str(details.get("stale_reason_key", "")))
+        stale_side = normalize_stale_side(str(details.get("stale_side", "")))
+        stale_asset_ids = self._normalize_stale_asset_ids(details.get("stale_asset_ids", ""))
+        return reason_key, stale_side, stale_asset_ids
+
+    def _open_market_stale_episode(
+        self,
+        *,
+        market_id: str,
+        stale_state: str,
+        previous_state: str,
+        details: dict[str, object],
+        now_utc: datetime,
+    ) -> None:
+        stale_reason_key = normalize_stale_reason_key(str(details.get("stale_reason_key", "")))
+        episode_details = dict(details)
+        episode_details["stale_reason_key"] = stale_reason_key
+        episode_details["stale_side"] = normalize_stale_side(
+            str(episode_details.get("stale_side", ""))
+        )
+        episode_details["stale_asset_ids"] = self._normalize_stale_asset_ids(
+            episode_details.get("stale_asset_ids", "")
+        )
+        self.state.market_stale_started_at_by_market[market_id] = now_utc
+        self.state.market_stale_reason_by_market[market_id] = stale_reason_key
+        self.state.market_stale_details_by_market[market_id] = episode_details
+        self._save_diagnostics_event(
+            event_name=DIAG_EVENT_MARKET_STALE_ENTERED,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=stale_reason_key,
+            details=format_kv_details(
+                {
+                    "stale_state": stale_state,
+                    "previous_state": previous_state,
+                    "stale_reason_key": stale_reason_key,
+                    "stale_side": str(episode_details.get("stale_side", "")),
+                    "stale_asset_id": str(episode_details.get("stale_asset_id", "")),
+                    "stale_asset_ids": str(episode_details.get("stale_asset_ids", "")),
+                    "no_signal_reason": self._market_freshness_to_no_signal_reason(
+                        stale_state,
+                        details=episode_details,
+                    ),
+                    "quote_age_ms": episode_details.get("quote_age_ms"),
+                    "quote_age_threshold_ms": episode_details.get("quote_age_threshold_ms"),
+                    "leg_timestamp_diff_ms": episode_details.get("leg_timestamp_diff_ms"),
+                    "market_slug": str(episode_details.get("market_slug", "")),
+                    "market_question": str(episode_details.get("market_question", "")),
+                    "yes_asset_id": str(episode_details.get("yes_asset_id", "")),
+                    "no_asset_id": str(episode_details.get("no_asset_id", "")),
+                    "universe_change_related": str(
+                        episode_details.get("universe_change_related", 0)
+                    ),
+                }
+            ),
+        )
+
+    def _close_market_stale_episode(
+        self,
+        *,
+        market_id: str,
+        previous_state: str,
+        now_utc: datetime,
+        next_state: str,
+        close_event_name: str = DIAG_EVENT_MARKET_STALE_RECOVERED,
+        close_reason: str = "recovered",
+    ) -> None:
+        stale_started_at = self.state.market_stale_started_at_by_market.pop(market_id, None)
+        stale_reason_key = normalize_stale_reason_key(
+            self.state.market_stale_reason_by_market.pop(market_id, STALE_REASON_UNKNOWN)
+        )
+        stale_details = self.state.market_stale_details_by_market.pop(market_id, {})
+        stale_duration_ms = None
+        if stale_started_at is not None:
+            stale_duration_ms = max(0.0, (now_utc - stale_started_at).total_seconds() * 1000.0)
+        self._save_diagnostics_event(
+            event_name=close_event_name,
+            now_utc=now_utc,
+            market_id=market_id,
+            reason=stale_reason_key,
+            latency_ms=stale_duration_ms,
+            details=format_kv_details(
+                {
+                    "previous_state": previous_state,
+                    "next_state": next_state,
+                    "recovered_state": next_state if close_reason == "recovered" else "",
+                    "episode_closed_reason": close_reason,
+                    "stale_reason_key": stale_reason_key,
+                    "stale_side": str(stale_details.get("stale_side", "")),
+                    "stale_asset_id": str(stale_details.get("stale_asset_id", "")),
+                    "stale_asset_ids": str(stale_details.get("stale_asset_ids", "")),
+                    "market_slug": str(stale_details.get("market_slug", "")),
+                    "market_question": str(stale_details.get("market_question", "")),
+                    "yes_asset_id": str(stale_details.get("yes_asset_id", "")),
+                    "no_asset_id": str(stale_details.get("no_asset_id", "")),
+                    "stale_duration_ms": (
+                        round(stale_duration_ms, 3) if stale_duration_ms is not None else None
+                    ),
+                    "universe_change_related": str(stale_details.get("universe_change_related", 0)),
+                }
+            ),
+        )
 
     def _update_market_freshness_state(
         self,
         *,
         market_id: str,
         state: str,
+        details: dict[str, object],
         now_utc: datetime,
     ) -> None:
+        previous_state = self.state.market_freshness_state_by_market.get(market_id, "")
+        previous_stale = self._is_market_stale_state(previous_state)
+        current_stale = self._is_market_stale_state(state)
+        normalized_details = dict(details)
+        if current_stale:
+            normalized_details["stale_reason_key"] = normalize_stale_reason_key(
+                str(normalized_details.get("stale_reason_key", ""))
+            )
+            normalized_details["stale_side"] = normalize_stale_side(
+                str(normalized_details.get("stale_side", ""))
+            )
+            normalized_details["stale_asset_ids"] = self._normalize_stale_asset_ids(
+                normalized_details.get("stale_asset_ids", "")
+            )
         self.state.market_freshness_state_by_market[market_id] = state
+        self.state.market_freshness_details_by_market[market_id] = normalized_details
         self.state.market_freshness_updated_at[market_id] = now_utc
+        if current_stale:
+            if not previous_stale:
+                self._open_market_stale_episode(
+                    market_id=market_id,
+                    stale_state=state,
+                    previous_state=previous_state,
+                    details=normalized_details,
+                    now_utc=now_utc,
+                )
+            else:
+                previous_episode_details = self.state.market_stale_details_by_market.get(
+                    market_id,
+                    {},
+                )
+                previous_signature = self._market_stale_episode_signature(previous_episode_details)
+                current_signature = self._market_stale_episode_signature(normalized_details)
+                if current_signature != previous_signature:
+                    self._close_market_stale_episode(
+                        market_id=market_id,
+                        previous_state=previous_state,
+                        now_utc=now_utc,
+                        next_state=state,
+                        close_event_name=DIAG_EVENT_MARKET_STALE_EPISODE_CLOSED,
+                        close_reason="reason_changed",
+                    )
+                    self._open_market_stale_episode(
+                        market_id=market_id,
+                        stale_state=state,
+                        previous_state=previous_state,
+                        details=normalized_details,
+                        now_utc=now_utc,
+                    )
+        elif previous_stale:
+            self._close_market_stale_episode(
+                market_id=market_id,
+                previous_state=previous_state,
+                now_utc=now_utc,
+                next_state=state,
+            )
         if state == MARKET_FRESHNESS_READY:
             self._record_market_ready_after_recovery(market_id=market_id, now_utc=now_utc)
 
     @staticmethod
-    def _market_freshness_to_no_signal_reason(state: str) -> str:
+    def _market_freshness_to_no_signal_reason(
+        state: str, *, details: dict[str, object] | None = None
+    ) -> str:
+        normalized_stale_reason = normalize_stale_reason_key(
+            str((details or {}).get("stale_reason_key", ""))
+        )
         mapping = {
             MARKET_FRESHNESS_NOT_READY: "market_not_ready",
             MARKET_FRESHNESS_PROBATION: "market_probation",
             MARKET_FRESHNESS_RECOVERING: "market_recovering",
-            MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE: "market_quote_stale_no_recent_quote",
-            MARKET_FRESHNESS_STALE_QUOTE_AGE: "market_quote_stale_quote_age",
+            MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE: STALE_NO_SIGNAL_REASON_NO_RECENT_QUOTE,
+            MARKET_FRESHNESS_STALE_QUOTE_AGE: STALE_NO_SIGNAL_REASON_QUOTE_AGE,
         }
+        if (
+            state == MARKET_FRESHNESS_STALE_QUOTE_AGE
+            and normalized_stale_reason == STALE_REASON_NO_RECENT_QUOTE
+        ):
+            return STALE_NO_SIGNAL_REASON_NO_RECENT_QUOTE
         return mapping.get(state, "market_not_ready")
 
     def _evaluate_market_signal_eligibility(
@@ -1638,16 +1992,25 @@ class PolymarketStructureArbApp:
             self._update_market_freshness_state(
                 market_id=market.market_id,
                 state=state,
+                details=state_details,
                 now_utc=now_utc,
             )
             if state != MARKET_FRESHNESS_READY:
-                return False, self._market_freshness_to_no_signal_reason(state), state_details
+                return (
+                    False,
+                    self._market_freshness_to_no_signal_reason(state, details=state_details),
+                    state_details,
+                )
 
         if state != MARKET_FRESHNESS_READY:
+            details = self.state.market_freshness_details_by_market.get(
+                market.market_id,
+                {"market_id": market.market_id},
+            )
             return (
                 False,
-                self._market_freshness_to_no_signal_reason(state),
-                {"market_id": market.market_id},
+                self._market_freshness_to_no_signal_reason(state, details=details),
+                details,
             )
 
         min_updates = max(
@@ -1689,11 +2052,12 @@ class PolymarketStructureArbApp:
         self._update_market_freshness_state(
             market_id=market.market_id,
             state=state,
+            details=details,
             now_utc=now_utc,
         )
         if state == MARKET_FRESHNESS_READY:
             return True, "market_ready", details
-        return False, self._market_freshness_to_no_signal_reason(state), details
+        return False, self._market_freshness_to_no_signal_reason(state, details=details), details
 
     def _update_asset_level_safe_mode(
         self,
@@ -2833,18 +3197,40 @@ class PolymarketStructureArbApp:
             "low_quality_runtime_excluded": 0,
             "other_readiness_gate": 0,
         }
+        stale_reason_counts: dict[str, int] = {}
+        stale_side_counts: dict[str, int] = {}
+        stale_universe_change_related_count = 0
         for market in self.markets_by_id.values():
-            market_state, _ = self._resolve_market_freshness_state(market=market, now_utc=now)
+            market_state, market_state_details = self._resolve_market_freshness_state(
+                market=market,
+                now_utc=now,
+            )
             self._update_market_freshness_state(
                 market_id=market.market_id,
                 state=market_state,
+                details=market_state_details,
                 now_utc=now,
             )
             market_state_counts[market_state] = market_state_counts.get(market_state, 0) + 1
+            if self._is_market_stale_state(market_state):
+                stale_reason_key = normalize_stale_reason_key(
+                    str(market_state_details.get("stale_reason_key", ""))
+                )
+                stale_side = normalize_stale_side(str(market_state_details.get("stale_side", "")))
+                stale_reason_counts[stale_reason_key] = (
+                    stale_reason_counts.get(stale_reason_key, 0) + 1
+                )
+                stale_side_counts[stale_side] = stale_side_counts.get(stale_side, 0) + 1
+                if int(str(market_state_details.get("universe_change_related", 0)) or 0) > 0:
+                    stale_universe_change_related_count += 1
             if market_state != MARKET_FRESHNESS_READY:
                 self._record_market_ready_after_recovery_blocked(
                     market_id=market.market_id,
-                    reason=self._market_freshness_to_no_signal_reason(market_state),
+                    reason=self._market_freshness_to_no_signal_reason(
+                        market_state,
+                        details=market_state_details,
+                    ),
+                    details=market_state_details,
                     now_utc=now,
                 )
             yes_updates, no_updates = self._market_quote_update_counts(market)
@@ -2895,9 +3281,11 @@ class PolymarketStructureArbApp:
             self.state.market_quality_stage_by_market[market.market_id] = quality_stage
             quality_stage_counts[quality_stage] = quality_stage_counts.get(quality_stage, 0) + 1
 
-            eligibility_ok, eligibility_reason, _ = self._evaluate_market_signal_eligibility(
-                market=market,
-                now_utc=now,
+            eligibility_ok, eligibility_reason, eligibility_details = (
+                self._evaluate_market_signal_eligibility(
+                    market=market,
+                    now_utc=now,
+                )
             )
             if eligibility_ok:
                 continue
@@ -2914,6 +3302,7 @@ class PolymarketStructureArbApp:
                 market_id=market.market_id,
                 reason=eligibility_reason,
                 category=gate_category,
+                details=eligibility_details,
                 now_utc=now,
             )
         self.state.eligible_markets = eligible_markets
@@ -3049,6 +3438,61 @@ class PolymarketStructureArbApp:
                 },
                 now_utc=now,
             )
+        for reason_key, reason_value in sorted(stale_reason_counts.items()):
+            metric_name = f"market_stale_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(reason_value),
+                details=f"tracked_markets={len(self.markets_by_id)}",
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": reason_value,
+                    "tracked_markets": len(self.markets_by_id),
+                },
+                now_utc=now,
+            )
+        for side_key, side_value in sorted(stale_side_counts.items()):
+            metric_name = f"market_stale_side:{side_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(side_value),
+                details=f"tracked_markets={len(self.markets_by_id)}",
+                created_at_iso=now.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": side_value,
+                    "tracked_markets": len(self.markets_by_id),
+                },
+                now_utc=now,
+            )
+        self.sqlite_store.save_metric(
+            metric_name="market_stale_universe_change_related_count",
+            metric_value=float(stale_universe_change_related_count),
+            details=f"tracked_markets={len(self.markets_by_id)}",
+            created_at_iso=now.isoformat(),
+            run_id=self.state.run_id,
+        )
+        self.csv_logger.log_metric(
+            {
+                "run_id": self.state.run_id,
+                "created_at": now.isoformat(),
+                "metric_name": "market_stale_universe_change_related_count",
+                "metric_value": stale_universe_change_related_count,
+                "tracked_markets": len(self.markets_by_id),
+            },
+            now_utc=now,
+        )
         for stage_name, stage_value in quality_stage_counts.items():
             metric_name = f"market_quality_stage_{stage_name}_count"
             self.sqlite_store.save_metric(

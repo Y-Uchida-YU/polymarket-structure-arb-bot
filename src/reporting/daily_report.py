@@ -9,12 +9,26 @@ from typing import Any
 
 import pandas as pd
 
+from src.utils.stale_diagnostics import (
+    extract_detail_value,
+    normalize_stale_reason_key,
+    normalize_stale_side,
+    parse_kv_details,
+    stale_reason_key_from_reason_and_details,
+)
+
 
 @dataclass(slots=True)
 class ReportWindow:
     start_iso: str
     end_iso: str
     label: str
+
+
+STALE_DURATION_EVENT_NAMES: tuple[str, ...] = (
+    "market_stale_recovered",
+    "market_stale_episode_closed",
+)
 
 
 class DailyReportGenerator:
@@ -404,6 +418,21 @@ class DailyReportGenerator:
                 "eligible_market_count": eligible_market_count,
                 "eligible_market_ratio": eligible_market_ratio,
                 "blocked_market_count": blocked_market_count,
+                "market_stale_enter_count": int(
+                    recovery_diagnostics.get("market_stale_enter_count", 0)
+                ),
+                "market_stale_recover_count": int(
+                    recovery_diagnostics.get("market_stale_recover_count", 0)
+                ),
+                "avg_market_stale_duration_ms": float(
+                    recovery_diagnostics.get("avg_market_stale_duration_ms", 0.0)
+                ),
+                "max_market_stale_duration_ms": float(
+                    recovery_diagnostics.get("max_market_stale_duration_ms", 0.0)
+                ),
+                "market_stale_universe_change_enter_count": int(
+                    recovery_diagnostics.get("market_stale_universe_change_enter_count", 0)
+                ),
                 "eligibility_gate_connection_recovering_count": eligibility_gate_reason_map.get(
                     "connection_recovering",
                     0,
@@ -526,6 +555,20 @@ class DailyReportGenerator:
             f"ready_market_ratio: {totals['ready_market_ratio']:.3f}",
             f"recovering_market_count: {totals['recovering_market_count']}",
             f"stale_market_count: {totals['stale_market_count']}",
+            (
+                "market_stale_transitions(enter/recover): "
+                f"{totals.get('market_stale_enter_count', 0)}/"
+                f"{totals.get('market_stale_recover_count', 0)}"
+            ),
+            (
+                "market_stale_duration_avg_max_ms: "
+                f"{float(totals.get('avg_market_stale_duration_ms', 0.0)):.1f}/"
+                f"{float(totals.get('max_market_stale_duration_ms', 0.0)):.1f}"
+            ),
+            (
+                "market_stale_universe_change_enter_count: "
+                f"{totals.get('market_stale_universe_change_enter_count', 0)}"
+            ),
             f"eligible_market_count: {totals['eligible_market_count']}",
             f"eligible_market_ratio: {totals['eligible_market_ratio']:.3f}",
             f"blocked_market_count: {totals['blocked_market_count']}",
@@ -656,6 +699,47 @@ class DailyReportGenerator:
                 for item in recovery["market_ready_blocked_reasons"][:5]
             )
             lines.append(f"top_recovery_market_ready_blocked_reasons: {market_ready_blocked}")
+        if recovery.get("market_stale_reason_breakdown"):
+            stale_reason_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["market_stale_reason_breakdown"][:5]
+            )
+            lines.append(f"market_stale_reason_breakdown: {stale_reason_summary}")
+        if recovery.get("market_stale_side_breakdown"):
+            stale_side_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["market_stale_side_breakdown"][:5]
+            )
+            lines.append(f"market_stale_side_breakdown: {stale_side_summary}")
+        if recovery.get("no_signal_stale_reason_breakdown"):
+            stale_no_signal_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["no_signal_stale_reason_breakdown"][:5]
+            )
+            lines.append(f"no_signal_stale_reason_breakdown: {stale_no_signal_summary}")
+        if recovery.get("market_ready_blocked_stale_reason_breakdown"):
+            blocked_stale_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["market_ready_blocked_stale_reason_breakdown"][:5]
+            )
+            lines.append(f"market_ready_blocked_stale_reason_breakdown: {blocked_stale_summary}")
+        if recovery.get("eligibility_gate_stale_reason_breakdown"):
+            gate_stale_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["eligibility_gate_stale_reason_breakdown"][:5]
+            )
+            lines.append(f"eligibility_gate_stale_reason_breakdown: {gate_stale_summary}")
+        if recovery.get("universe_change_market_ready_blocked_stale_reason_breakdown"):
+            universe_blocked_stale_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["universe_change_market_ready_blocked_stale_reason_breakdown"][
+                    :5
+                ]
+            )
+            lines.append(
+                "universe_change_market_ready_blocked_stale_reason_breakdown: "
+                f"{universe_blocked_stale_summary}"
+            )
         if recovery.get("top_stale_assets"):
             stale_summary = ", ".join(
                 f"{item['asset_id']}={item['count']}" for item in recovery["top_stale_assets"][:5]
@@ -673,6 +757,34 @@ class DailyReportGenerator:
                 for item in recovery["top_market_blocked_markets"][:5]
             )
             lines.append(f"top_market_blocked_markets: {blocked_summary}")
+        if recovery.get("top_long_stale_markets"):
+            long_stale_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}="
+                    f"{float(item.get('max_stale_duration_ms', 0.0)):.1f}ms"
+                )
+                for item in recovery["top_long_stale_markets"][:5]
+            )
+            lines.append(f"top_long_stale_markets: {long_stale_summary}")
+        if recovery.get("top_repeated_stale_markets"):
+            repeated_stale_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}="
+                    f"{int(item.get('enter_count', 0))}"
+                )
+                for item in recovery["top_repeated_stale_markets"][:5]
+            )
+            lines.append(f"top_repeated_stale_markets: {repeated_stale_summary}")
+        if recovery.get("top_stale_legs"):
+            stale_legs_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}:"
+                    f"{item.get('side')}({item.get('asset_id')})="
+                    f"{int(item.get('count', 0))}"
+                )
+                for item in recovery["top_stale_legs"][:5]
+            )
+            lines.append(f"top_stale_legs: {stale_legs_summary}")
         if report.get("warnings"):
             lines.append("warnings: " + ", ".join(report["warnings"]))
         return "\n".join(lines)
@@ -1325,13 +1437,7 @@ class DailyReportGenerator:
         compact = details.strip()
         if key == "reason" and compact and "=" not in compact:
             return compact
-        prefix = f"{key}="
-        for token in details.split(";"):
-            token = token.strip()
-            if token.startswith(prefix):
-                value = token[len(prefix) :].strip()
-                return value or None
-        return None
+        return extract_detail_value(details, key)
 
     @staticmethod
     def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -1381,6 +1487,20 @@ class DailyReportGenerator:
             "recovery_universe_change_first_quote_success_rate": 0.0,
             "recovery_universe_change_book_ready_success_rate": 0.0,
             "recovery_universe_change_market_ready_success_rate": 0.0,
+            "market_stale_enter_count": 0,
+            "market_stale_recover_count": 0,
+            "avg_market_stale_duration_ms": 0.0,
+            "max_market_stale_duration_ms": 0.0,
+            "market_stale_universe_change_enter_count": 0,
+            "market_stale_reason_breakdown": [],
+            "market_stale_side_breakdown": [],
+            "market_ready_blocked_stale_reason_breakdown": [],
+            "eligibility_gate_stale_reason_breakdown": [],
+            "no_signal_stale_reason_breakdown": [],
+            "universe_change_market_ready_blocked_stale_reason_breakdown": [],
+            "top_long_stale_markets": [],
+            "top_repeated_stale_markets": [],
+            "top_stale_legs": [],
             "top_stale_assets": [],
             "top_missing_book_assets": [],
             "top_market_blocked_markets": [],
@@ -1425,6 +1545,36 @@ class DailyReportGenerator:
           AND latency_ms IS NOT NULL
         """
         params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return 0.0, 0.0
+        avg_value = float(row[0]) if row[0] is not None else 0.0
+        max_value = float(row[1]) if row[1] is not None else 0.0
+        return avg_value, max_value
+
+    def _diagnostics_latency_stats_for_events(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_names: tuple[str, ...],
+    ) -> tuple[float, float]:
+        names = [name for name in event_names if name]
+        if not names:
+            return 0.0, 0.0
+        placeholders = ", ".join("?" for _ in names)
+        query = f"""
+        SELECT AVG(latency_ms), MAX(latency_ms)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name IN ({placeholders})
+          AND latency_ms IS NOT NULL
+        """
+        params: list[object] = [window.start_iso, window.end_iso, *names]
         if run_id is not None:
             query += " AND run_id = ?"
             params.append(run_id)
@@ -1712,6 +1862,255 @@ class DailyReportGenerator:
             for row in rows
         ]
 
+    def _diagnostics_detail_breakdown_for_event(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_name: str,
+        detail_key: str,
+        reason_like: str | None = None,
+        details_like: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT reason, details
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if reason_like is not None:
+            query += " AND reason LIKE ?"
+            params.append(reason_like)
+        if details_like is not None:
+            query += " AND details LIKE ?"
+            params.append(details_like)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[str, int] = {}
+        for reason_value, details_value in rows:
+            reason_text = str(reason_value or "")
+            details_text = str(details_value or "")
+            detail = self._extract_kv_from_details(details_text, detail_key)
+            if detail_key == "stale_reason_key":
+                detail = stale_reason_key_from_reason_and_details(
+                    reason=reason_text,
+                    details=details_text,
+                )
+                detail = normalize_stale_reason_key(detail)
+            elif detail_key == "stale_side":
+                detail = normalize_stale_side(detail)
+            key = (detail or "unknown").strip() or "unknown"
+            counts[key] = counts.get(key, 0) + 1
+        items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        return [{"reason": reason, "count": count} for reason, count in items[: max(1, int(limit))]]
+
+    def _metric_stale_reason_breakdown(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT metric_name, details, metric_value
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE 'no_signal_reason:market_quote_stale%'
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[str, int] = {}
+        for metric_name, details, metric_value in rows:
+            reason = str(metric_name).split(":", 1)[-1]
+            stale_reason_key = stale_reason_key_from_reason_and_details(
+                reason=reason,
+                details=str(details or ""),
+            )
+            normalized = normalize_stale_reason_key(stale_reason_key)
+            increment = int(round(float(metric_value if metric_value is not None else 1.0)))
+            counts[normalized] = counts.get(normalized, 0) + max(1, increment)
+        items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        return [{"reason": reason, "count": count} for reason, count in items[: max(1, int(limit))]]
+
+    def _top_long_stale_markets(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          COUNT(*) AS recover_count,
+          AVG(d.latency_ms) AS avg_stale_duration_ms,
+          MAX(d.latency_ms) AS max_stale_duration_ms,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name IN ('market_stale_recovered', 'market_stale_episode_closed')
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+          AND d.latency_ms IS NOT NULL
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id ORDER BY MAX(d.latency_ms) DESC, AVG(d.latency_ms) DESC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "market_id": str(row[0]),
+                "recover_count": int(row[1] if row[1] is not None else 0),
+                "avg_stale_duration_ms": float(row[2] if row[2] is not None else 0.0),
+                "max_stale_duration_ms": float(row[3] if row[3] is not None else 0.0),
+                "market_slug": str(row[4] if row[4] is not None else ""),
+                "market_question": str(row[5] if row[5] is not None else ""),
+            }
+            for row in rows
+        ]
+
+    def _top_repeated_stale_markets(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          SUM(CASE WHEN d.event_name = 'market_stale_entered' THEN 1 ELSE 0 END) AS enter_count,
+          SUM(CASE WHEN d.event_name = 'market_stale_recovered' THEN 1 ELSE 0 END) AS recover_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name IN ('market_stale_entered', 'market_stale_recovered')
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id"
+            " HAVING SUM(CASE WHEN d.event_name = 'market_stale_entered' THEN 1 ELSE 0 END) > 0"
+            " ORDER BY enter_count DESC, recover_count DESC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "market_id": str(row[0]),
+                "enter_count": int(row[1] if row[1] is not None else 0),
+                "recover_count": int(row[2] if row[2] is not None else 0),
+                "market_slug": str(row[3] if row[3] is not None else ""),
+                "market_question": str(row[4] if row[4] is not None else ""),
+            }
+            for row in rows
+        ]
+
+    def _top_stale_legs(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason,
+          d.details,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question,
+          MAX(COALESCE(m.yes_token_id, '')) AS yes_asset_id,
+          MAX(COALESCE(m.no_token_id, '')) AS no_asset_id
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_stale_entered'
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY d.id ORDER BY d.created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for row in rows:
+            market_id = str(row[0] or "")
+            reason = str(row[1] or "")
+            details = str(row[2] or "")
+            market_slug = str(row[3] or "")
+            market_question = str(row[4] or "")
+            yes_asset_id = str(row[5] or "")
+            no_asset_id = str(row[6] or "")
+            detail_map = parse_kv_details(details)
+            stale_reason_key = stale_reason_key_from_reason_and_details(
+                reason=reason, details=details
+            )
+            asset_ids_raw = detail_map.get("stale_asset_ids") or detail_map.get(
+                "stale_asset_id", ""
+            )
+            candidate_assets = [item.strip() for item in asset_ids_raw.split(",") if item.strip()]
+            if not candidate_assets:
+                stale_side = normalize_stale_side(detail_map.get("stale_side"))
+                if stale_side in {"yes", "both"} and yes_asset_id:
+                    candidate_assets.append(yes_asset_id)
+                if stale_side in {"no", "both"} and no_asset_id:
+                    candidate_assets.append(no_asset_id)
+            for asset_id in candidate_assets:
+                side = "unknown"
+                if asset_id == yes_asset_id:
+                    side = "yes"
+                elif asset_id == no_asset_id:
+                    side = "no"
+                key = (market_id, asset_id, side)
+                entry = counts.setdefault(
+                    key,
+                    {
+                        "market_id": market_id,
+                        "asset_id": asset_id,
+                        "side": side,
+                        "count": 0,
+                        "market_slug": market_slug,
+                        "market_question": market_question,
+                        "stale_reason_key": normalize_stale_reason_key(stale_reason_key),
+                    },
+                )
+                entry["count"] += 1
+        top_items = sorted(
+            counts.values(),
+            key=lambda item: int(item.get("count", 0)),
+            reverse=True,
+        )
+        return top_items[: max(1, int(limit))]
+
     def _recovery_diagnostics(
         self,
         conn: sqlite3.Connection,
@@ -1837,6 +2236,83 @@ class DailyReportGenerator:
                 event_name="market_ready_after_recovery_blocked",
                 details_like="%recovery_reason=market_universe_changed%",
             )
+            market_stale_enter_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_stale_entered",
+            )
+            market_stale_recover_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_stale_recovered",
+            )
+            stale_avg_ms, stale_max_ms = self._diagnostics_latency_stats_for_events(
+                conn,
+                window,
+                run_id=run_id,
+                event_names=STALE_DURATION_EVENT_NAMES,
+            )
+            market_stale_universe_change_enter_count = (
+                self._count_diagnostics_event_with_details_like(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="market_stale_entered",
+                    details_like="%universe_change_related=1%",
+                )
+            )
+            market_stale_reason_breakdown = self._diagnostics_detail_breakdown_for_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_stale_entered",
+                detail_key="stale_reason_key",
+            )
+            market_stale_side_breakdown = self._diagnostics_detail_breakdown_for_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_stale_entered",
+                detail_key="stale_side",
+            )
+            market_ready_blocked_stale_reason_breakdown = (
+                self._diagnostics_detail_breakdown_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery_blocked",
+                    detail_key="stale_reason_key",
+                    reason_like="market_quote_stale%",
+                )
+            )
+            eligibility_gate_stale_reason_breakdown = self._diagnostics_detail_breakdown_for_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="eligibility_gate_unmet",
+                detail_key="stale_reason_key",
+                details_like="%category=stale_quote_freshness%",
+            )
+            no_signal_stale_reason_breakdown = self._metric_stale_reason_breakdown(
+                conn,
+                window,
+                run_id=run_id,
+            )
+            if not market_stale_reason_breakdown:
+                market_stale_reason_breakdown = no_signal_stale_reason_breakdown
+            universe_change_market_ready_blocked_stale_reason_breakdown = (
+                self._diagnostics_detail_breakdown_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="market_ready_after_recovery_blocked",
+                    detail_key="stale_reason_key",
+                    reason_like="market_quote_stale%",
+                    details_like="%recovery_reason=market_universe_changed%",
+                )
+            )
             return {
                 "recovery_resync_started_count": resync_started_count,
                 "recovery_first_quote_success_count": first_quote_success_count,
@@ -1926,6 +2402,23 @@ class DailyReportGenerator:
                     if universe_resync_started_count > 0
                     else 0.0
                 ),
+                "market_stale_enter_count": market_stale_enter_count,
+                "market_stale_recover_count": market_stale_recover_count,
+                "avg_market_stale_duration_ms": stale_avg_ms,
+                "max_market_stale_duration_ms": stale_max_ms,
+                "market_stale_universe_change_enter_count": (
+                    market_stale_universe_change_enter_count
+                ),
+                "market_stale_reason_breakdown": market_stale_reason_breakdown,
+                "market_stale_side_breakdown": market_stale_side_breakdown,
+                "market_ready_blocked_stale_reason_breakdown": (
+                    market_ready_blocked_stale_reason_breakdown
+                ),
+                "eligibility_gate_stale_reason_breakdown": eligibility_gate_stale_reason_breakdown,
+                "no_signal_stale_reason_breakdown": no_signal_stale_reason_breakdown,
+                "universe_change_market_ready_blocked_stale_reason_breakdown": (
+                    universe_change_market_ready_blocked_stale_reason_breakdown
+                ),
                 "top_stale_assets": self._top_asset_counts_for_event(
                     conn,
                     window,
@@ -1950,6 +2443,21 @@ class DailyReportGenerator:
                     run_id=run_id,
                 ),
                 "top_recovery_slow_markets": self._top_slow_markets(
+                    conn,
+                    window,
+                    run_id=run_id,
+                ),
+                "top_long_stale_markets": self._top_long_stale_markets(
+                    conn,
+                    window,
+                    run_id=run_id,
+                ),
+                "top_repeated_stale_markets": self._top_repeated_stale_markets(
+                    conn,
+                    window,
+                    run_id=run_id,
+                ),
+                "top_stale_legs": self._top_stale_legs(
                     conn,
                     window,
                     run_id=run_id,

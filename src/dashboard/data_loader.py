@@ -7,11 +7,25 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.utils.stale_diagnostics import (
+    extract_detail_value,
+    normalize_stale_reason_key,
+    normalize_stale_side,
+    parse_kv_details,
+    stale_reason_key_from_reason_and_details,
+)
+
 
 @dataclass(slots=True)
 class DashboardWindow:
     start_iso: str
     end_iso: str
+
+
+STALE_DURATION_EVENT_NAMES: tuple[str, ...] = (
+    "market_stale_recovered",
+    "market_stale_episode_closed",
+)
 
 
 def resolve_window(
@@ -975,6 +989,85 @@ class DashboardDataLoader:
                         details_like="%recovery_reason=market_universe_changed%",
                     )
                 )
+                market_stale_enter_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_stale_entered",
+                )
+                market_stale_recover_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_stale_recovered",
+                )
+                stale_avg_ms, stale_max_ms = self._diagnostics_latency_stats_for_events(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_names=STALE_DURATION_EVENT_NAMES,
+                )
+                market_stale_universe_change_enter_count = (
+                    self._count_diagnostics_event_with_details_like(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="market_stale_entered",
+                        details_like="%universe_change_related=1%",
+                    )
+                )
+                market_stale_reason_breakdown = self._diagnostics_detail_breakdown_for_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_stale_entered",
+                    detail_key="stale_reason_key",
+                )
+                market_stale_side_breakdown = self._diagnostics_detail_breakdown_for_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_stale_entered",
+                    detail_key="stale_side",
+                )
+                market_ready_blocked_stale_reason_breakdown = (
+                    self._diagnostics_detail_breakdown_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="market_ready_after_recovery_blocked",
+                        detail_key="stale_reason_key",
+                        reason_like="market_quote_stale%",
+                    )
+                )
+                eligibility_gate_stale_reason_breakdown = (
+                    self._diagnostics_detail_breakdown_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="eligibility_gate_unmet",
+                        detail_key="stale_reason_key",
+                        details_like="%category=stale_quote_freshness%",
+                    )
+                )
+                no_signal_stale_reason_breakdown = self._metric_stale_reason_breakdown(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                )
+                if market_stale_reason_breakdown.empty:
+                    market_stale_reason_breakdown = no_signal_stale_reason_breakdown.copy()
+                universe_change_market_ready_blocked_stale_reason_breakdown = (
+                    self._diagnostics_detail_breakdown_for_event(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                        event_name="market_ready_after_recovery_blocked",
+                        detail_key="stale_reason_key",
+                        reason_like="market_quote_stale%",
+                        details_like="%recovery_reason=market_universe_changed%",
+                    )
+                )
                 return {
                     "recovery_resync_started_count": float(resync_started_count),
                     "recovery_first_quote_success_count": float(first_quote_success_count),
@@ -1066,6 +1159,25 @@ class DashboardDataLoader:
                         if universe_resync_started_count > 0
                         else 0.0
                     ),
+                    "market_stale_enter_count": float(market_stale_enter_count),
+                    "market_stale_recover_count": float(market_stale_recover_count),
+                    "avg_market_stale_duration_ms": stale_avg_ms,
+                    "max_market_stale_duration_ms": stale_max_ms,
+                    "market_stale_universe_change_enter_count": float(
+                        market_stale_universe_change_enter_count
+                    ),
+                    "market_stale_reason_breakdown": market_stale_reason_breakdown,
+                    "market_stale_side_breakdown": market_stale_side_breakdown,
+                    "market_ready_blocked_stale_reason_breakdown": (
+                        market_ready_blocked_stale_reason_breakdown
+                    ),
+                    "eligibility_gate_stale_reason_breakdown": (
+                        eligibility_gate_stale_reason_breakdown
+                    ),
+                    "no_signal_stale_reason_breakdown": no_signal_stale_reason_breakdown,
+                    "universe_change_market_ready_blocked_stale_reason_breakdown": (
+                        universe_change_market_ready_blocked_stale_reason_breakdown
+                    ),
                     "top_stale_assets": self._top_diagnostics_counts(
                         conn=conn,
                         window=window,
@@ -1093,6 +1205,21 @@ class DashboardDataLoader:
                         run_id=run_id,
                     ),
                     "top_recovery_slow_markets": self._top_slow_markets(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                    ),
+                    "top_long_stale_markets": self._top_long_stale_markets(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                    ),
+                    "top_repeated_stale_markets": self._top_repeated_stale_markets(
+                        conn=conn,
+                        window=window,
+                        run_id=run_id,
+                    ),
+                    "top_stale_legs": self._top_stale_legs(
                         conn=conn,
                         window=window,
                         run_id=run_id,
@@ -1370,6 +1497,246 @@ class DashboardDataLoader:
         frame["reason"] = frame["reason"].fillna("unknown")
         return frame
 
+    def _diagnostics_detail_breakdown_for_event(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_name: str,
+        detail_key: str,
+        reason_like: str | None = None,
+        details_like: str | None = None,
+        limit: int = 10,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT reason, details
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if reason_like is not None:
+            query += " AND reason LIKE ?"
+            params.append(reason_like)
+        if details_like is not None:
+            query += " AND details LIKE ?"
+            params.append(details_like)
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[str, int] = {}
+        for reason_value, details_value in rows:
+            reason_text = str(reason_value or "")
+            details_text = str(details_value or "")
+            detail = self._extract_kv(details_text, detail_key)
+            if detail_key == "stale_reason_key":
+                detail = stale_reason_key_from_reason_and_details(
+                    reason=reason_text,
+                    details=details_text,
+                )
+                detail = normalize_stale_reason_key(detail)
+            elif detail_key == "stale_side":
+                detail = normalize_stale_side(detail)
+            key = (detail or "unknown").strip() or "unknown"
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return pd.DataFrame(columns=["reason", "count"])
+        rows_out = sorted(counts.items(), key=lambda item: item[1], reverse=True)[
+            : max(1, int(limit))
+        ]
+        return pd.DataFrame(rows_out, columns=["reason", "count"])
+
+    def _metric_stale_reason_breakdown(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        limit: int = 10,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT metric_name, details, metric_value
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name LIKE 'no_signal_reason:market_quote_stale%'
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[str, int] = {}
+        for metric_name, details, metric_value in rows:
+            metric_reason = str(metric_name).split(":", 1)[-1]
+            stale_reason = stale_reason_key_from_reason_and_details(
+                reason=metric_reason,
+                details=str(details or ""),
+            )
+            normalized_reason = normalize_stale_reason_key(stale_reason)
+            increment = int(round(float(metric_value if metric_value is not None else 1.0)))
+            counts[normalized_reason] = counts.get(normalized_reason, 0) + max(1, increment)
+        if not counts:
+            return pd.DataFrame(columns=["reason", "count"])
+        rows_out = sorted(counts.items(), key=lambda item: item[1], reverse=True)[
+            : max(1, int(limit))
+        ]
+        return pd.DataFrame(rows_out, columns=["reason", "count"])
+
+    def _top_long_stale_markets(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT
+          d.market_id,
+          COUNT(*) AS recover_count,
+          AVG(d.latency_ms) AS avg_stale_duration_ms,
+          MAX(d.latency_ms) AS max_stale_duration_ms,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name IN ('market_stale_recovered', 'market_stale_episode_closed')
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+          AND d.latency_ms IS NOT NULL
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id ORDER BY max_stale_duration_ms DESC, "
+            "avg_stale_duration_ms DESC LIMIT 5"
+        )
+        return pd.read_sql_query(query, conn, params=params)
+
+    def _top_repeated_stale_markets(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT
+          d.market_id,
+          SUM(CASE WHEN d.event_name = 'market_stale_entered' THEN 1 ELSE 0 END) AS enter_count,
+          SUM(CASE WHEN d.event_name = 'market_stale_recovered' THEN 1 ELSE 0 END) AS recover_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name IN ('market_stale_entered', 'market_stale_recovered')
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id"
+            " HAVING SUM(CASE WHEN d.event_name = 'market_stale_entered' THEN 1 ELSE 0 END) > 0"
+            " ORDER BY enter_count DESC, recover_count DESC LIMIT 5"
+        )
+        return pd.read_sql_query(query, conn, params=params)
+
+    def _top_stale_legs(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason,
+          d.details,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question,
+          MAX(COALESCE(m.yes_token_id, '')) AS yes_asset_id,
+          MAX(COALESCE(m.no_token_id, '')) AS no_asset_id
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_stale_entered'
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY d.id ORDER BY d.created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        counts: dict[tuple[str, str, str], dict[str, object]] = {}
+        for row in rows:
+            market_id = str(row[0] or "")
+            reason = str(row[1] or "")
+            details = str(row[2] or "")
+            market_slug = str(row[3] or "")
+            market_question = str(row[4] or "")
+            yes_asset_id = str(row[5] or "")
+            no_asset_id = str(row[6] or "")
+            details_map = parse_kv_details(details)
+            stale_reason_key = stale_reason_key_from_reason_and_details(
+                reason=reason, details=details
+            )
+            asset_ids_raw = details_map.get("stale_asset_ids") or details_map.get(
+                "stale_asset_id", ""
+            )
+            candidate_assets = [item.strip() for item in asset_ids_raw.split(",") if item.strip()]
+            if not candidate_assets:
+                stale_side = normalize_stale_side(details_map.get("stale_side"))
+                if stale_side in {"yes", "both"} and yes_asset_id:
+                    candidate_assets.append(yes_asset_id)
+                if stale_side in {"no", "both"} and no_asset_id:
+                    candidate_assets.append(no_asset_id)
+            for asset_id in candidate_assets:
+                side = "unknown"
+                if asset_id == yes_asset_id:
+                    side = "yes"
+                elif asset_id == no_asset_id:
+                    side = "no"
+                key = (market_id, asset_id, side)
+                entry = counts.setdefault(
+                    key,
+                    {
+                        "market_id": market_id,
+                        "asset_id": asset_id,
+                        "side": side,
+                        "count": 0,
+                        "market_slug": market_slug,
+                        "market_question": market_question,
+                        "stale_reason_key": normalize_stale_reason_key(stale_reason_key),
+                    },
+                )
+                entry["count"] = int(entry["count"]) + 1
+        if not counts:
+            return pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "asset_id",
+                    "side",
+                    "count",
+                    "market_slug",
+                    "market_question",
+                    "stale_reason_key",
+                ]
+            )
+        frame = pd.DataFrame(counts.values())
+        return frame.sort_values("count", ascending=False).head(5)
+
     def _sum_metric(
         self,
         *,
@@ -1407,6 +1774,36 @@ class DashboardDataLoader:
           AND latency_ms IS NOT NULL
         """
         params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return 0.0, 0.0
+        avg_value = float(row[0]) if row[0] is not None else 0.0
+        max_value = float(row[1]) if row[1] is not None else 0.0
+        return avg_value, max_value
+
+    def _diagnostics_latency_stats_for_events(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        event_names: tuple[str, ...],
+    ) -> tuple[float, float]:
+        names = [name for name in event_names if name]
+        if not names:
+            return 0.0, 0.0
+        placeholders = ", ".join("?" for _ in names)
+        query = f"""
+        SELECT AVG(latency_ms), MAX(latency_ms)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name IN ({placeholders})
+          AND latency_ms IS NOT NULL
+        """
+        params: list[object] = [window.start_iso, window.end_iso, *names]
         if run_id is not None:
             query += " AND run_id = ?"
             params.append(run_id)
@@ -1769,13 +2166,7 @@ class DashboardDataLoader:
 
     @staticmethod
     def _extract_kv(details: str, key: str) -> str | None:
-        prefix = f"{key}="
-        for token in details.split(";"):
-            candidate = token.strip()
-            if candidate.startswith(prefix):
-                value = candidate[len(prefix) :].strip()
-                return value or None
-        return None
+        return extract_detail_value(details, key)
 
     @staticmethod
     def _window_params(*, window: DashboardWindow, run_id: str | None) -> list[object]:
@@ -1887,6 +2278,21 @@ class DashboardDataLoader:
             "recovery_universe_change_first_quote_success_rate": 0.0,
             "recovery_universe_change_book_ready_success_rate": 0.0,
             "recovery_universe_change_market_ready_success_rate": 0.0,
+            "market_stale_enter_count": 0.0,
+            "market_stale_recover_count": 0.0,
+            "avg_market_stale_duration_ms": 0.0,
+            "max_market_stale_duration_ms": 0.0,
+            "market_stale_universe_change_enter_count": 0.0,
+            "market_stale_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "market_stale_side_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "market_ready_blocked_stale_reason_breakdown": pd.DataFrame(
+                columns=["reason", "count"]
+            ),
+            "eligibility_gate_stale_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "no_signal_stale_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "universe_change_market_ready_blocked_stale_reason_breakdown": pd.DataFrame(
+                columns=["reason", "count"]
+            ),
             "top_stale_assets": pd.DataFrame(
                 columns=[
                     "asset_id",
@@ -1930,6 +2336,36 @@ class DashboardDataLoader:
                     "success_count",
                     "market_slug",
                     "market_question",
+                ]
+            ),
+            "top_long_stale_markets": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "recover_count",
+                    "avg_stale_duration_ms",
+                    "max_stale_duration_ms",
+                    "market_slug",
+                    "market_question",
+                ]
+            ),
+            "top_repeated_stale_markets": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "enter_count",
+                    "recover_count",
+                    "market_slug",
+                    "market_question",
+                ]
+            ),
+            "top_stale_legs": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "asset_id",
+                    "side",
+                    "count",
+                    "market_slug",
+                    "market_question",
+                    "stale_reason_key",
                 ]
             ),
         }
