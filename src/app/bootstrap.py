@@ -660,7 +660,9 @@ class PolymarketStructureArbApp:
         }
         self.state.market_recovery_started_at_for_diagnostics = {
             market_id: started_at
-            for market_id, started_at in self.state.market_recovery_started_at_for_diagnostics.items()
+            for market_id, started_at in (
+                self.state.market_recovery_started_at_for_diagnostics.items()
+            )
             if market_id in current_markets
         }
         self.state.market_recovery_reason_by_market = {
@@ -1278,7 +1280,11 @@ class PolymarketStructureArbApp:
             market_id=market_id,
             reason=normalized_reason,
             latency_ms=latency_ms,
-            details=f"recovery_reason={recovery_reason or ''};stage={DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED}",
+            details=(
+                "recovery_reason="
+                f"{recovery_reason or ''};"
+                f"stage={DIAG_EVENT_MARKET_READY_AFTER_RECOVERY_BLOCKED}"
+            ),
         )
 
     @staticmethod

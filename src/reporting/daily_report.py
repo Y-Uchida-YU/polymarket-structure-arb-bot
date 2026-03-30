@@ -421,9 +421,11 @@ class DailyReportGenerator:
                     "probation",
                     0,
                 ),
-                "eligibility_gate_low_quality_runtime_excluded_count": eligibility_gate_reason_map.get(
-                    "low_quality_runtime_excluded",
-                    0,
+                "eligibility_gate_low_quality_runtime_excluded_count": (
+                    eligibility_gate_reason_map.get(
+                        "low_quality_runtime_excluded",
+                        0,
+                    )
                 ),
                 "eligibility_gate_other_readiness_gate_count": eligibility_gate_reason_map.get(
                     "other_readiness_gate",
@@ -528,7 +530,9 @@ class DailyReportGenerator:
             f"eligible_market_ratio: {totals['eligible_market_ratio']:.3f}",
             f"blocked_market_count: {totals['blocked_market_count']}",
             (
-                "eligibility_gate_breakdown(connection/book/stale/blocked/probation/low_quality/other): "
+                "eligibility_gate_breakdown("
+                "connection/book/stale/blocked/"
+                "probation/low_quality/other): "
                 f"{totals.get('eligibility_gate_connection_recovering_count', 0)}/"
                 f"{totals.get('eligibility_gate_book_recovering_count', 0)}/"
                 f"{totals.get('eligibility_gate_stale_quote_freshness_count', 0)}/"
@@ -1888,13 +1892,25 @@ class DailyReportGenerator:
                     run_id=run_id,
                     event_name="eligibility_gate_unmet",
                 ),
-                "recovery_universe_change_resync_started_count": universe_resync_started_count,
-                "recovery_universe_change_first_quote_success_count": universe_first_quote_success_count,
-                "recovery_universe_change_book_ready_success_count": universe_book_ready_success_count,
-                "recovery_universe_change_market_ready_success_count": universe_market_ready_success_count,
-                "recovery_universe_change_first_quote_blocked_count": universe_first_quote_blocked_count,
-                "recovery_universe_change_book_ready_blocked_count": universe_book_ready_blocked_count,
-                "recovery_universe_change_market_ready_blocked_count": universe_market_ready_blocked_count,
+                "recovery_universe_change_resync_started_count": (universe_resync_started_count),
+                "recovery_universe_change_first_quote_success_count": (
+                    universe_first_quote_success_count
+                ),
+                "recovery_universe_change_book_ready_success_count": (
+                    universe_book_ready_success_count
+                ),
+                "recovery_universe_change_market_ready_success_count": (
+                    universe_market_ready_success_count
+                ),
+                "recovery_universe_change_first_quote_blocked_count": (
+                    universe_first_quote_blocked_count
+                ),
+                "recovery_universe_change_book_ready_blocked_count": (
+                    universe_book_ready_blocked_count
+                ),
+                "recovery_universe_change_market_ready_blocked_count": (
+                    universe_market_ready_blocked_count
+                ),
                 "recovery_universe_change_first_quote_success_rate": (
                     universe_first_quote_success_count / universe_resync_started_count
                     if universe_resync_started_count > 0
