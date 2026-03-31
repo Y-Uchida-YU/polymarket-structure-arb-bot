@@ -227,6 +227,18 @@ class DailyReportGenerator:
             run_id=run_id,
             metric_name="low_quality_runtime_excluded_count",
         )
+        chronic_stale_excluded_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_excluded_market_count",
+        )
+        chronic_stale_exclusion_active_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_exclusion_active_count",
+        )
         ready_market_ratio = self._latest_metric_float_value(
             conn,
             window,
@@ -298,6 +310,12 @@ class DailyReportGenerator:
             >= watched_market_count_current
         ):
             no_eligible_markets_causes.append("all_markets_stale_freshness")
+        if (
+            watched_market_count_current > 0
+            and eligibility_gate_reason_map.get("chronic_stale_excluded", 0)
+            >= watched_market_count_current
+        ):
+            no_eligible_markets_causes.append("all_markets_chronic_stale_excluded")
         if (
             watched_market_count_current > 0
             and eligibility_gate_reason_map.get("blocked", 0) >= watched_market_count_current
@@ -456,6 +474,10 @@ class DailyReportGenerator:
                         0,
                     )
                 ),
+                "eligibility_gate_chronic_stale_excluded_count": eligibility_gate_reason_map.get(
+                    "chronic_stale_excluded",
+                    0,
+                ),
                 "eligibility_gate_other_readiness_gate_count": eligibility_gate_reason_map.get(
                     "other_readiness_gate",
                     0,
@@ -463,6 +485,14 @@ class DailyReportGenerator:
                 "min_watched_markets_floor": min_watched_markets_floor,
                 "low_quality_market_count": low_quality_market_count,
                 "low_quality_runtime_excluded_count": low_quality_runtime_excluded_count,
+                "chronic_stale_excluded_market_count": chronic_stale_excluded_market_count,
+                "chronic_stale_exclusion_active_count": chronic_stale_exclusion_active_count,
+                "chronic_stale_exclusion_enter_count": int(
+                    recovery_diagnostics.get("chronic_stale_exclusion_enter_count", 0)
+                ),
+                "chronic_stale_exclusion_cleared_count": int(
+                    recovery_diagnostics.get("chronic_stale_exclusion_cleared_count", 0)
+                ),
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
                 "total_projected_pnl": pnl_sums["total_projected_pnl"],
@@ -575,13 +605,14 @@ class DailyReportGenerator:
             (
                 "eligibility_gate_breakdown("
                 "connection/book/stale/blocked/"
-                "probation/low_quality/other): "
+                "probation/low_quality/chronic/other): "
                 f"{totals.get('eligibility_gate_connection_recovering_count', 0)}/"
                 f"{totals.get('eligibility_gate_book_recovering_count', 0)}/"
                 f"{totals.get('eligibility_gate_stale_quote_freshness_count', 0)}/"
                 f"{totals.get('eligibility_gate_blocked_count', 0)}/"
                 f"{totals.get('eligibility_gate_probation_count', 0)}/"
                 f"{totals.get('eligibility_gate_low_quality_runtime_excluded_count', 0)}/"
+                f"{totals.get('eligibility_gate_chronic_stale_excluded_count', 0)}/"
                 f"{totals.get('eligibility_gate_other_readiness_gate_count', 0)}"
             ),
             f"min_watched_markets_floor: {totals['min_watched_markets_floor']}",
@@ -589,6 +620,12 @@ class DailyReportGenerator:
             (
                 "low_quality_runtime_excluded_count: "
                 f"{totals['low_quality_runtime_excluded_count']}"
+            ),
+            (
+                "chronic_stale_exclusion(active/enter/cleared): "
+                f"{totals.get('chronic_stale_exclusion_active_count', 0)}/"
+                f"{totals.get('chronic_stale_exclusion_enter_count', 0)}/"
+                f"{totals.get('chronic_stale_exclusion_cleared_count', 0)}"
             ),
             (
                 "watched_markets(current/cumulative): "
@@ -717,6 +754,12 @@ class DailyReportGenerator:
                 for item in recovery["no_signal_stale_reason_breakdown"][:5]
             )
             lines.append(f"no_signal_stale_reason_breakdown: {stale_no_signal_summary}")
+        if recovery.get("chronic_stale_reason_breakdown"):
+            chronic_reason_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["chronic_stale_reason_breakdown"][:5]
+            )
+            lines.append(f"chronic_stale_reason_breakdown: {chronic_reason_summary}")
         if recovery.get("market_ready_blocked_stale_reason_breakdown"):
             blocked_stale_summary = ", ".join(
                 f"{item['reason']}={item['count']}"
@@ -742,15 +785,34 @@ class DailyReportGenerator:
             )
         if recovery.get("top_stale_assets"):
             stale_summary = ", ".join(
-                f"{item['asset_id']}={item['count']}" for item in recovery["top_stale_assets"][:5]
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}:"
+                    f"{item.get('side') or 'unknown'}({item.get('asset_id')})="
+                    f"{int(item.get('count', 0))}"
+                )
+                for item in recovery["top_stale_assets"][:5]
             )
             lines.append(f"top_stale_assets: {stale_summary}")
         if recovery.get("top_missing_book_assets"):
             missing_asset_summary = ", ".join(
-                f"{item['asset_id']}={item['count']}"
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}:"
+                    f"{item.get('side') or 'unknown'}({item.get('asset_id')})="
+                    f"{int(item.get('count', 0))}"
+                )
                 for item in recovery["top_missing_book_assets"][:5]
             )
             lines.append(f"top_missing_book_assets: {missing_asset_summary}")
+        if recovery.get("top_quote_missing_after_resync_assets"):
+            quote_missing_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}:"
+                    f"{item.get('side') or 'unknown'}({item.get('asset_id')})="
+                    f"{int(item.get('count', 0))}"
+                )
+                for item in recovery["top_quote_missing_after_resync_assets"][:5]
+            )
+            lines.append(f"top_quote_missing_after_resync_assets: {quote_missing_summary}")
         if recovery.get("top_market_blocked_markets"):
             blocked_summary = ", ".join(
                 f"{item['market_id']}={item['count']}"
@@ -769,12 +831,35 @@ class DailyReportGenerator:
         if recovery.get("top_repeated_stale_markets"):
             repeated_stale_summary = ", ".join(
                 (
-                    f"{item.get('market_slug') or item.get('market_id')}="
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')})="
                     f"{int(item.get('enter_count', 0))}"
                 )
                 for item in recovery["top_repeated_stale_markets"][:5]
             )
             lines.append(f"top_repeated_stale_markets: {repeated_stale_summary}")
+        if recovery.get("top_chronic_stale_markets"):
+            chronic_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')}):"
+                    f"{item.get('chronic_reason')}="
+                    f"{int(item.get('enter_count', 0))}"
+                )
+                for item in recovery["top_chronic_stale_markets"][:5]
+            )
+            lines.append(f"top_chronic_stale_markets: {chronic_summary}")
+        if recovery.get("top_repeated_missing_book_markets"):
+            missing_market_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')}):"
+                    f"{item.get('dominant_reason')}="
+                    f"{int(item.get('count', 0))}"
+                )
+                for item in recovery["top_repeated_missing_book_markets"][:5]
+            )
+            lines.append(f"top_repeated_missing_book_markets: {missing_market_summary}")
         if recovery.get("top_stale_legs"):
             stale_legs_summary = ", ".join(
                 (
@@ -1492,6 +1577,10 @@ class DailyReportGenerator:
             "avg_market_stale_duration_ms": 0.0,
             "max_market_stale_duration_ms": 0.0,
             "market_stale_universe_change_enter_count": 0,
+            "chronic_stale_exclusion_enter_count": 0,
+            "chronic_stale_exclusion_active_count": 0,
+            "chronic_stale_exclusion_cleared_count": 0,
+            "chronic_stale_reason_breakdown": [],
             "market_stale_reason_breakdown": [],
             "market_stale_side_breakdown": [],
             "market_ready_blocked_stale_reason_breakdown": [],
@@ -1500,9 +1589,12 @@ class DailyReportGenerator:
             "universe_change_market_ready_blocked_stale_reason_breakdown": [],
             "top_long_stale_markets": [],
             "top_repeated_stale_markets": [],
+            "top_chronic_stale_markets": [],
             "top_stale_legs": [],
             "top_stale_assets": [],
             "top_missing_book_assets": [],
+            "top_quote_missing_after_resync_assets": [],
+            "top_repeated_missing_book_markets": [],
             "top_market_blocked_markets": [],
             "top_recovery_slow_assets": [],
             "top_recovery_slow_markets": [],
@@ -1592,6 +1684,7 @@ class DailyReportGenerator:
         *,
         run_id: str | None,
         event_name: str,
+        reason: str | None = None,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
         query = """
@@ -1620,6 +1713,9 @@ class DailyReportGenerator:
           AND d.asset_id != ''
         """
         params: list[object] = [window.start_iso, window.end_iso, event_name]
+        if reason is not None:
+            query += " AND d.reason = ?"
+            params.append(reason)
         if run_id is not None:
             query += " AND d.run_id = ?"
             params.append(run_id)
@@ -1803,6 +1899,35 @@ class DailyReportGenerator:
           AND reason = ?
         """
         params: list[object] = [window.start_iso, window.end_iso, event_name, reason]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        row = conn.execute(query, params).fetchone()
+        return int(row[0] if row else 0)
+
+    def _count_distinct_market_diagnostics_events_with_reason(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        event_names: tuple[str, ...],
+        reason: str,
+    ) -> int:
+        names = [name for name in event_names if name]
+        if not names:
+            return 0
+        placeholders = ", ".join("?" for _ in names)
+        query = f"""
+        SELECT COUNT(DISTINCT market_id)
+        FROM diagnostics_events
+        WHERE created_at >= ? AND created_at < ?
+          AND event_name IN ({placeholders})
+          AND reason = ?
+          AND market_id IS NOT NULL
+          AND market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso, *names, reason]
         if run_id is not None:
             query += " AND run_id = ?"
             params.append(run_id)
@@ -2032,6 +2157,135 @@ class DailyReportGenerator:
             for row in rows
         ]
 
+    def _top_chronic_stale_markets(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason,
+          d.details,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_chronic_stale_exclusion_entered'
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY d.id ORDER BY d.created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for market_id_value, reason_value, details_value, slug_value, question_value in rows:
+            market_id = str(market_id_value or "")
+            if not market_id:
+                continue
+            reason = str(reason_value or "")
+            details_map = parse_kv_details(str(details_value or ""))
+            stale_enter_count = int(float(details_map.get("stale_enter_count", "0") or 0.0))
+            max_stale_duration_ms = float(details_map.get("max_stale_duration_ms", "0") or 0.0)
+            entry = grouped.setdefault(
+                market_id,
+                {
+                    "market_id": market_id,
+                    "market_slug": str(slug_value or ""),
+                    "market_question": str(question_value or ""),
+                    "enter_count": 0,
+                    "chronic_reason": reason or "repeated_stale_enters",
+                    "latest_stale_enter_count": 0,
+                    "max_observed_stale_duration_ms": 0.0,
+                },
+            )
+            entry["enter_count"] = int(entry["enter_count"]) + 1
+            entry["latest_stale_enter_count"] = max(
+                int(entry["latest_stale_enter_count"]),
+                stale_enter_count,
+            )
+            entry["max_observed_stale_duration_ms"] = max(
+                float(entry["max_observed_stale_duration_ms"]),
+                max_stale_duration_ms,
+            )
+            if not str(entry["chronic_reason"]) and reason:
+                entry["chronic_reason"] = reason
+        items = sorted(
+            grouped.values(),
+            key=lambda item: (
+                int(item.get("enter_count", 0)),
+                float(item.get("max_observed_stale_duration_ms", 0.0)),
+            ),
+            reverse=True,
+        )
+        return items[: max(1, int(limit))]
+
+    def _top_repeated_missing_book_markets(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason,
+          COUNT(*) AS count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'missing_book_state_detected'
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += " GROUP BY d.market_id, d.reason ORDER BY count DESC"
+        rows = conn.execute(query, params).fetchall()
+        grouped: dict[str, dict[str, Any]] = {}
+        for market_id_value, reason_value, count_value, slug_value, question_value in rows:
+            market_id = str(market_id_value or "")
+            if not market_id:
+                continue
+            count = int(count_value if count_value is not None else 0)
+            reason = str(reason_value or "unknown")
+            entry = grouped.setdefault(
+                market_id,
+                {
+                    "market_id": market_id,
+                    "market_slug": str(slug_value or ""),
+                    "market_question": str(question_value or ""),
+                    "count": 0,
+                    "dominant_reason": reason,
+                },
+            )
+            entry["count"] = int(entry["count"]) + count
+            dominant_reason = str(entry["dominant_reason"])
+            if count > int(entry.get("_dominant_count", 0)):
+                entry["dominant_reason"] = reason
+                entry["_dominant_count"] = count
+            elif not dominant_reason:
+                entry["dominant_reason"] = reason
+        items = sorted(grouped.values(), key=lambda item: int(item.get("count", 0)), reverse=True)
+        for item in items:
+            item.pop("_dominant_count", None)
+        return items[: max(1, int(limit))]
+
     def _top_stale_legs(
         self,
         conn: sqlite3.Connection,
@@ -2187,33 +2441,60 @@ class DailyReportGenerator:
                 run_id=run_id,
                 event_name="market_ready_after_recovery",
             )
-            universe_resync_started_count = self._count_diagnostics_event_with_reason(
-                conn,
-                window,
-                run_id=run_id,
-                event_name="resync_started",
-                reason="market_universe_changed",
+            # Universe-change funnel is defined in consistent market-level stages:
+            # resync-started -> first-quote-progressed -> book-ready-progressed -> market-ready.
+            # "progressed" is cumulative by stage so counts remain monotonic.
+            universe_resync_started_count = (
+                self._count_distinct_market_diagnostics_events_with_reason(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_names=("resync_started",),
+                    reason="market_universe_changed",
+                )
             )
-            universe_first_quote_success_count = self._count_diagnostics_event_with_reason(
-                conn,
-                window,
-                run_id=run_id,
-                event_name="first_quote_after_resync",
-                reason="market_universe_changed",
+            universe_first_quote_success_count = (
+                self._count_distinct_market_diagnostics_events_with_reason(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_names=(
+                        "first_quote_after_resync",
+                        "book_ready_after_resync",
+                        "market_ready_after_recovery",
+                    ),
+                    reason="market_universe_changed",
+                )
             )
-            universe_book_ready_success_count = self._count_diagnostics_event_with_reason(
-                conn,
-                window,
-                run_id=run_id,
-                event_name="book_ready_after_resync",
-                reason="market_universe_changed",
+            universe_book_ready_success_count = (
+                self._count_distinct_market_diagnostics_events_with_reason(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_names=("book_ready_after_resync", "market_ready_after_recovery"),
+                    reason="market_universe_changed",
+                )
             )
-            universe_market_ready_success_count = self._count_diagnostics_event_with_reason(
-                conn,
-                window,
-                run_id=run_id,
-                event_name="market_ready_after_recovery",
-                reason="market_universe_changed",
+            universe_market_ready_success_count = (
+                self._count_distinct_market_diagnostics_events_with_reason(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_names=("market_ready_after_recovery",),
+                    reason="market_universe_changed",
+                )
+            )
+            universe_first_quote_success_count = min(
+                universe_first_quote_success_count,
+                universe_resync_started_count,
+            )
+            universe_book_ready_success_count = min(
+                universe_book_ready_success_count,
+                universe_first_quote_success_count,
+            )
+            universe_market_ready_success_count = min(
+                universe_market_ready_success_count,
+                universe_book_ready_success_count,
             )
             universe_first_quote_blocked_count = self._count_diagnostics_event_with_details_like(
                 conn,
@@ -2262,6 +2543,30 @@ class DailyReportGenerator:
                     event_name="market_stale_entered",
                     details_like="%universe_change_related=1%",
                 )
+            )
+            chronic_stale_exclusion_enter_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_chronic_stale_exclusion_entered",
+            )
+            chronic_stale_exclusion_cleared_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_chronic_stale_exclusion_cleared",
+            )
+            chronic_stale_exclusion_active_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="chronic_stale_exclusion_active_count",
+            )
+            chronic_stale_reason_breakdown = self._diagnostics_reasons_for_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_chronic_stale_exclusion_entered",
             )
             market_stale_reason_breakdown = self._diagnostics_detail_breakdown_for_event(
                 conn,
@@ -2409,6 +2714,10 @@ class DailyReportGenerator:
                 "market_stale_universe_change_enter_count": (
                     market_stale_universe_change_enter_count
                 ),
+                "chronic_stale_exclusion_enter_count": chronic_stale_exclusion_enter_count,
+                "chronic_stale_exclusion_active_count": chronic_stale_exclusion_active_count,
+                "chronic_stale_exclusion_cleared_count": chronic_stale_exclusion_cleared_count,
+                "chronic_stale_reason_breakdown": chronic_stale_reason_breakdown,
                 "market_stale_reason_breakdown": market_stale_reason_breakdown,
                 "market_stale_side_breakdown": market_stale_side_breakdown,
                 "market_ready_blocked_stale_reason_breakdown": (
@@ -2430,6 +2739,13 @@ class DailyReportGenerator:
                     window,
                     run_id=run_id,
                     event_name="missing_book_state_detected",
+                ),
+                "top_quote_missing_after_resync_assets": self._top_asset_counts_for_event(
+                    conn,
+                    window,
+                    run_id=run_id,
+                    event_name="missing_book_state_detected",
+                    reason="quote_missing_after_resync",
                 ),
                 "top_market_blocked_markets": self._top_market_counts_for_event(
                     conn,
@@ -2453,6 +2769,16 @@ class DailyReportGenerator:
                     run_id=run_id,
                 ),
                 "top_repeated_stale_markets": self._top_repeated_stale_markets(
+                    conn,
+                    window,
+                    run_id=run_id,
+                ),
+                "top_chronic_stale_markets": self._top_chronic_stale_markets(
+                    conn,
+                    window,
+                    run_id=run_id,
+                ),
+                "top_repeated_missing_book_markets": self._top_repeated_missing_book_markets(
                     conn,
                     window,
                     run_id=run_id,

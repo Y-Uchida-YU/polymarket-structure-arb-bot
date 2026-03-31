@@ -55,6 +55,24 @@ def test_no_eligible_causes_derived_from_overview() -> None:
     assert "quality_penalty_excessive" in causes
 
 
+def test_no_eligible_causes_includes_chronic_stale_excluded() -> None:
+    causes = _no_eligible_causes(
+        {
+            "watched_markets_current": 2.0,
+            "min_watched_markets_floor": 0.0,
+            "ready_market_count": 2.0,
+            "recovering_market_count": 0.0,
+            "stale_market_count": 0.0,
+            "eligible_market_count": 0.0,
+            "market_not_ready_count": 0.0,
+            "low_quality_runtime_excluded_count": 0.0,
+            "chronic_stale_excluded_market_count": 2.0,
+            "eligibility_gate_chronic_stale_excluded_count": 2.0,
+        }
+    )
+    assert "all_markets_chronic_stale_excluded" in causes
+
+
 def test_as_frame_returns_empty_frame_when_value_is_missing() -> None:
     frame = _as_frame(None, columns=["asset_id", "count"])
     assert isinstance(frame, pd.DataFrame)
