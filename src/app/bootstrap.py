@@ -806,7 +806,7 @@ class PolymarketStructureArbApp:
         low_quality_excluded_market_ids = self._runtime_low_quality_excluded_market_ids()
         chronic_excluded_market_ids = self._active_chronic_stale_excluded_market_ids(
             now_utc=utc_now(),
-            prune_expired=True,
+            prune_expired=False,
         )
         runtime_excluded_market_ids = set(low_quality_excluded_market_ids) | set(
             chronic_excluded_market_ids
@@ -984,9 +984,14 @@ class PolymarketStructureArbApp:
         }
         active_chronic_exclusions = self._active_chronic_stale_excluded_market_ids(
             now_utc=now,
-            prune_expired=True,
+            prune_expired=False,
         )
-        tracked_chronic_markets = current_markets | active_chronic_exclusions
+        # Keep expired exclusions until refresh handles clear-event emission and cleanup.
+        tracked_chronic_markets = (
+            current_markets
+            | active_chronic_exclusions
+            | set(self.state.market_chronic_stale_excluded_until.keys())
+        )
         self.state.market_chronic_stale_excluded_until = {
             market_id: excluded_until
             for market_id, excluded_until in self.state.market_chronic_stale_excluded_until.items()
