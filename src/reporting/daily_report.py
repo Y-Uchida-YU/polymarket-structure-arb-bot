@@ -239,6 +239,42 @@ class DailyReportGenerator:
             run_id=run_id,
             metric_name="chronic_stale_exclusion_active_count",
         )
+        chronic_stale_reintroduced_for_floor_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_reintroduced_for_floor_count",
+        )
+        chronic_stale_reintroduced_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_reintroduced_market_count",
+        )
+        watched_chronic_stale_excluded_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="watched_chronic_stale_excluded_market_count",
+        )
+        chronic_stale_exclusion_extended_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_exclusion_extended_count",
+        )
+        chronic_stale_exclusion_avg_active_age_ms = self._latest_metric_float_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_exclusion_avg_active_age_ms",
+        )
+        chronic_stale_exclusion_long_active_market_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="chronic_stale_exclusion_long_active_market_count",
+        )
         ready_market_ratio = self._latest_metric_float_value(
             conn,
             window,
@@ -316,6 +352,10 @@ class DailyReportGenerator:
             >= watched_market_count_current
         ):
             no_eligible_markets_causes.append("all_markets_chronic_stale_excluded")
+        if watched_chronic_stale_excluded_market_count > 0 and eligible_market_count == 0:
+            no_eligible_markets_causes.append("watched_universe_chronic_contaminated")
+        if chronic_stale_reintroduced_market_count > 0 and eligible_market_count == 0:
+            no_eligible_markets_causes.append("watched_floor_reintroduced_chronic_stale")
         if (
             watched_market_count_current > 0
             and eligibility_gate_reason_map.get("blocked", 0) >= watched_market_count_current
@@ -487,11 +527,27 @@ class DailyReportGenerator:
                 "low_quality_runtime_excluded_count": low_quality_runtime_excluded_count,
                 "chronic_stale_excluded_market_count": chronic_stale_excluded_market_count,
                 "chronic_stale_exclusion_active_count": chronic_stale_exclusion_active_count,
+                "chronic_stale_reintroduced_for_floor_count": (
+                    chronic_stale_reintroduced_for_floor_count
+                ),
+                "chronic_stale_reintroduced_market_count": (
+                    chronic_stale_reintroduced_market_count
+                ),
+                "watched_chronic_stale_excluded_market_count": (
+                    watched_chronic_stale_excluded_market_count
+                ),
                 "chronic_stale_exclusion_enter_count": int(
                     recovery_diagnostics.get("chronic_stale_exclusion_enter_count", 0)
                 ),
+                "chronic_stale_exclusion_extended_count": chronic_stale_exclusion_extended_count,
                 "chronic_stale_exclusion_cleared_count": int(
                     recovery_diagnostics.get("chronic_stale_exclusion_cleared_count", 0)
+                ),
+                "chronic_stale_exclusion_avg_active_age_ms": (
+                    chronic_stale_exclusion_avg_active_age_ms
+                ),
+                "chronic_stale_exclusion_long_active_market_count": (
+                    chronic_stale_exclusion_long_active_market_count
                 ),
                 "projected_matched_pnl": pnl_sums["projected_matched_pnl"],
                 "unmatched_inventory_mtm": pnl_sums["unmatched_inventory_mtm"],
@@ -628,6 +684,17 @@ class DailyReportGenerator:
                 f"{totals.get('chronic_stale_exclusion_cleared_count', 0)}"
             ),
             (
+                "chronic_stale_exclusion(extended/avg_age_ms/long_active): "
+                f"{totals.get('chronic_stale_exclusion_extended_count', 0)}/"
+                f"{float(totals.get('chronic_stale_exclusion_avg_active_age_ms', 0.0)):.1f}/"
+                f"{totals.get('chronic_stale_exclusion_long_active_market_count', 0)}"
+            ),
+            (
+                "chronic_stale_reintroduced(for_floor/current_watched_chronic): "
+                f"{totals.get('chronic_stale_reintroduced_for_floor_count', 0)}/"
+                f"{totals.get('watched_chronic_stale_excluded_market_count', 0)}"
+            ),
+            (
                 "watched_markets(current/cumulative): "
                 f"{universe.get('current_watched_markets', 0)} / "
                 f"{universe.get('cumulative_watched_markets', 0)}"
@@ -760,6 +827,20 @@ class DailyReportGenerator:
                 for item in recovery["chronic_stale_reason_breakdown"][:5]
             )
             lines.append(f"chronic_stale_reason_breakdown: {chronic_reason_summary}")
+        if recovery.get("chronic_stale_extension_reason_breakdown"):
+            chronic_extension_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["chronic_stale_extension_reason_breakdown"][:5]
+            )
+            lines.append(
+                "chronic_stale_extension_reason_breakdown: " f"{chronic_extension_summary}"
+            )
+        if recovery.get("watched_chronic_stale_reason_breakdown"):
+            watched_chronic_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["watched_chronic_stale_reason_breakdown"][:5]
+            )
+            lines.append(f"watched_chronic_stale_reason_breakdown: {watched_chronic_summary}")
         if recovery.get("market_ready_blocked_stale_reason_breakdown"):
             blocked_stale_summary = ", ".join(
                 f"{item['reason']}={item['count']}"
@@ -849,6 +930,27 @@ class DailyReportGenerator:
                 for item in recovery["top_chronic_stale_markets"][:5]
             )
             lines.append(f"top_chronic_stale_markets: {chronic_summary}")
+        if recovery.get("top_reintroduced_chronic_stale_markets"):
+            reintroduced_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')}):"
+                    f"{item.get('reintroduced_reason')}="
+                    f"{int(item.get('reintroduced_count', 0))}"
+                )
+                for item in recovery["top_reintroduced_chronic_stale_markets"][:5]
+            )
+            lines.append(f"top_reintroduced_chronic_stale_markets: {reintroduced_summary}")
+        if recovery.get("top_long_active_chronic_stale_markets"):
+            long_active_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')})="
+                    f"{float(item.get('active_age_ms', 0.0)):.1f}ms"
+                )
+                for item in recovery["top_long_active_chronic_stale_markets"][:5]
+            )
+            lines.append(f"top_long_active_chronic_stale_markets: {long_active_summary}")
         if recovery.get("top_repeated_missing_book_markets"):
             missing_market_summary = ", ".join(
                 (
@@ -1469,6 +1571,40 @@ class DailyReportGenerator:
             row = conn.execute(fallback_query, fallback_params).fetchone()
         return float(row[0]) if row and row[0] is not None else 0.0
 
+    def _latest_metric_details(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+    ) -> str:
+        query = """
+        SELECT details
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, metric_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            fallback_query = """
+            SELECT details
+            FROM metrics
+            WHERE metric_name = ?
+            """
+            fallback_params: list[object] = [metric_name]
+            if run_id is not None:
+                fallback_query += " AND run_id = ?"
+                fallback_params.append(run_id)
+            fallback_query += " ORDER BY created_at DESC LIMIT 1"
+            row = conn.execute(fallback_query, fallback_params).fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+
     def _latest_metric_prefix_breakdown(
         self,
         conn: sqlite3.Connection,
@@ -1516,6 +1652,91 @@ class DailyReportGenerator:
         ]
         breakdown.sort(key=lambda item: float(item.get("count", 0.0)), reverse=True)
         return breakdown
+
+    @staticmethod
+    def _parse_market_numeric_details(details: str) -> list[tuple[str, float]]:
+        results: list[tuple[str, float]] = []
+        compact = str(details or "").strip()
+        if not compact:
+            return results
+        for token in compact.split(","):
+            if ":" not in token:
+                continue
+            market_id, value_text = token.split(":", 1)
+            market_id = market_id.strip()
+            value_text = value_text.strip()
+            if not market_id:
+                continue
+            try:
+                numeric_value = float(value_text)
+            except ValueError:
+                continue
+            results.append((market_id, numeric_value))
+        return results
+
+    def _market_context_map(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        market_ids: list[str],
+    ) -> dict[str, dict[str, str]]:
+        unique_ids = [market_id for market_id in dict.fromkeys(market_ids) if market_id]
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        query = f"""
+        SELECT market_id, MAX(COALESCE(slug, '')) AS slug, MAX(COALESCE(question, '')) AS question
+        FROM markets
+        WHERE market_id IN ({placeholders})
+        GROUP BY market_id
+        """
+        rows = conn.execute(query, unique_ids).fetchall()
+        return {
+            str(row[0]): {
+                "market_slug": str(row[1] or ""),
+                "market_question": str(row[2] or ""),
+            }
+            for row in rows
+            if str(row[0] or "")
+        }
+
+    def _top_markets_from_latest_metric_details(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+        value_key: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        parsed = self._parse_market_numeric_details(
+            self._latest_metric_details(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+        if not parsed:
+            return []
+        contexts = self._market_context_map(
+            conn,
+            market_ids=[market_id for market_id, _ in parsed],
+        )
+        rows: list[dict[str, Any]] = []
+        for market_id, value in parsed:
+            context = contexts.get(market_id, {"market_slug": "", "market_question": ""})
+            rows.append(
+                {
+                    "market_id": market_id,
+                    "market_slug": context["market_slug"],
+                    "market_question": context["market_question"],
+                    value_key: float(value),
+                }
+            )
+        rows.sort(key=lambda item: float(item.get(value_key, 0.0)), reverse=True)
+        return rows[: max(1, int(limit))]
 
     @staticmethod
     def _extract_kv_from_details(details: str, key: str) -> str | None:
@@ -1579,8 +1800,13 @@ class DailyReportGenerator:
             "market_stale_universe_change_enter_count": 0,
             "chronic_stale_exclusion_enter_count": 0,
             "chronic_stale_exclusion_active_count": 0,
+            "chronic_stale_exclusion_extended_count": 0,
             "chronic_stale_exclusion_cleared_count": 0,
+            "chronic_stale_exclusion_avg_active_age_ms": 0.0,
+            "chronic_stale_exclusion_long_active_market_count": 0,
             "chronic_stale_reason_breakdown": [],
+            "chronic_stale_extension_reason_breakdown": [],
+            "watched_chronic_stale_reason_breakdown": [],
             "market_stale_reason_breakdown": [],
             "market_stale_side_breakdown": [],
             "market_ready_blocked_stale_reason_breakdown": [],
@@ -1590,6 +1816,8 @@ class DailyReportGenerator:
             "top_long_stale_markets": [],
             "top_repeated_stale_markets": [],
             "top_chronic_stale_markets": [],
+            "top_reintroduced_chronic_stale_markets": [],
+            "top_long_active_chronic_stale_markets": [],
             "top_stale_legs": [],
             "top_stale_assets": [],
             "top_missing_book_assets": [],
@@ -2228,6 +2456,51 @@ class DailyReportGenerator:
         )
         return items[: max(1, int(limit))]
 
+    def _top_reintroduced_chronic_stale_markets(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason,
+          COUNT(*) AS reintroduced_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_chronic_stale_reintroduced_for_floor'
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id, d.reason"
+            " ORDER BY reintroduced_count DESC, d.market_id ASC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "market_id": str(row[0] or ""),
+                "reintroduced_reason": str(row[1] or "watched_floor_backfill_chronic_relaxed"),
+                "reintroduced_count": int(row[2] if row[2] is not None else 0),
+                "market_slug": str(row[3] or ""),
+                "market_question": str(row[4] or ""),
+            }
+            for row in rows
+            if str(row[0] or "")
+        ]
+
     def _top_repeated_missing_book_markets(
         self,
         conn: sqlite3.Connection,
@@ -2550,6 +2823,12 @@ class DailyReportGenerator:
                 run_id=run_id,
                 event_name="market_chronic_stale_exclusion_entered",
             )
+            chronic_stale_exclusion_extended_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_chronic_stale_exclusion_extended",
+            )
             chronic_stale_exclusion_cleared_count = self._count_diagnostics_event(
                 conn,
                 window,
@@ -2567,6 +2846,48 @@ class DailyReportGenerator:
                 window,
                 run_id=run_id,
                 event_name="market_chronic_stale_exclusion_entered",
+            )
+            chronic_stale_extension_reason_breakdown = self._diagnostics_reasons_for_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_chronic_stale_exclusion_extended",
+            )
+            chronic_stale_exclusion_avg_active_age_ms = self._latest_metric_float_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="chronic_stale_exclusion_avg_active_age_ms",
+            )
+            chronic_stale_exclusion_long_active_market_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="chronic_stale_exclusion_long_active_market_count",
+            )
+            chronic_stale_reintroduced_for_floor_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="chronic_stale_reintroduced_for_floor_count",
+            )
+            chronic_stale_reintroduced_market_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="chronic_stale_reintroduced_market_count",
+            )
+            watched_chronic_stale_excluded_market_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="watched_chronic_stale_excluded_market_count",
+            )
+            watched_chronic_stale_reason_breakdown = self._latest_metric_prefix_breakdown(
+                conn,
+                window,
+                run_id=run_id,
+                metric_prefix="watched_chronic_stale_reason:",
             )
             market_stale_reason_breakdown = self._diagnostics_detail_breakdown_for_event(
                 conn,
@@ -2715,9 +3036,29 @@ class DailyReportGenerator:
                     market_stale_universe_change_enter_count
                 ),
                 "chronic_stale_exclusion_enter_count": chronic_stale_exclusion_enter_count,
+                "chronic_stale_exclusion_extended_count": chronic_stale_exclusion_extended_count,
                 "chronic_stale_exclusion_active_count": chronic_stale_exclusion_active_count,
                 "chronic_stale_exclusion_cleared_count": chronic_stale_exclusion_cleared_count,
+                "chronic_stale_exclusion_avg_active_age_ms": (
+                    chronic_stale_exclusion_avg_active_age_ms
+                ),
+                "chronic_stale_exclusion_long_active_market_count": (
+                    chronic_stale_exclusion_long_active_market_count
+                ),
+                "chronic_stale_reintroduced_for_floor_count": (
+                    chronic_stale_reintroduced_for_floor_count
+                ),
+                "chronic_stale_reintroduced_market_count": (
+                    chronic_stale_reintroduced_market_count
+                ),
+                "watched_chronic_stale_excluded_market_count": (
+                    watched_chronic_stale_excluded_market_count
+                ),
                 "chronic_stale_reason_breakdown": chronic_stale_reason_breakdown,
+                "chronic_stale_extension_reason_breakdown": (
+                    chronic_stale_extension_reason_breakdown
+                ),
+                "watched_chronic_stale_reason_breakdown": (watched_chronic_stale_reason_breakdown),
                 "market_stale_reason_breakdown": market_stale_reason_breakdown,
                 "market_stale_side_breakdown": market_stale_side_breakdown,
                 "market_ready_blocked_stale_reason_breakdown": (
@@ -2777,6 +3118,22 @@ class DailyReportGenerator:
                     conn,
                     window,
                     run_id=run_id,
+                ),
+                "top_reintroduced_chronic_stale_markets": (
+                    self._top_reintroduced_chronic_stale_markets(
+                        conn,
+                        window,
+                        run_id=run_id,
+                    )
+                ),
+                "top_long_active_chronic_stale_markets": (
+                    self._top_markets_from_latest_metric_details(
+                        conn,
+                        window,
+                        run_id=run_id,
+                        metric_name="chronic_stale_exclusion_long_active_market_count",
+                        value_key="active_age_ms",
+                    )
                 ),
                 "top_repeated_missing_book_markets": self._top_repeated_missing_book_markets(
                     conn,

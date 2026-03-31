@@ -121,6 +121,12 @@ def _evaluation_status(
         overview.get("low_quality_runtime_excluded_count", 0.0)
     )
     chronic_stale_excluded_count = float(overview.get("chronic_stale_excluded_market_count", 0.0))
+    watched_chronic_stale_excluded_count = float(
+        overview.get("watched_chronic_stale_excluded_market_count", 0.0)
+    )
+    chronic_reintroduced_for_floor_count = float(
+        overview.get("chronic_stale_reintroduced_for_floor_count", 0.0)
+    )
     readiness_friction_count = (
         float(overview.get("book_not_ready_count", 0.0))
         + float(overview.get("quote_too_old_count", 0.0))
@@ -161,6 +167,15 @@ def _evaluation_status(
             and low_quality_runtime_excluded_count >= watched_markets_current
         )
         or (watched_markets_current > 0 and chronic_stale_excluded_count >= watched_markets_current)
+        or (
+            watched_markets_current > 0
+            and watched_chronic_stale_excluded_count >= watched_markets_current
+        )
+        or (
+            watched_markets_current > 0
+            and chronic_reintroduced_for_floor_count > 0
+            and eligible_market_count <= 0
+        )
         or stale_market_count > max(5.0, ready_market_count)
     )
     if not_ready:
@@ -189,6 +204,12 @@ def _no_eligible_causes(overview: dict[str, float]) -> list[str]:
     market_not_ready = int(float(overview.get("market_not_ready_count", 0.0)))
     low_quality_excluded = int(float(overview.get("low_quality_runtime_excluded_count", 0.0)))
     chronic_excluded = int(float(overview.get("chronic_stale_excluded_market_count", 0.0)))
+    watched_chronic_excluded = int(
+        float(overview.get("watched_chronic_stale_excluded_market_count", 0.0))
+    )
+    chronic_reintroduced_for_floor = int(
+        float(overview.get("chronic_stale_reintroduced_for_floor_count", 0.0))
+    )
     gate_connection_recovering = int(
         float(overview.get("eligibility_gate_connection_recovering_count", 0.0))
     )
@@ -210,6 +231,10 @@ def _no_eligible_causes(overview: dict[str, float]) -> list[str]:
         causes.append("quality_penalty_excessive")
     if watched_markets > 0 and chronic_excluded >= watched_markets:
         causes.append("all_markets_chronic_stale_excluded")
+    if watched_markets > 0 and watched_chronic_excluded > 0:
+        causes.append("watched_universe_chronic_contaminated")
+    if watched_markets > 0 and chronic_reintroduced_for_floor > 0:
+        causes.append("watched_floor_reintroduced_chronic_stale")
     if watched_markets > 0 and gate_connection_recovering >= watched_markets:
         causes.append("all_markets_connection_recovering")
     if watched_markets > 0 and gate_book_recovering >= watched_markets:
@@ -307,32 +332,54 @@ def _overview_section(
         int(overview["chronic_stale_excluded_market_count"]),
     )
 
-    col35, col36, col37, col38 = st.columns(4)
-    col35.metric(
+    col36, col37, col38, col39, col40 = st.columns(5)
+    col36.metric(
+        "Chronic Reintroduced (Floor)",
+        int(overview["chronic_stale_reintroduced_for_floor_count"]),
+    )
+    col37.metric(
+        "Watched Chronic Excluded",
+        int(overview["watched_chronic_stale_excluded_market_count"]),
+    )
+    col38.metric(
+        "Chronic Excl Extended",
+        int(overview["chronic_stale_exclusion_extended_count"]),
+    )
+    col39.metric(
+        "Chronic Excl Avg Age (ms)",
+        f"{float(overview['chronic_stale_exclusion_avg_active_age_ms']):.1f}",
+    )
+    col40.metric(
+        "Chronic Excl Long-Active",
+        int(overview["chronic_stale_exclusion_long_active_market_count"]),
+    )
+
+    col41, col42, col43, col44 = st.columns(4)
+    col41.metric(
         "Gate: Conn Recovering",
         int(overview["eligibility_gate_connection_recovering_count"]),
     )
-    col36.metric(
+    col42.metric(
         "Gate: Book Recovering",
         int(overview["eligibility_gate_book_recovering_count"]),
     )
-    col37.metric(
+    col43.metric(
         "Gate: Stale/Freshness",
         int(overview["eligibility_gate_stale_quote_freshness_count"]),
     )
-    col38.metric(
+    col44.metric(
         "Gate: Other Readiness",
         int(overview["eligibility_gate_other_readiness_gate_count"]),
     )
 
-    col39, col40, col41, col42 = st.columns(4)
-    col39.metric("Gate: Blocked", int(overview["eligibility_gate_blocked_count"]))
-    col40.metric("Gate: Probation", int(overview["eligibility_gate_probation_count"]))
-    col41.metric(
+    col45, col46, col47, col48 = st.columns(4)
+    col45.metric("Gate: Blocked", int(overview["eligibility_gate_blocked_count"]))
+    col46.metric("Gate: Probation", int(overview["eligibility_gate_probation_count"]))
+    col47.metric(
         "Gate: Low-Quality Excluded",
         int(overview["eligibility_gate_low_quality_runtime_excluded_count"]),
     )
-    col42.metric(
+    col48.metric(
         "Gate: Chronic Stale Excluded",
         int(overview["eligibility_gate_chronic_stale_excluded_count"]),
     )
@@ -678,18 +725,40 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         int(float(recovery.get("chronic_stale_exclusion_active_count", 0.0))),
     )
 
-    col27, col28, col29 = st.columns(3)
+    col27, col28, col29, col30, col31 = st.columns(5)
     col27.metric(
         "Chronic Exclusion Enter",
         int(float(recovery.get("chronic_stale_exclusion_enter_count", 0.0))),
     )
     col28.metric(
+        "Chronic Exclusion Extended",
+        int(float(recovery.get("chronic_stale_exclusion_extended_count", 0.0))),
+    )
+    col29.metric(
         "Chronic Exclusion Cleared",
         int(float(recovery.get("chronic_stale_exclusion_cleared_count", 0.0))),
     )
-    col29.metric(
+    col30.metric(
+        "Chronic Reintroduced (Floor)",
+        int(float(recovery.get("chronic_stale_reintroduced_for_floor_count", 0.0))),
+    )
+    col31.metric(
         "UC Market Ready Blocked",
         int(float(recovery.get("recovery_universe_change_market_ready_blocked_count", 0.0))),
+    )
+
+    col32, col33, col34 = st.columns(3)
+    col32.metric(
+        "Watched Chronic Excluded",
+        int(float(recovery.get("watched_chronic_stale_excluded_market_count", 0.0))),
+    )
+    col33.metric(
+        "Chronic Excl Avg Active Age (ms)",
+        f"{float(recovery.get('chronic_stale_exclusion_avg_active_age_ms', 0.0)):.1f}",
+    )
+    col34.metric(
+        "Chronic Excl Long-Active",
+        int(float(recovery.get("chronic_stale_exclusion_long_active_market_count", 0.0))),
     )
 
     col30, col31 = st.columns(2)
@@ -814,6 +883,28 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
     else:
         st.dataframe(chronic_breakdown, use_container_width=True, hide_index=True)
 
+    col35, col36 = st.columns(2)
+    with col35:
+        st.markdown("**Chronic Exclusion Extension Reason Breakdown**")
+        chronic_extension_breakdown = _as_frame(
+            recovery.get("chronic_stale_extension_reason_breakdown"),
+            columns=["reason", "count"],
+        )
+        if chronic_extension_breakdown.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(chronic_extension_breakdown, use_container_width=True, hide_index=True)
+    with col36:
+        st.markdown("**Watched Chronic Excluded Reason Breakdown**")
+        watched_chronic_breakdown = _as_frame(
+            recovery.get("watched_chronic_stale_reason_breakdown"),
+            columns=["reason", "count"],
+        )
+        if watched_chronic_breakdown.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(watched_chronic_breakdown, use_container_width=True, hide_index=True)
+
     col32, col33 = st.columns(2)
     with col32:
         st.markdown("**Top Stale Assets**")
@@ -920,8 +1011,35 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
         else:
             st.dataframe(top_chronic_stale, use_container_width=True, hide_index=True)
 
-    col40, col41, col42 = st.columns(3)
+    col40, col41 = st.columns(2)
     with col40:
+        st.markdown("**Top Reintroduced Chronic Stale Markets**")
+        top_reintroduced_chronic = _as_frame(
+            recovery.get("top_reintroduced_chronic_stale_markets"),
+            columns=[
+                "market_slug",
+                "market_id",
+                "reintroduced_reason",
+                "reintroduced_count",
+            ],
+        )
+        if top_reintroduced_chronic.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(top_reintroduced_chronic, use_container_width=True, hide_index=True)
+    with col41:
+        st.markdown("**Top Long-Active Chronic Exclusions**")
+        top_long_active_chronic = _as_frame(
+            recovery.get("top_long_active_chronic_stale_markets"),
+            columns=["market_slug", "market_id", "active_age_ms"],
+        )
+        if top_long_active_chronic.empty:
+            st.write("No data.")
+        else:
+            st.dataframe(top_long_active_chronic, use_container_width=True, hide_index=True)
+
+    col42, col43, col44 = st.columns(3)
+    with col42:
         st.markdown("**Top Repeated Missing Book Markets**")
         repeated_missing_markets = _as_frame(
             recovery.get("top_repeated_missing_book_markets"),
@@ -931,7 +1049,7 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.write("No data.")
         else:
             st.dataframe(repeated_missing_markets, use_container_width=True, hide_index=True)
-    with col41:
+    with col43:
         st.markdown("**Top Recovery Slow Assets**")
         slow_assets = _as_frame(
             recovery.get("top_recovery_slow_assets"),
@@ -948,7 +1066,7 @@ def _recovery_diagnostics_section(recovery: dict[str, object]) -> None:
             st.write("No data.")
         else:
             st.dataframe(slow_assets, use_container_width=True, hide_index=True)
-    with col42:
+    with col44:
         st.markdown("**Top Recovery Slow Markets**")
         slow_markets = _as_frame(
             recovery.get("top_recovery_slow_markets"),

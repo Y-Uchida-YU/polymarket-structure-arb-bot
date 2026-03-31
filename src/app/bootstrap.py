@@ -99,11 +99,16 @@ DIAG_EVENT_MARKET_STALE_ENTERED = "market_stale_entered"
 DIAG_EVENT_MARKET_STALE_RECOVERED = "market_stale_recovered"
 DIAG_EVENT_MARKET_STALE_EPISODE_CLOSED = "market_stale_episode_closed"
 DIAG_EVENT_MARKET_CHRONIC_STALE_EXCLUSION_ENTERED = "market_chronic_stale_exclusion_entered"
+DIAG_EVENT_MARKET_CHRONIC_STALE_EXCLUSION_EXTENDED = "market_chronic_stale_exclusion_extended"
 DIAG_EVENT_MARKET_CHRONIC_STALE_EXCLUSION_CLEARED = "market_chronic_stale_exclusion_cleared"
+DIAG_EVENT_MARKET_CHRONIC_STALE_REINTRODUCED_FOR_FLOOR = (
+    "market_chronic_stale_reintroduced_for_floor"
+)
 
 CHRONIC_STALE_REASON_REPEATED_STALE_ENTERS = "repeated_stale_enters"
 CHRONIC_STALE_REASON_LONG_SINGLE_STALE_DURATION = "long_single_stale_duration"
 CHRONIC_STALE_REASON_BOTH = "both"
+CHRONIC_STALE_LONG_ACTIVE_MULTIPLIER = 2.0
 NO_SIGNAL_REASON_CHRONIC_STALE_EXCLUDED = "chronic_stale_excluded"
 
 
@@ -191,6 +196,12 @@ class AppState:
     last_refresh_runtime_excluded_reason_by_market: dict[str, str] = field(default_factory=dict)
     last_refresh_runtime_excluded_count: int = 0
     last_refresh_runtime_excluded_at: datetime | None = None
+    last_refresh_chronic_reintroduced_market_ids: set[str] = field(default_factory=set)
+    last_refresh_chronic_reintroduced_reason_by_market: dict[str, str] = field(default_factory=dict)
+    last_refresh_watched_chronic_stale_market_ids: set[str] = field(default_factory=set)
+    last_refresh_watched_chronic_stale_reason_by_market: dict[str, str] = field(
+        default_factory=dict
+    )
     market_chronic_stale_excluded_until: dict[str, datetime] = field(default_factory=dict)
     market_chronic_stale_exclusion_started_at: dict[str, datetime] = field(default_factory=dict)
     market_chronic_stale_reason_by_market: dict[str, str] = field(default_factory=dict)
@@ -252,14 +263,22 @@ class MarketSnapshot:
     excluded_counts: dict[str, int]
     markets_by_id: dict[str, BinaryMarket]
     token_to_market_side: dict[str, tuple[str, str]]
+    chronic_reintroduced_for_floor_market_ids: set[str] = field(default_factory=set)
+    chronic_reintroduced_reason_by_market: dict[str, str] = field(default_factory=dict)
+    watched_chronic_stale_market_ids: set[str] = field(default_factory=set)
+    watched_chronic_stale_reason_by_market: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
 class ChronicStaleExclusionSummary:
     active_market_ids: set[str] = field(default_factory=set)
     entered_market_ids: set[str] = field(default_factory=set)
+    extended_market_ids: set[str] = field(default_factory=set)
     cleared_market_ids: set[str] = field(default_factory=set)
     reason_counts: dict[str, int] = field(default_factory=dict)
+    extended_reason_counts: dict[str, int] = field(default_factory=dict)
+    avg_active_age_ms: float = 0.0
+    long_active_market_ages_ms: dict[str, float] = field(default_factory=dict)
 
 
 class PolymarketStructureArbApp:
@@ -541,7 +560,12 @@ class PolymarketStructureArbApp:
         *,
         now_utc: datetime,
     ) -> ChronicStaleExclusionSummary:
-        previous_active = set(self.state.market_chronic_stale_excluded_until.keys())
+        previous_excluded_until = dict(self.state.market_chronic_stale_excluded_until)
+        previous_tracked_market_ids = set(previous_excluded_until.keys())
+        previous_active_market_ids = self._active_chronic_stale_excluded_market_ids(
+            now_utc=now_utc,
+            prune_expired=False,
+        )
         previous_reasons = dict(self.state.market_chronic_stale_reason_by_market)
         previous_details = {
             market_id: dict(details)
@@ -576,6 +600,9 @@ class PolymarketStructureArbApp:
             now_utc=now_utc,
             window_minutes=window_minutes,
         )
+        extended_market_ids: set[str] = set()
+        extended_reason_counts: dict[str, int] = {}
+        extension_ms_by_market: dict[str, float] = {}
         for market_id, (stale_enter_count, max_stale_duration_ms) in candidate_metrics.items():
             repeated_trigger = stale_enter_count >= min_enter_count
             long_trigger = max_stale_duration_ms >= max_single_duration_ms
@@ -597,6 +624,19 @@ class PolymarketStructureArbApp:
                 "cooldown_ms": cooldown_ms,
             }
             excluded_until = now_utc + cooldown_delta
+            previous_until = previous_excluded_until.get(market_id)
+            if (
+                market_id in previous_active_market_ids
+                and previous_until is not None
+                and excluded_until > previous_until
+            ):
+                extension_ms = max(
+                    0.0,
+                    (excluded_until - previous_until).total_seconds() * 1000.0,
+                )
+                extended_market_ids.add(market_id)
+                extended_reason_counts[reason_key] = extended_reason_counts.get(reason_key, 0) + 1
+                extension_ms_by_market[market_id] = extension_ms
             if market_id not in self.state.market_chronic_stale_excluded_until:
                 self.state.market_chronic_stale_exclusion_started_at[market_id] = now_utc
             self.state.market_chronic_stale_excluded_until[market_id] = excluded_until
@@ -607,8 +647,8 @@ class PolymarketStructureArbApp:
             now_utc=now_utc,
             prune_expired=False,
         )
-        entered_market_ids = active_market_ids - previous_active
-        cleared_market_ids = previous_active - active_market_ids
+        entered_market_ids = active_market_ids - previous_tracked_market_ids
+        cleared_market_ids = previous_tracked_market_ids - active_market_ids
 
         for market_id in sorted(entered_market_ids):
             details = self._market_chronic_stale_details(market_id)
@@ -617,6 +657,25 @@ class PolymarketStructureArbApp:
                 now_utc=now_utc,
                 market_id=market_id,
                 reason=self.state.market_chronic_stale_reason_by_market.get(market_id),
+                details=format_kv_details(details),
+            )
+
+        for market_id in sorted(extended_market_ids):
+            details = self._market_chronic_stale_details(market_id)
+            previous_until = previous_excluded_until.get(market_id)
+            next_until = self.state.market_chronic_stale_excluded_until.get(market_id)
+            if previous_until is not None:
+                details["previous_excluded_until"] = previous_until.isoformat()
+            if next_until is not None:
+                details["next_excluded_until"] = next_until.isoformat()
+            details["extension_reason"] = "cooldown_refreshed_by_new_chronic_signal"
+            details["extension_ms"] = round(extension_ms_by_market.get(market_id, 0.0), 3)
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_CHRONIC_STALE_EXCLUSION_EXTENDED,
+                now_utc=now_utc,
+                market_id=market_id,
+                reason=self.state.market_chronic_stale_reason_by_market.get(market_id),
+                latency_ms=extension_ms_by_market.get(market_id),
                 details=format_kv_details(details),
             )
 
@@ -646,13 +705,35 @@ class PolymarketStructureArbApp:
                 CHRONIC_STALE_REASON_REPEATED_STALE_ENTERS,
             )
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        active_market_ages_ms: dict[str, float] = {}
+        for market_id in active_market_ids:
+            started_at = self.state.market_chronic_stale_exclusion_started_at.get(market_id)
+            if started_at is None:
+                continue
+            age_ms = max(0.0, (now_utc - started_at).total_seconds() * 1000.0)
+            active_market_ages_ms[market_id] = age_ms
+        avg_active_age_ms = (
+            sum(active_market_ages_ms.values()) / len(active_market_ages_ms)
+            if active_market_ages_ms
+            else 0.0
+        )
+        long_active_threshold_ms = float(cooldown_ms) * CHRONIC_STALE_LONG_ACTIVE_MULTIPLIER
+        long_active_market_ages_ms = {
+            market_id: age_ms
+            for market_id, age_ms in active_market_ages_ms.items()
+            if age_ms >= long_active_threshold_ms
+        }
         self.state.market_chronic_stale_enter_count_last_cycle = len(entered_market_ids)
         self.state.market_chronic_stale_cleared_count_last_cycle = len(cleared_market_ids)
         return ChronicStaleExclusionSummary(
             active_market_ids=active_market_ids,
             entered_market_ids=entered_market_ids,
+            extended_market_ids=extended_market_ids,
             cleared_market_ids=cleared_market_ids,
             reason_counts=reason_counts,
+            extended_reason_counts=extended_reason_counts,
+            avg_active_age_ms=avg_active_age_ms,
+            long_active_market_ages_ms=long_active_market_ages_ms,
         )
 
     def _record_chronic_stale_exclusion_metrics(
@@ -661,21 +742,60 @@ class PolymarketStructureArbApp:
         summary: ChronicStaleExclusionSummary,
         now_utc: datetime,
     ) -> None:
+        reintroduced_market_ids = set(self.state.last_refresh_chronic_reintroduced_market_ids)
+        watched_chronic_market_ids = set(self.state.last_refresh_watched_chronic_stale_market_ids)
+        reintroduced_reason_by_market = dict(
+            self.state.last_refresh_chronic_reintroduced_reason_by_market
+        )
+        watched_chronic_reason_by_market = dict(
+            self.state.last_refresh_watched_chronic_stale_reason_by_market
+        )
         metrics = {
             "chronic_stale_excluded_market_count": float(len(summary.active_market_ids)),
             "chronic_stale_exclusion_enter_count": float(len(summary.entered_market_ids)),
+            "chronic_stale_exclusion_extended_count": float(len(summary.extended_market_ids)),
             "chronic_stale_exclusion_active_count": float(len(summary.active_market_ids)),
             "chronic_stale_exclusion_cleared_count": float(len(summary.cleared_market_ids)),
+            "chronic_stale_exclusion_avg_active_age_ms": float(summary.avg_active_age_ms),
+            "chronic_stale_exclusion_long_active_market_count": float(
+                len(summary.long_active_market_ages_ms)
+            ),
+            "chronic_stale_reintroduced_for_floor_count": float(len(reintroduced_market_ids)),
+            "chronic_stale_reintroduced_market_count": float(len(watched_chronic_market_ids)),
+            "watched_chronic_stale_excluded_market_count": float(len(watched_chronic_market_ids)),
         }
         active_summary = ",".join(
             f"{market_id}:{self.state.market_chronic_stale_reason_by_market.get(market_id, '')}"
             for market_id in sorted(summary.active_market_ids)[:10]
         )
+        reintroduced_summary = ",".join(
+            f"{market_id}:{reintroduced_reason_by_market.get(market_id, '')}"
+            for market_id in sorted(reintroduced_market_ids)[:10]
+        )
+        watched_chronic_summary = ",".join(
+            f"{market_id}:{watched_chronic_reason_by_market.get(market_id, '')}"
+            for market_id in sorted(watched_chronic_market_ids)[:10]
+        )
+        long_active_summary = ",".join(
+            f"{market_id}:{round(age_ms, 1)}"
+            for market_id, age_ms in sorted(
+                summary.long_active_market_ages_ms.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:10]
+        )
+        metric_details = {
+            "chronic_stale_reintroduced_for_floor_count": reintroduced_summary,
+            "chronic_stale_reintroduced_market_count": watched_chronic_summary,
+            "watched_chronic_stale_excluded_market_count": watched_chronic_summary,
+            "chronic_stale_exclusion_long_active_market_count": long_active_summary,
+        }
         for metric_name, metric_value in metrics.items():
+            details = metric_details.get(metric_name, active_summary)
             self.sqlite_store.save_metric(
                 metric_name=metric_name,
                 metric_value=metric_value,
-                details=active_summary,
+                details=details,
                 created_at_iso=now_utc.isoformat(),
                 run_id=self.state.run_id,
             )
@@ -686,6 +806,7 @@ class PolymarketStructureArbApp:
                     "metric_name": metric_name,
                     "metric_value": metric_value,
                     "active_markets": len(summary.active_market_ids),
+                    "details": details,
                 },
                 now_utc=now_utc,
             )
@@ -705,6 +826,79 @@ class PolymarketStructureArbApp:
                     "metric_name": metric_name,
                     "metric_value": count,
                     "active_markets": len(summary.active_market_ids),
+                },
+                now_utc=now_utc,
+            )
+        for reason_key, count in sorted(summary.extended_reason_counts.items()):
+            metric_name = f"chronic_stale_exclusion_extended_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=f"extended_markets={len(summary.extended_market_ids)}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "extended_markets": len(summary.extended_market_ids),
+                },
+                now_utc=now_utc,
+            )
+
+        reintroduced_reason_counts: dict[str, int] = {}
+        for market_id in reintroduced_market_ids:
+            reason = reintroduced_reason_by_market.get(
+                market_id,
+                "watched_floor_backfill_chronic_relaxed",
+            )
+            reintroduced_reason_counts[reason] = reintroduced_reason_counts.get(reason, 0) + 1
+        for reason_key, count in sorted(reintroduced_reason_counts.items()):
+            metric_name = f"chronic_stale_reintroduced_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=f"reintroduced_markets={len(reintroduced_market_ids)}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "reintroduced_markets": len(reintroduced_market_ids),
+                },
+                now_utc=now_utc,
+            )
+
+        watched_reason_counts: dict[str, int] = {}
+        for market_id in watched_chronic_market_ids:
+            reason = watched_chronic_reason_by_market.get(
+                market_id,
+                "watched_chronic_stale_excluded",
+            )
+            watched_reason_counts[reason] = watched_reason_counts.get(reason, 0) + 1
+        for reason_key, count in sorted(watched_reason_counts.items()):
+            metric_name = f"watched_chronic_stale_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=f"watched_chronic_markets={len(watched_chronic_market_ids)}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "watched_chronic_markets": len(watched_chronic_market_ids),
                 },
                 now_utc=now_utc,
             )
@@ -824,34 +1018,123 @@ class PolymarketStructureArbApp:
             runtime_excluded_market_ids=runtime_excluded_market_ids,
             runtime_excluded_reason_by_market=runtime_excluded_reason_by_market,
         )
+        chronic_reintroduced_for_floor_market_ids: set[str] = set()
+        chronic_reintroduced_reason_by_market: dict[str, str] = {}
         watched_floor = self._effective_watched_floor()
         if watched_floor > 0 and len(extraction.markets) < watched_floor:
             relaxed_filters = self._relaxed_market_filters_for_watched_floor()
-            relaxed_runtime_excluded_ids = (
-                set()
-                if self.config.settings.runtime.watched_floor_relax_runtime_exclusion
-                else runtime_excluded_market_ids
-            )
-            relaxed_runtime_excluded_reasons = (
-                None
-                if self.config.settings.runtime.watched_floor_relax_runtime_exclusion
-                else runtime_excluded_reason_by_market
-            )
-            relaxed_extraction = extract_binary_markets_with_stats(
+            existing_market_ids = {market.market_id for market in extraction.markets}
+            supplements: list[BinaryMarket] = []
+
+            stage1_extraction = extract_binary_markets_with_stats(
                 raw_markets=raw_markets,
                 market_filters=relaxed_filters,
                 markets_config=self.config.markets,
                 preferred_market_ids=set(self.markets_by_id.keys()),
-                runtime_excluded_market_ids=relaxed_runtime_excluded_ids,
-                runtime_excluded_reason_by_market=relaxed_runtime_excluded_reasons,
+                runtime_excluded_market_ids=runtime_excluded_market_ids,
+                runtime_excluded_reason_by_market=runtime_excluded_reason_by_market,
             )
             needed = max(0, watched_floor - len(extraction.markets))
-            existing_market_ids = {market.market_id for market in extraction.markets}
-            supplements = [
+            stage1_supplements = [
                 market
-                for market in relaxed_extraction.markets
+                for market in stage1_extraction.markets
                 if market.market_id not in existing_market_ids
             ][:needed]
+            if stage1_supplements:
+                supplements.extend(stage1_supplements)
+                existing_market_ids.update(market.market_id for market in stage1_supplements)
+                extraction.excluded_counts["watched_floor_backfilled_non_excluded"] = (
+                    extraction.excluded_counts.get("watched_floor_backfilled_non_excluded", 0)
+                    + len(stage1_supplements)
+                )
+
+            stage2_supplements: list[BinaryMarket] = []
+            if (
+                self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+                and len(extraction.markets) + len(supplements) < watched_floor
+            ):
+                chronic_only_reason_map = {
+                    market_id: "chronic_stale_runtime" for market_id in chronic_excluded_market_ids
+                }
+                stage2_extraction = extract_binary_markets_with_stats(
+                    raw_markets=raw_markets,
+                    market_filters=relaxed_filters,
+                    markets_config=self.config.markets,
+                    preferred_market_ids=set(self.markets_by_id.keys()),
+                    runtime_excluded_market_ids=set(chronic_excluded_market_ids),
+                    runtime_excluded_reason_by_market=chronic_only_reason_map,
+                )
+                needed = max(0, watched_floor - (len(extraction.markets) + len(supplements)))
+                stage2_supplements = [
+                    market
+                    for market in stage2_extraction.markets
+                    if (
+                        market.market_id in low_quality_excluded_market_ids
+                        and market.market_id not in existing_market_ids
+                    )
+                ][:needed]
+                if stage2_supplements:
+                    supplements.extend(stage2_supplements)
+                    existing_market_ids.update(market.market_id for market in stage2_supplements)
+                    extraction.excluded_counts["watched_floor_backfilled_low_quality_runtime"] = (
+                        extraction.excluded_counts.get(
+                            "watched_floor_backfilled_low_quality_runtime",
+                            0,
+                        )
+                        + len(stage2_supplements)
+                    )
+
+            stage3_supplements: list[BinaryMarket] = []
+            if (
+                self.config.settings.runtime.watched_floor_relax_chronic_stale_exclusion
+                and len(extraction.markets) + len(supplements) < watched_floor
+            ):
+                stage3_runtime_excluded_ids = (
+                    set()
+                    if self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+                    else set(low_quality_excluded_market_ids)
+                )
+                stage3_runtime_reason_map = (
+                    None
+                    if not stage3_runtime_excluded_ids
+                    else {
+                        market_id: "low_quality_runtime"
+                        for market_id in stage3_runtime_excluded_ids
+                    }
+                )
+                stage3_extraction = extract_binary_markets_with_stats(
+                    raw_markets=raw_markets,
+                    market_filters=relaxed_filters,
+                    markets_config=self.config.markets,
+                    preferred_market_ids=set(self.markets_by_id.keys()),
+                    runtime_excluded_market_ids=stage3_runtime_excluded_ids,
+                    runtime_excluded_reason_by_market=stage3_runtime_reason_map,
+                )
+                needed = max(0, watched_floor - (len(extraction.markets) + len(supplements)))
+                stage3_supplements = [
+                    market
+                    for market in stage3_extraction.markets
+                    if (
+                        market.market_id in chronic_excluded_market_ids
+                        and market.market_id not in existing_market_ids
+                    )
+                ][:needed]
+                if stage3_supplements:
+                    supplements.extend(stage3_supplements)
+                    existing_market_ids.update(market.market_id for market in stage3_supplements)
+                    extraction.excluded_counts["watched_floor_backfilled_chronic_stale_runtime"] = (
+                        extraction.excluded_counts.get(
+                            "watched_floor_backfilled_chronic_stale_runtime",
+                            0,
+                        )
+                        + len(stage3_supplements)
+                    )
+                    for market in stage3_supplements:
+                        chronic_reintroduced_for_floor_market_ids.add(market.market_id)
+                        chronic_reintroduced_reason_by_market[market.market_id] = (
+                            "watched_floor_backfill_chronic_relaxed"
+                        )
+
             if supplements:
                 extraction.markets = [*extraction.markets, *supplements]
                 extraction.excluded_counts["watched_floor_backfilled"] = (
@@ -860,15 +1143,30 @@ class PolymarketStructureArbApp:
                 self.logger.info(
                     (
                         "Watched floor backfill applied floor=%s base=%s added=%s "
-                        "runtime_exclusion_relaxed=%s activity_relaxed=%s"
+                        "non_excluded=%s low_quality=%s chronic=%s "
+                        "low_quality_relaxed=%s chronic_relaxed=%s activity_relaxed=%s"
                     ),
                     watched_floor,
-                    len(existing_market_ids),
+                    len(extraction.markets) - len(supplements),
                     len(supplements),
+                    len(stage1_supplements),
+                    len(stage2_supplements),
+                    len(stage3_supplements),
                     self.config.settings.runtime.watched_floor_relax_runtime_exclusion,
+                    self.config.settings.runtime.watched_floor_relax_chronic_stale_exclusion,
                     self.config.settings.runtime.watched_floor_relax_activity_filters,
                 )
         markets_by_id = {market.market_id: market for market in extraction.markets}
+        watched_chronic_stale_market_ids = {
+            market_id for market_id in markets_by_id if market_id in chronic_excluded_market_ids
+        }
+        watched_chronic_stale_reason_by_market = {
+            market_id: chronic_reintroduced_reason_by_market.get(
+                market_id,
+                "watched_chronic_stale_excluded",
+            )
+            for market_id in watched_chronic_stale_market_ids
+        }
         token_to_market_side: dict[str, tuple[str, str]] = {}
         for market in extraction.markets:
             token_to_market_side[market.yes_token_id] = (market.market_id, "yes")
@@ -878,6 +1176,10 @@ class PolymarketStructureArbApp:
             excluded_counts=extraction.excluded_counts,
             markets_by_id=markets_by_id,
             token_to_market_side=token_to_market_side,
+            chronic_reintroduced_for_floor_market_ids=chronic_reintroduced_for_floor_market_ids,
+            chronic_reintroduced_reason_by_market=chronic_reintroduced_reason_by_market,
+            watched_chronic_stale_market_ids=watched_chronic_stale_market_ids,
+            watched_chronic_stale_reason_by_market=watched_chronic_stale_reason_by_market,
         )
 
     async def _apply_market_snapshot(
@@ -907,6 +1209,41 @@ class PolymarketStructureArbApp:
         self.state.subscribed_assets = len(asset_ids)
         self.state.cumulative_watched_market_ids.update(self.markets_by_id.keys())
         self.state.cumulative_subscribed_asset_ids.update(asset_ids)
+        self.state.last_refresh_chronic_reintroduced_market_ids = set(
+            snapshot.chronic_reintroduced_for_floor_market_ids
+        )
+        self.state.last_refresh_chronic_reintroduced_reason_by_market = dict(
+            snapshot.chronic_reintroduced_reason_by_market
+        )
+        self.state.last_refresh_watched_chronic_stale_market_ids = set(
+            snapshot.watched_chronic_stale_market_ids
+        )
+        self.state.last_refresh_watched_chronic_stale_reason_by_market = dict(
+            snapshot.watched_chronic_stale_reason_by_market
+        )
+        for market_id in sorted(snapshot.chronic_reintroduced_for_floor_market_ids):
+            reason = snapshot.chronic_reintroduced_reason_by_market.get(
+                market_id,
+                "watched_floor_backfill_chronic_relaxed",
+            )
+            details = {
+                **self._market_context_by_market_id(market_id),
+                "reintroduced_reason": reason,
+                "watched_floor": self._effective_watched_floor(),
+                "low_quality_relax_enabled": int(
+                    self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+                ),
+                "chronic_relax_enabled": int(
+                    self.config.settings.runtime.watched_floor_relax_chronic_stale_exclusion
+                ),
+            }
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_CHRONIC_STALE_REINTRODUCED_FOR_FLOOR,
+                now_utc=now,
+                market_id=market_id,
+                reason=reason,
+                details=format_kv_details(details),
+            )
 
         self.state.safe_mode_blocked_assets &= current_asset_ids
         self.state.safe_mode_blocked_markets &= current_markets

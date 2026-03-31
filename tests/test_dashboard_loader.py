@@ -354,6 +354,42 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 ("run-1", "chronic_stale_excluded_market_count", 1.0, "m1", now),
                 ("run-1", "chronic_stale_exclusion_active_count", 1.0, "m1", now),
+                (
+                    "run-1",
+                    "chronic_stale_reintroduced_for_floor_count",
+                    1.0,
+                    "m1:watched_floor_backfill_chronic_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "chronic_stale_reintroduced_market_count",
+                    1.0,
+                    "m1:watched_floor_backfill_chronic_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "watched_chronic_stale_excluded_market_count",
+                    1.0,
+                    "m1:watched_floor_backfill_chronic_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "chronic_stale_exclusion_extended_count",
+                    1.0,
+                    "m1:repeated_stale_enters",
+                    now,
+                ),
+                ("run-1", "chronic_stale_exclusion_avg_active_age_ms", 91000.0, "m1", now),
+                (
+                    "run-1",
+                    "chronic_stale_exclusion_long_active_market_count",
+                    1.0,
+                    "m1:91000.0",
+                    now,
+                ),
             ],
         )
         store.conn.executemany(
@@ -520,6 +556,26 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 (
                     "run-1",
+                    "market_chronic_stale_exclusion_extended",
+                    None,
+                    "m1",
+                    "repeated_stale_enters",
+                    60000.0,
+                    "extension_reason=cooldown_refreshed_by_new_chronic_signal",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_chronic_stale_reintroduced_for_floor",
+                    None,
+                    "m1",
+                    "watched_floor_backfill_chronic_relaxed",
+                    None,
+                    "market_slug=market-1",
+                    now,
+                ),
+                (
+                    "run-1",
                     "eligibility_gate_unmet",
                     None,
                     "m1",
@@ -597,8 +653,12 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert recovery["avg_market_stale_duration_ms"] == 900.0
     assert recovery["market_stale_universe_change_enter_count"] == 1.0
     assert recovery["chronic_stale_exclusion_enter_count"] == 1.0
+    assert recovery["chronic_stale_exclusion_extended_count"] == 1.0
     assert recovery["chronic_stale_exclusion_active_count"] == 1.0
     assert recovery["chronic_stale_exclusion_cleared_count"] == 1.0
+    assert recovery["chronic_stale_reintroduced_for_floor_count"] == 1.0
+    assert recovery["watched_chronic_stale_excluded_market_count"] == 1.0
+    assert recovery["chronic_stale_exclusion_long_active_market_count"] == 1.0
     assert not recovery["first_quote_blocked_reasons"].empty
     assert str(recovery["first_quote_blocked_reasons"].iloc[0]["reason"]) == "connection_recovering"
     assert not recovery["eligibility_gate_unmet_reasons"].empty
@@ -620,6 +680,12 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     top_chronic_markets = recovery["top_chronic_stale_markets"]
     assert not top_chronic_markets.empty
     assert str(top_chronic_markets.iloc[0]["market_slug"]) == "market-1"
+    top_reintroduced_chronic = recovery["top_reintroduced_chronic_stale_markets"]
+    assert not top_reintroduced_chronic.empty
+    assert str(top_reintroduced_chronic.iloc[0]["market_id"]) == "m1"
+    top_long_active_chronic = recovery["top_long_active_chronic_stale_markets"]
+    assert not top_long_active_chronic.empty
+    assert str(top_long_active_chronic.iloc[0]["market_id"]) == "m1"
     top_quote_missing = recovery["top_quote_missing_after_resync_assets"]
     assert not top_quote_missing.empty
     assert str(top_quote_missing.iloc[0]["asset_id"]) == "a1"
