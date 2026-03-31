@@ -107,6 +107,7 @@ class RuntimeSettings(BaseModel):
     min_watched_markets_floor: int = 8
     watched_floor_relax_activity_filters: bool = True
     watched_floor_relax_runtime_exclusion: bool = True
+    watched_floor_relax_chronic_stale_exclusion: bool = False
     snapshot_interval_minutes: int = 60
     report_export_interval_minutes: int = 1_440
     environment_name: str = "win11-local"

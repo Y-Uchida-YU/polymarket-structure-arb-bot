@@ -1129,6 +1129,42 @@ def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path
             [
                 ("run-1", "chronic_stale_excluded_market_count", 1.0, "m1", now),
                 ("run-1", "chronic_stale_exclusion_active_count", 1.0, "m1", now),
+                (
+                    "run-1",
+                    "chronic_stale_reintroduced_for_floor_count",
+                    1.0,
+                    "m1:watched_floor_backfill_chronic_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "chronic_stale_reintroduced_market_count",
+                    1.0,
+                    "m1:watched_floor_backfill_chronic_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "watched_chronic_stale_excluded_market_count",
+                    1.0,
+                    "m1:watched_floor_backfill_chronic_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "chronic_stale_exclusion_extended_count",
+                    1.0,
+                    "m1:repeated_stale_enters",
+                    now,
+                ),
+                ("run-1", "chronic_stale_exclusion_avg_active_age_ms", 91000.0, "m1", now),
+                (
+                    "run-1",
+                    "chronic_stale_exclusion_long_active_market_count",
+                    1.0,
+                    "m1:91000.0",
+                    now,
+                ),
             ],
         )
         store.conn.executemany(
@@ -1156,6 +1192,26 @@ def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path
                     "repeated_stale_enters",
                     120000.0,
                     "cleared_reason=cooldown_elapsed;market_slug=chronic-market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_chronic_stale_exclusion_extended",
+                    None,
+                    "m1",
+                    "repeated_stale_enters",
+                    60000.0,
+                    "extension_reason=cooldown_refreshed_by_new_chronic_signal",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_chronic_stale_reintroduced_for_floor",
+                    None,
+                    "m1",
+                    "watched_floor_backfill_chronic_relaxed",
+                    None,
+                    "market_slug=chronic-market-1",
                     now,
                 ),
                 (
@@ -1202,9 +1258,17 @@ def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path
     assert report["totals"]["chronic_stale_excluded_market_count"] == 1
     assert report["totals"]["chronic_stale_exclusion_active_count"] == 1
     assert report["totals"]["chronic_stale_exclusion_enter_count"] == 1
+    assert report["totals"]["chronic_stale_exclusion_extended_count"] == 1
     assert report["totals"]["chronic_stale_exclusion_cleared_count"] == 1
+    assert report["totals"]["chronic_stale_reintroduced_for_floor_count"] == 1
+    assert report["totals"]["watched_chronic_stale_excluded_market_count"] == 1
     assert recovery["chronic_stale_reason_breakdown"][0]["reason"] == "repeated_stale_enters"
+    assert (
+        recovery["chronic_stale_extension_reason_breakdown"][0]["reason"] == "repeated_stale_enters"
+    )
     assert recovery["top_chronic_stale_markets"][0]["market_slug"] == "chronic-market-1"
+    assert recovery["top_reintroduced_chronic_stale_markets"][0]["market_id"] == "m1"
+    assert recovery["top_long_active_chronic_stale_markets"][0]["market_id"] == "m1"
     assert recovery["top_quote_missing_after_resync_assets"][0]["asset_id"] == "a1"
     assert recovery["top_quote_missing_after_resync_assets"][0]["side"] == "yes"
     assert recovery["top_repeated_missing_book_markets"][0]["market_id"] == "m1"

@@ -290,6 +290,42 @@ class DashboardDataLoader:
                 run_id=run_id,
                 metric_name="chronic_stale_exclusion_active_count",
             )
+            chronic_stale_reintroduced_for_floor_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="chronic_stale_reintroduced_for_floor_count",
+            )
+            chronic_stale_reintroduced_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="chronic_stale_reintroduced_market_count",
+            )
+            watched_chronic_stale_excluded_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="watched_chronic_stale_excluded_market_count",
+            )
+            chronic_stale_exclusion_extended_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="chronic_stale_exclusion_extended_count",
+            )
+            chronic_stale_exclusion_avg_active_age_ms = self._latest_metric_float_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="chronic_stale_exclusion_avg_active_age_ms",
+            )
+            chronic_stale_exclusion_long_active_market_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="chronic_stale_exclusion_long_active_market_count",
+            )
             ready_market_ratio = self._latest_metric_float_value(
                 conn=conn,
                 window=window,
@@ -390,6 +426,22 @@ class DashboardDataLoader:
             "low_quality_runtime_excluded_count": float(low_quality_runtime_excluded_count),
             "chronic_stale_excluded_market_count": float(chronic_stale_excluded_market_count),
             "chronic_stale_exclusion_active_count": float(chronic_stale_exclusion_active_count),
+            "chronic_stale_reintroduced_for_floor_count": float(
+                chronic_stale_reintroduced_for_floor_count
+            ),
+            "chronic_stale_reintroduced_market_count": float(
+                chronic_stale_reintroduced_market_count
+            ),
+            "watched_chronic_stale_excluded_market_count": float(
+                watched_chronic_stale_excluded_market_count
+            ),
+            "chronic_stale_exclusion_extended_count": float(chronic_stale_exclusion_extended_count),
+            "chronic_stale_exclusion_avg_active_age_ms": float(
+                chronic_stale_exclusion_avg_active_age_ms
+            ),
+            "chronic_stale_exclusion_long_active_market_count": float(
+                chronic_stale_exclusion_long_active_market_count
+            ),
             "no_initial_book_count": float(
                 self._sum_metric(
                     conn=conn,
@@ -1065,6 +1117,12 @@ class DashboardDataLoader:
                     run_id=run_id,
                     event_name="market_chronic_stale_exclusion_entered",
                 )
+                chronic_stale_exclusion_extended_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_chronic_stale_exclusion_extended",
+                )
                 chronic_stale_exclusion_cleared_count = self._count_diagnostics_event(
                     conn=conn,
                     window=window,
@@ -1082,6 +1140,48 @@ class DashboardDataLoader:
                     window=window,
                     run_id=run_id,
                     event_name="market_chronic_stale_exclusion_entered",
+                )
+                chronic_stale_extension_reason_breakdown = self._diagnostics_reasons_for_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_chronic_stale_exclusion_extended",
+                )
+                chronic_stale_exclusion_avg_active_age_ms = self._latest_metric_float_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="chronic_stale_exclusion_avg_active_age_ms",
+                )
+                chronic_stale_exclusion_long_active_market_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="chronic_stale_exclusion_long_active_market_count",
+                )
+                chronic_stale_reintroduced_for_floor_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="chronic_stale_reintroduced_for_floor_count",
+                )
+                chronic_stale_reintroduced_market_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="chronic_stale_reintroduced_market_count",
+                )
+                watched_chronic_stale_excluded_market_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="watched_chronic_stale_excluded_market_count",
+                )
+                watched_chronic_stale_reason_breakdown = self._latest_metric_prefix_breakdown(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_prefix="watched_chronic_stale_reason:",
                 )
                 market_stale_reason_breakdown = self._diagnostics_detail_breakdown_for_event(
                     conn=conn,
@@ -1236,13 +1336,37 @@ class DashboardDataLoader:
                     "chronic_stale_exclusion_enter_count": float(
                         chronic_stale_exclusion_enter_count
                     ),
+                    "chronic_stale_exclusion_extended_count": float(
+                        chronic_stale_exclusion_extended_count
+                    ),
                     "chronic_stale_exclusion_active_count": float(
                         chronic_stale_exclusion_active_count
                     ),
                     "chronic_stale_exclusion_cleared_count": float(
                         chronic_stale_exclusion_cleared_count
                     ),
+                    "chronic_stale_exclusion_avg_active_age_ms": float(
+                        chronic_stale_exclusion_avg_active_age_ms
+                    ),
+                    "chronic_stale_exclusion_long_active_market_count": float(
+                        chronic_stale_exclusion_long_active_market_count
+                    ),
+                    "chronic_stale_reintroduced_for_floor_count": float(
+                        chronic_stale_reintroduced_for_floor_count
+                    ),
+                    "chronic_stale_reintroduced_market_count": float(
+                        chronic_stale_reintroduced_market_count
+                    ),
+                    "watched_chronic_stale_excluded_market_count": float(
+                        watched_chronic_stale_excluded_market_count
+                    ),
                     "chronic_stale_reason_breakdown": chronic_stale_reason_breakdown,
+                    "chronic_stale_extension_reason_breakdown": (
+                        chronic_stale_extension_reason_breakdown
+                    ),
+                    "watched_chronic_stale_reason_breakdown": (
+                        watched_chronic_stale_reason_breakdown
+                    ),
                     "market_stale_reason_breakdown": market_stale_reason_breakdown,
                     "market_stale_side_breakdown": market_stale_side_breakdown,
                     "market_ready_blocked_stale_reason_breakdown": (
@@ -1308,6 +1432,22 @@ class DashboardDataLoader:
                         conn=conn,
                         window=window,
                         run_id=run_id,
+                    ),
+                    "top_reintroduced_chronic_stale_markets": (
+                        self._top_reintroduced_chronic_stale_markets(
+                            conn=conn,
+                            window=window,
+                            run_id=run_id,
+                        )
+                    ),
+                    "top_long_active_chronic_stale_markets": (
+                        self._top_markets_from_latest_metric_details(
+                            conn=conn,
+                            window=window,
+                            run_id=run_id,
+                            metric_name="chronic_stale_exclusion_long_active_market_count",
+                            value_key="active_age_ms",
+                        )
                     ),
                     "top_repeated_missing_book_markets": self._top_repeated_missing_book_markets(
                         conn=conn,
@@ -1859,6 +1999,38 @@ class DashboardDataLoader:
             .head(5)
         )
 
+    def _top_reintroduced_chronic_stale_markets(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason AS reintroduced_reason,
+          COUNT(*) AS reintroduced_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_chronic_stale_reintroduced_for_floor'
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id, d.reason"
+            " ORDER BY reintroduced_count DESC, d.market_id ASC LIMIT 5"
+        )
+        return pd.read_sql_query(query, conn, params=params)
+
     def _top_repeated_missing_book_markets(
         self,
         *,
@@ -2397,6 +2569,40 @@ class DashboardDataLoader:
             row = conn.execute(fallback_query, fallback_params).fetchone()
         return float(row[0]) if row and row[0] is not None else 0.0
 
+    def _latest_metric_details(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_name: str,
+    ) -> str:
+        query = """
+        SELECT details
+        FROM metrics
+        WHERE created_at >= ? AND created_at < ?
+          AND metric_name = ?
+        """
+        params: list[object] = [window.start_iso, window.end_iso, metric_name]
+        if run_id is not None:
+            query += " AND run_id = ?"
+            params.append(run_id)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            fallback_query = """
+            SELECT details
+            FROM metrics
+            WHERE metric_name = ?
+            """
+            fallback_params: list[object] = [metric_name]
+            if run_id is not None:
+                fallback_query += " AND run_id = ?"
+                fallback_params.append(run_id)
+            fallback_query += " ORDER BY created_at DESC LIMIT 1"
+            row = conn.execute(fallback_query, fallback_params).fetchone()
+        return str(row[0]) if row and row[0] is not None else ""
+
     def _latest_metric_prefix_breakdown(
         self,
         *,
@@ -2444,6 +2650,94 @@ class DashboardDataLoader:
         ]
         breakdown.sort(key=lambda item: float(item.get("count", 0.0)), reverse=True)
         return breakdown
+
+    @staticmethod
+    def _parse_market_numeric_details(details: str) -> list[tuple[str, float]]:
+        results: list[tuple[str, float]] = []
+        compact = str(details or "").strip()
+        if not compact:
+            return results
+        for token in compact.split(","):
+            if ":" not in token:
+                continue
+            market_id, value_text = token.split(":", 1)
+            market_id = market_id.strip()
+            value_text = value_text.strip()
+            if not market_id:
+                continue
+            try:
+                numeric_value = float(value_text)
+            except ValueError:
+                continue
+            results.append((market_id, numeric_value))
+        return results
+
+    def _market_context_map(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        market_ids: list[str],
+    ) -> dict[str, dict[str, str]]:
+        unique_ids = [market_id for market_id in dict.fromkeys(market_ids) if market_id]
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        query = f"""
+        SELECT market_id, MAX(COALESCE(slug, '')) AS slug, MAX(COALESCE(question, '')) AS question
+        FROM markets
+        WHERE market_id IN ({placeholders})
+        GROUP BY market_id
+        """
+        rows = conn.execute(query, unique_ids).fetchall()
+        return {
+            str(row[0]): {
+                "market_slug": str(row[1] or ""),
+                "market_question": str(row[2] or ""),
+            }
+            for row in rows
+            if str(row[0] or "")
+        }
+
+    def _top_markets_from_latest_metric_details(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_name: str,
+        value_key: str,
+        limit: int = 5,
+    ) -> pd.DataFrame:
+        parsed = self._parse_market_numeric_details(
+            self._latest_metric_details(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+        if not parsed:
+            return pd.DataFrame(columns=["market_id", "market_slug", "market_question", value_key])
+        contexts = self._market_context_map(
+            conn=conn,
+            market_ids=[market_id for market_id, _ in parsed],
+        )
+        rows = []
+        for market_id, value in parsed:
+            context = contexts.get(market_id, {"market_slug": "", "market_question": ""})
+            rows.append(
+                {
+                    "market_id": market_id,
+                    "market_slug": context["market_slug"],
+                    "market_question": context["market_question"],
+                    value_key: float(value),
+                }
+            )
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+        frame = frame.sort_values(value_key, ascending=False).head(max(1, int(limit)))
+        return frame.reset_index(drop=True)
 
     @staticmethod
     def _extract_kv(details: str, key: str) -> str | None:
@@ -2565,9 +2859,17 @@ class DashboardDataLoader:
             "max_market_stale_duration_ms": 0.0,
             "market_stale_universe_change_enter_count": 0.0,
             "chronic_stale_exclusion_enter_count": 0.0,
+            "chronic_stale_exclusion_extended_count": 0.0,
             "chronic_stale_exclusion_active_count": 0.0,
             "chronic_stale_exclusion_cleared_count": 0.0,
+            "chronic_stale_exclusion_avg_active_age_ms": 0.0,
+            "chronic_stale_exclusion_long_active_market_count": 0.0,
+            "chronic_stale_reintroduced_for_floor_count": 0.0,
+            "chronic_stale_reintroduced_market_count": 0.0,
+            "watched_chronic_stale_excluded_market_count": 0.0,
             "chronic_stale_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "chronic_stale_extension_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "watched_chronic_stale_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
             "market_stale_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
             "market_stale_side_breakdown": pd.DataFrame(columns=["reason", "count"]),
             "market_ready_blocked_stale_reason_breakdown": pd.DataFrame(
@@ -2663,6 +2965,23 @@ class DashboardDataLoader:
                     "max_observed_stale_duration_ms",
                 ]
             ),
+            "top_reintroduced_chronic_stale_markets": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "reintroduced_reason",
+                    "reintroduced_count",
+                    "market_slug",
+                    "market_question",
+                ]
+            ),
+            "top_long_active_chronic_stale_markets": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "market_slug",
+                    "market_question",
+                    "active_age_ms",
+                ]
+            ),
             "top_repeated_missing_book_markets": pd.DataFrame(
                 columns=[
                     "market_id",
@@ -2730,6 +3049,12 @@ class DashboardDataLoader:
             "low_quality_runtime_excluded_count": 0.0,
             "chronic_stale_excluded_market_count": 0.0,
             "chronic_stale_exclusion_active_count": 0.0,
+            "chronic_stale_reintroduced_for_floor_count": 0.0,
+            "chronic_stale_reintroduced_market_count": 0.0,
+            "watched_chronic_stale_excluded_market_count": 0.0,
+            "chronic_stale_exclusion_extended_count": 0.0,
+            "chronic_stale_exclusion_avg_active_age_ms": 0.0,
+            "chronic_stale_exclusion_long_active_market_count": 0.0,
             "no_initial_book_count": 0.0,
             "asset_warming_up_count": 0.0,
             "resync_count": 0.0,
