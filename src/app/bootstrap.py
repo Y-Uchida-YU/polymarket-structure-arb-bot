@@ -647,7 +647,7 @@ class PolymarketStructureArbApp:
             now_utc=now_utc,
             prune_expired=False,
         )
-        entered_market_ids = active_market_ids - previous_active_market_ids
+        entered_market_ids = active_market_ids - previous_tracked_market_ids
         cleared_market_ids = previous_tracked_market_ids - active_market_ids
 
         for market_id in sorted(entered_market_ids):
