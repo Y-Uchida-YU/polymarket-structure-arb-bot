@@ -166,10 +166,19 @@ def test_dashboard_loader_empty_state(tmp_path: Path) -> None:
     assert overview["ready_market_ratio"] == 0.0
     assert overview["eligible_market_ratio"] == 0.0
     assert overview["min_watched_markets_floor"] == 0.0
+    assert overview["low_quality_runtime_exclusion_active_count"] == 0.0
+    assert overview["low_quality_runtime_exclusion_enter_count"] == 0.0
+    assert overview["low_quality_runtime_exclusion_cleared_count"] == 0.0
+    assert overview["low_quality_reintroduced_for_floor_count"] == 0.0
+    assert overview["current_watched_low_quality_excluded_count"] == 0.0
+    assert overview["watched_floor_shortfall_due_to_low_quality_exclusion"] == 0.0
     assert recovery["recovery_resync_started_count"] == 0.0
     assert recovery["recovery_first_quote_success_rate"] == 0.0
     assert recovery["market_stale_enter_count"] == 0.0
     assert recovery["avg_market_stale_duration_ms"] == 0.0
+    assert recovery["low_quality_runtime_exclusion_active_count"] == 0.0
+    assert recovery["low_quality_reintroduced_for_floor_count"] == 0.0
+    assert recovery["current_watched_low_quality_excluded_count"] == 0.0
     assert recovery["top_stale_assets"].empty
     assert recovery["top_stale_legs"].empty
     assert loader.load_run_ids() == []
@@ -213,6 +222,12 @@ def test_dashboard_loader_core_metrics_with_run_id_filter(tmp_path: Path) -> Non
     assert overview["min_watched_markets_floor"] == 0.0
     assert overview["low_quality_market_count"] == 0.0
     assert overview["low_quality_runtime_excluded_count"] == 0.0
+    assert overview["low_quality_runtime_exclusion_active_count"] == 0.0
+    assert overview["low_quality_runtime_exclusion_enter_count"] == 0.0
+    assert overview["low_quality_runtime_exclusion_cleared_count"] == 0.0
+    assert overview["low_quality_reintroduced_for_floor_count"] == 0.0
+    assert overview["current_watched_low_quality_excluded_count"] == 0.0
+    assert overview["watched_floor_shortfall_due_to_low_quality_exclusion"] == 0.0
     assert overview["watched_markets_current"] == 5.0
     assert overview["subscribed_assets_current"] == 10.0
 
@@ -354,6 +369,48 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 ("run-1", "chronic_stale_excluded_market_count", 1.0, "m1", now),
                 ("run-1", "chronic_stale_exclusion_active_count", 1.0, "m1", now),
+                (
+                    "run-1",
+                    "low_quality_runtime_exclusion_active_count",
+                    2.0,
+                    "m1:stage=excluded,m2:stage=excluded",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "low_quality_reintroduced_for_floor_count",
+                    1.0,
+                    "m1:watched_floor_backfill_low_quality_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "current_watched_low_quality_excluded_count",
+                    1.0,
+                    "m1:watched_floor_backfill_low_quality_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "watched_floor_shortfall_due_to_low_quality_exclusion",
+                    0.0,
+                    "floor=2;watched=2;shortfall=0;excluded_not_watched=0;low_quality_relax_enabled=1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "low_quality_reintroduced_reason:watched_floor_backfill_low_quality_relaxed",
+                    1.0,
+                    "reintroduced_markets=1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "watched_low_quality_reason:watched_floor_backfill_low_quality_relaxed",
+                    1.0,
+                    "watched_low_quality_markets=1",
+                    now,
+                ),
                 (
                     "run-1",
                     "chronic_stale_reintroduced_for_floor_count",
@@ -536,6 +593,36 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
                 ),
                 (
                     "run-1",
+                    "market_low_quality_runtime_exclusion_entered",
+                    None,
+                    "m1",
+                    "low_quality_runtime",
+                    None,
+                    "runtime_exclusion_reason=stage=excluded;market_slug=market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_low_quality_runtime_exclusion_cleared",
+                    None,
+                    "m1",
+                    "low_quality_runtime",
+                    None,
+                    "cleared_reason=quality_recovered_or_universe_requalified;market_slug=market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_low_quality_reintroduced_for_floor",
+                    None,
+                    "m1",
+                    "watched_floor_backfill_low_quality_relaxed",
+                    None,
+                    "market_slug=market-1",
+                    now,
+                ),
+                (
+                    "run-1",
                     "market_chronic_stale_exclusion_entered",
                     None,
                     "m1",
@@ -652,6 +739,12 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert recovery["market_stale_recover_count"] == 1.0
     assert recovery["avg_market_stale_duration_ms"] == 900.0
     assert recovery["market_stale_universe_change_enter_count"] == 1.0
+    assert recovery["low_quality_runtime_exclusion_enter_count"] == 1.0
+    assert recovery["low_quality_runtime_exclusion_active_count"] == 2.0
+    assert recovery["low_quality_runtime_exclusion_cleared_count"] == 1.0
+    assert recovery["low_quality_reintroduced_for_floor_count"] == 1.0
+    assert recovery["current_watched_low_quality_excluded_count"] == 1.0
+    assert recovery["watched_floor_shortfall_due_to_low_quality_exclusion"] == 0.0
     assert recovery["chronic_stale_exclusion_enter_count"] == 1.0
     assert recovery["chronic_stale_exclusion_extended_count"] == 1.0
     assert recovery["chronic_stale_exclusion_active_count"] == 1.0
@@ -670,6 +763,17 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     assert not recovery["no_signal_stale_reason_breakdown"].empty
     assert not recovery["market_ready_blocked_stale_reason_breakdown"].empty
     assert not recovery["eligibility_gate_stale_reason_breakdown"].empty
+    assert not recovery["low_quality_reason_breakdown"].empty
+    low_quality_reintroduced_breakdown = recovery["low_quality_reintroduced_reason_breakdown"]
+    assert len(low_quality_reintroduced_breakdown) > 0
+    assert str(low_quality_reintroduced_breakdown[0]["reason"]) == (
+        "watched_floor_backfill_low_quality_relaxed"
+    )
+    watched_low_quality_breakdown = recovery["watched_low_quality_reason_breakdown"]
+    assert len(watched_low_quality_breakdown) > 0
+    assert str(watched_low_quality_breakdown[0]["reason"]) == (
+        "watched_floor_backfill_low_quality_relaxed"
+    )
     assert not recovery["top_stale_legs"].empty
     top_stale_assets = recovery["top_stale_assets"]
     assert not top_stale_assets.empty
@@ -683,6 +787,12 @@ def test_dashboard_loader_recovery_diagnostics_summary(tmp_path: Path) -> None:
     top_reintroduced_chronic = recovery["top_reintroduced_chronic_stale_markets"]
     assert not top_reintroduced_chronic.empty
     assert str(top_reintroduced_chronic.iloc[0]["market_id"]) == "m1"
+    top_reintroduced_low_quality = recovery["top_reintroduced_low_quality_markets"]
+    assert not top_reintroduced_low_quality.empty
+    assert str(top_reintroduced_low_quality.iloc[0]["market_id"]) == "m1"
+    top_watched_low_quality = recovery["top_watched_low_quality_excluded_markets"]
+    assert not top_watched_low_quality.empty
+    assert str(top_watched_low_quality.iloc[0]["market_id"]) == "m1"
     top_long_active_chronic = recovery["top_long_active_chronic_stale_markets"]
     assert not top_long_active_chronic.empty
     assert str(top_long_active_chronic.iloc[0]["market_id"]) == "m1"

@@ -106,7 +106,8 @@ class RuntimeSettings(BaseModel):
     market_stale_exclusion_cooldown_ms: int = 1_800_000
     min_watched_markets_floor: int = 8
     watched_floor_relax_activity_filters: bool = True
-    watched_floor_relax_runtime_exclusion: bool = True
+    watched_floor_relax_low_quality_runtime_exclusion: bool | None = None
+    watched_floor_relax_runtime_exclusion: bool = False
     watched_floor_relax_chronic_stale_exclusion: bool = False
     snapshot_interval_minutes: int = 60
     report_export_interval_minutes: int = 1_440

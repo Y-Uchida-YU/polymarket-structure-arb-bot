@@ -227,6 +227,42 @@ class DailyReportGenerator:
             run_id=run_id,
             metric_name="low_quality_runtime_excluded_count",
         )
+        low_quality_runtime_exclusion_active_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="low_quality_runtime_exclusion_active_count",
+        )
+        low_quality_runtime_exclusion_enter_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="low_quality_runtime_exclusion_enter_count",
+        )
+        low_quality_runtime_exclusion_cleared_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="low_quality_runtime_exclusion_cleared_count",
+        )
+        low_quality_reintroduced_for_floor_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="low_quality_reintroduced_for_floor_count",
+        )
+        current_watched_low_quality_excluded_count = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="current_watched_low_quality_excluded_count",
+        )
+        watched_floor_shortfall_due_to_low_quality_exclusion = self._latest_metric_value(
+            conn,
+            window,
+            run_id=run_id,
+            metric_name="watched_floor_shortfall_due_to_low_quality_exclusion",
+        )
         chronic_stale_excluded_market_count = self._latest_metric_value(
             conn,
             window,
@@ -328,6 +364,12 @@ class DailyReportGenerator:
             no_eligible_markets_causes.append("all_markets_stale")
         if low_quality_runtime_excluded_count >= max(1, watched_market_count_current):
             no_eligible_markets_causes.append("quality_penalty_excessive")
+        if current_watched_low_quality_excluded_count > 0 and eligible_market_count == 0:
+            no_eligible_markets_causes.append("watched_universe_low_quality_contaminated")
+        if low_quality_reintroduced_for_floor_count > 0 and eligible_market_count == 0:
+            no_eligible_markets_causes.append("watched_floor_reintroduced_low_quality")
+        if watched_floor_shortfall_due_to_low_quality_exclusion > 0:
+            no_eligible_markets_causes.append("watched_floor_shortfall_low_quality_exclusion")
         if (
             watched_market_count_current > 0
             and eligibility_gate_reason_map.get("connection_recovering", 0)
@@ -525,6 +567,24 @@ class DailyReportGenerator:
                 "min_watched_markets_floor": min_watched_markets_floor,
                 "low_quality_market_count": low_quality_market_count,
                 "low_quality_runtime_excluded_count": low_quality_runtime_excluded_count,
+                "low_quality_runtime_exclusion_active_count": (
+                    low_quality_runtime_exclusion_active_count
+                ),
+                "low_quality_runtime_exclusion_enter_count": (
+                    low_quality_runtime_exclusion_enter_count
+                ),
+                "low_quality_runtime_exclusion_cleared_count": (
+                    low_quality_runtime_exclusion_cleared_count
+                ),
+                "low_quality_reintroduced_for_floor_count": (
+                    low_quality_reintroduced_for_floor_count
+                ),
+                "current_watched_low_quality_excluded_count": (
+                    current_watched_low_quality_excluded_count
+                ),
+                "watched_floor_shortfall_due_to_low_quality_exclusion": (
+                    watched_floor_shortfall_due_to_low_quality_exclusion
+                ),
                 "chronic_stale_excluded_market_count": chronic_stale_excluded_market_count,
                 "chronic_stale_exclusion_active_count": chronic_stale_exclusion_active_count,
                 "chronic_stale_reintroduced_for_floor_count": (
@@ -678,6 +738,19 @@ class DailyReportGenerator:
                 f"{totals['low_quality_runtime_excluded_count']}"
             ),
             (
+                "low_quality_runtime_exclusion(active/enter/cleared): "
+                f"{totals.get('low_quality_runtime_exclusion_active_count', 0)}/"
+                f"{totals.get('low_quality_runtime_exclusion_enter_count', 0)}/"
+                f"{totals.get('low_quality_runtime_exclusion_cleared_count', 0)}"
+            ),
+            (
+                "low_quality_contamination("
+                "watched_excluded/reintroduced_for_floor/shortfall_due_exclusion): "
+                f"{totals.get('current_watched_low_quality_excluded_count', 0)}/"
+                f"{totals.get('low_quality_reintroduced_for_floor_count', 0)}/"
+                f"{totals.get('watched_floor_shortfall_due_to_low_quality_exclusion', 0)}"
+            ),
+            (
                 "chronic_stale_exclusion(active/enter/cleared): "
                 f"{totals.get('chronic_stale_exclusion_active_count', 0)}/"
                 f"{totals.get('chronic_stale_exclusion_enter_count', 0)}/"
@@ -695,12 +768,12 @@ class DailyReportGenerator:
                 f"{totals.get('watched_chronic_stale_excluded_market_count', 0)}"
             ),
             (
-                "watched_markets(current/cumulative): "
+                "watched_markets(latest_snapshot/cumulative_window): "
                 f"{universe.get('current_watched_markets', 0)} / "
                 f"{universe.get('cumulative_watched_markets', 0)}"
             ),
             (
-                "subscribed_assets(current/cumulative): "
+                "subscribed_assets(latest_snapshot/cumulative_window): "
                 f"{universe.get('current_subscribed_assets', 0)} / "
                 f"{universe.get('cumulative_subscribed_assets', 0)}"
             ),
@@ -821,6 +894,26 @@ class DailyReportGenerator:
                 for item in recovery["no_signal_stale_reason_breakdown"][:5]
             )
             lines.append(f"no_signal_stale_reason_breakdown: {stale_no_signal_summary}")
+        if recovery.get("low_quality_reason_breakdown"):
+            low_quality_reason_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["low_quality_reason_breakdown"][:5]
+            )
+            lines.append(f"low_quality_reason_breakdown: {low_quality_reason_summary}")
+        if recovery.get("low_quality_reintroduced_reason_breakdown"):
+            low_quality_reintroduced_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["low_quality_reintroduced_reason_breakdown"][:5]
+            )
+            lines.append(
+                "low_quality_reintroduced_reason_breakdown: " f"{low_quality_reintroduced_summary}"
+            )
+        if recovery.get("watched_low_quality_reason_breakdown"):
+            watched_low_quality_summary = ", ".join(
+                f"{item['reason']}={item['count']}"
+                for item in recovery["watched_low_quality_reason_breakdown"][:5]
+            )
+            lines.append(f"watched_low_quality_reason_breakdown: {watched_low_quality_summary}")
         if recovery.get("chronic_stale_reason_breakdown"):
             chronic_reason_summary = ", ".join(
                 f"{item['reason']}={item['count']}"
@@ -941,6 +1034,32 @@ class DailyReportGenerator:
                 for item in recovery["top_reintroduced_chronic_stale_markets"][:5]
             )
             lines.append(f"top_reintroduced_chronic_stale_markets: {reintroduced_summary}")
+        if recovery.get("top_reintroduced_low_quality_markets"):
+            reintroduced_low_quality_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')}):"
+                    f"{item.get('reintroduced_reason')}="
+                    f"{int(item.get('reintroduced_count', 0))}"
+                )
+                for item in recovery["top_reintroduced_low_quality_markets"][:5]
+            )
+            lines.append(
+                "top_reintroduced_low_quality_markets: " f"{reintroduced_low_quality_summary}"
+            )
+        if recovery.get("top_watched_low_quality_excluded_markets"):
+            watched_low_quality_markets_summary = ", ".join(
+                (
+                    f"{item.get('market_slug') or item.get('market_id')}"
+                    f"({item.get('market_id')}):"
+                    f"{item.get('reason')}"
+                )
+                for item in recovery["top_watched_low_quality_excluded_markets"][:5]
+            )
+            lines.append(
+                "top_watched_low_quality_excluded_markets: "
+                f"{watched_low_quality_markets_summary}"
+            )
         if recovery.get("top_long_active_chronic_stale_markets"):
             long_active_summary = ", ".join(
                 (
@@ -1674,6 +1793,23 @@ class DailyReportGenerator:
             results.append((market_id, numeric_value))
         return results
 
+    @staticmethod
+    def _parse_market_reason_details(details: str) -> list[tuple[str, str]]:
+        results: list[tuple[str, str]] = []
+        compact = str(details or "").strip()
+        if not compact:
+            return results
+        for token in compact.split(","):
+            if ":" not in token:
+                continue
+            market_id, reason_text = token.split(":", 1)
+            market_id = market_id.strip()
+            reason_text = reason_text.strip()
+            if not market_id:
+                continue
+            results.append((market_id, reason_text))
+        return results
+
     def _market_context_map(
         self,
         conn: sqlite3.Connection,
@@ -1738,6 +1874,43 @@ class DailyReportGenerator:
         rows.sort(key=lambda item: float(item.get(value_key, 0.0)), reverse=True)
         return rows[: max(1, int(limit))]
 
+    def _top_markets_from_latest_metric_reason_details(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        metric_name: str,
+        reason_key: str = "reason",
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        parsed = self._parse_market_reason_details(
+            self._latest_metric_details(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+        if not parsed:
+            return []
+        contexts = self._market_context_map(
+            conn,
+            market_ids=[market_id for market_id, _ in parsed],
+        )
+        rows: list[dict[str, Any]] = []
+        for market_id, reason in parsed:
+            context = contexts.get(market_id, {"market_slug": "", "market_question": ""})
+            rows.append(
+                {
+                    "market_id": market_id,
+                    "market_slug": context["market_slug"],
+                    "market_question": context["market_question"],
+                    reason_key: reason,
+                }
+            )
+        return rows[: max(1, int(limit))]
+
     @staticmethod
     def _extract_kv_from_details(details: str, key: str) -> str | None:
         compact = details.strip()
@@ -1798,6 +1971,15 @@ class DailyReportGenerator:
             "avg_market_stale_duration_ms": 0.0,
             "max_market_stale_duration_ms": 0.0,
             "market_stale_universe_change_enter_count": 0,
+            "low_quality_runtime_exclusion_enter_count": 0,
+            "low_quality_runtime_exclusion_active_count": 0,
+            "low_quality_runtime_exclusion_cleared_count": 0,
+            "low_quality_reintroduced_for_floor_count": 0,
+            "current_watched_low_quality_excluded_count": 0,
+            "watched_floor_shortfall_due_to_low_quality_exclusion": 0,
+            "low_quality_reason_breakdown": [],
+            "low_quality_reintroduced_reason_breakdown": [],
+            "watched_low_quality_reason_breakdown": [],
             "chronic_stale_exclusion_enter_count": 0,
             "chronic_stale_exclusion_active_count": 0,
             "chronic_stale_exclusion_extended_count": 0,
@@ -1817,6 +1999,8 @@ class DailyReportGenerator:
             "top_repeated_stale_markets": [],
             "top_chronic_stale_markets": [],
             "top_reintroduced_chronic_stale_markets": [],
+            "top_reintroduced_low_quality_markets": [],
+            "top_watched_low_quality_excluded_markets": [],
             "top_long_active_chronic_stale_markets": [],
             "top_stale_legs": [],
             "top_stale_assets": [],
@@ -2501,6 +2685,51 @@ class DailyReportGenerator:
             if str(row[0] or "")
         ]
 
+    def _top_reintroduced_low_quality_markets(
+        self,
+        conn: sqlite3.Connection,
+        window: ReportWindow,
+        *,
+        run_id: str | None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason,
+          COUNT(*) AS reintroduced_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_low_quality_reintroduced_for_floor'
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id, d.reason"
+            " ORDER BY reintroduced_count DESC, d.market_id ASC LIMIT ?"
+        )
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "market_id": str(row[0] or ""),
+                "reintroduced_reason": str(row[1] or "watched_floor_backfill_low_quality_relaxed"),
+                "reintroduced_count": int(row[2] if row[2] is not None else 0),
+                "market_slug": str(row[3] or ""),
+                "market_question": str(row[4] or ""),
+            }
+            for row in rows
+            if str(row[0] or "")
+        ]
+
     def _top_repeated_missing_book_markets(
         self,
         conn: sqlite3.Connection,
@@ -2817,6 +3046,60 @@ class DailyReportGenerator:
                     details_like="%universe_change_related=1%",
                 )
             )
+            low_quality_runtime_exclusion_enter_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_low_quality_runtime_exclusion_entered",
+            )
+            low_quality_runtime_exclusion_cleared_count = self._count_diagnostics_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_low_quality_runtime_exclusion_cleared",
+            )
+            low_quality_runtime_exclusion_active_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="low_quality_runtime_exclusion_active_count",
+            )
+            low_quality_reintroduced_for_floor_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="low_quality_reintroduced_for_floor_count",
+            )
+            current_watched_low_quality_excluded_count = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="current_watched_low_quality_excluded_count",
+            )
+            watched_floor_shortfall_due_to_low_quality_exclusion = self._latest_metric_value(
+                conn,
+                window,
+                run_id=run_id,
+                metric_name="watched_floor_shortfall_due_to_low_quality_exclusion",
+            )
+            low_quality_reason_breakdown = self._diagnostics_reasons_for_event(
+                conn,
+                window,
+                run_id=run_id,
+                event_name="market_low_quality_runtime_exclusion_entered",
+            )
+            low_quality_reintroduced_reason_breakdown = self._latest_metric_prefix_breakdown(
+                conn,
+                window,
+                run_id=run_id,
+                metric_prefix="low_quality_reintroduced_reason:",
+            )
+            watched_low_quality_reason_breakdown = self._latest_metric_prefix_breakdown(
+                conn,
+                window,
+                run_id=run_id,
+                metric_prefix="watched_low_quality_reason:",
+            )
             chronic_stale_exclusion_enter_count = self._count_diagnostics_event(
                 conn,
                 window,
@@ -3035,6 +3318,29 @@ class DailyReportGenerator:
                 "market_stale_universe_change_enter_count": (
                     market_stale_universe_change_enter_count
                 ),
+                "low_quality_runtime_exclusion_enter_count": (
+                    low_quality_runtime_exclusion_enter_count
+                ),
+                "low_quality_runtime_exclusion_active_count": (
+                    low_quality_runtime_exclusion_active_count
+                ),
+                "low_quality_runtime_exclusion_cleared_count": (
+                    low_quality_runtime_exclusion_cleared_count
+                ),
+                "low_quality_reintroduced_for_floor_count": (
+                    low_quality_reintroduced_for_floor_count
+                ),
+                "current_watched_low_quality_excluded_count": (
+                    current_watched_low_quality_excluded_count
+                ),
+                "watched_floor_shortfall_due_to_low_quality_exclusion": (
+                    watched_floor_shortfall_due_to_low_quality_exclusion
+                ),
+                "low_quality_reason_breakdown": low_quality_reason_breakdown,
+                "low_quality_reintroduced_reason_breakdown": (
+                    low_quality_reintroduced_reason_breakdown
+                ),
+                "watched_low_quality_reason_breakdown": watched_low_quality_reason_breakdown,
                 "chronic_stale_exclusion_enter_count": chronic_stale_exclusion_enter_count,
                 "chronic_stale_exclusion_extended_count": chronic_stale_exclusion_extended_count,
                 "chronic_stale_exclusion_active_count": chronic_stale_exclusion_active_count,
@@ -3124,6 +3430,21 @@ class DailyReportGenerator:
                         conn,
                         window,
                         run_id=run_id,
+                    )
+                ),
+                "top_reintroduced_low_quality_markets": (
+                    self._top_reintroduced_low_quality_markets(
+                        conn,
+                        window,
+                        run_id=run_id,
+                    )
+                ),
+                "top_watched_low_quality_excluded_markets": (
+                    self._top_markets_from_latest_metric_reason_details(
+                        conn,
+                        window,
+                        run_id=run_id,
+                        metric_name="current_watched_low_quality_excluded_count",
                     )
                 ),
                 "top_long_active_chronic_stale_markets": (

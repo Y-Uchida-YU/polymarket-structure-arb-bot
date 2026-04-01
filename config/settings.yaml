@@ -1,4 +1,4 @@
-api:
+﻿api:
   gamma_base_url: "https://gamma-api.polymarket.com"
   gamma_markets_endpoint: "/markets"
   clob_base_url: "https://clob.polymarket.com"
@@ -82,7 +82,8 @@ runtime:
   low_quality_market_exclusion_candidate_penalty_ratio: 1.5
   min_watched_markets_floor: 8
   watched_floor_relax_activity_filters: true
-  watched_floor_relax_runtime_exclusion: true
+  watched_floor_relax_low_quality_runtime_exclusion: false
+  watched_floor_relax_runtime_exclusion: false
   snapshot_interval_minutes: 60
   report_export_interval_minutes: 1440
   environment_name: "win11-local"

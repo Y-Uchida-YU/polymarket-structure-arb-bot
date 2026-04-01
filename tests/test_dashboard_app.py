@@ -93,6 +93,29 @@ def test_no_eligible_causes_includes_chronic_universe_contamination() -> None:
     assert "watched_floor_reintroduced_chronic_stale" in causes
 
 
+def test_no_eligible_causes_includes_low_quality_contamination_signals() -> None:
+    causes = _no_eligible_causes(
+        {
+            "watched_markets_current": 2.0,
+            "min_watched_markets_floor": 2.0,
+            "ready_market_count": 1.0,
+            "recovering_market_count": 0.0,
+            "stale_market_count": 0.0,
+            "eligible_market_count": 0.0,
+            "market_not_ready_count": 0.0,
+            "low_quality_runtime_excluded_count": 0.0,
+            "current_watched_low_quality_excluded_count": 1.0,
+            "low_quality_reintroduced_for_floor_count": 1.0,
+            "watched_floor_shortfall_due_to_low_quality_exclusion": 1.0,
+            "chronic_stale_excluded_market_count": 0.0,
+            "watched_chronic_stale_excluded_market_count": 0.0,
+        }
+    )
+    assert "watched_universe_low_quality_contaminated" in causes
+    assert "watched_floor_reintroduced_low_quality" in causes
+    assert "watched_floor_shortfall_low_quality_exclusion" in causes
+
+
 def test_as_frame_returns_empty_frame_when_value_is_missing() -> None:
     frame = _as_frame(None, columns=["asset_id", "count"])
     assert isinstance(frame, pd.DataFrame)

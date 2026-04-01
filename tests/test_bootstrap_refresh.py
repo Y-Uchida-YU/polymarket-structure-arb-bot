@@ -1725,6 +1725,7 @@ def test_runtime_low_quality_market_is_excluded_on_refresh(tmp_path: Path) -> No
             "low_quality_market_min_observations": 1,
             "low_quality_market_exclusion_consecutive_cycles": 1,
             "min_watched_markets_floor": 0,
+            "watched_floor_relax_low_quality_runtime_exclusion": False,
             "watched_floor_relax_runtime_exclusion": False,
         },
         market_filters={
@@ -1835,6 +1836,7 @@ def test_runtime_low_quality_market_not_excluded_on_temporary_deterioration(tmp_
             "low_quality_market_min_observations": 1,
             "low_quality_market_exclusion_consecutive_cycles": 3,
             "min_watched_markets_floor": 0,
+            "watched_floor_relax_low_quality_runtime_exclusion": False,
             "watched_floor_relax_runtime_exclusion": False,
         },
         market_filters={
@@ -2127,6 +2129,7 @@ def test_chronic_stale_excluded_market_not_backfilled_by_default_policy(
             "market_refresh_minutes": 1,
             "market_universe_change_confirmations": 1,
             "min_watched_markets_floor": 2,
+            "watched_floor_relax_low_quality_runtime_exclusion": False,
             "watched_floor_relax_runtime_exclusion": True,
             "watched_floor_relax_chronic_stale_exclusion": False,
         },
@@ -2183,6 +2186,7 @@ def test_chronic_stale_excluded_market_backfilled_when_policy_enabled(
             "market_refresh_minutes": 1,
             "market_universe_change_confirmations": 1,
             "min_watched_markets_floor": 2,
+            "watched_floor_relax_low_quality_runtime_exclusion": False,
             "watched_floor_relax_runtime_exclusion": True,
             "watched_floor_relax_chronic_stale_exclusion": True,
         },
@@ -2313,8 +2317,91 @@ def test_chronic_stale_exclusion_extension_is_tracked_separately_from_enter(
     asyncio.run(app.shutdown())
 
 
-def test_watched_market_floor_prevents_extreme_universe_shrink(tmp_path: Path) -> None:
-    logger = logging.getLogger("test_watched_floor")
+def test_chronic_stale_exclusion_reentry_after_expiry_is_counted_as_enter_not_extend(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_chronic_stale_reentry_after_expiry")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_stale_exclusion_window_minutes": 60,
+            "market_stale_exclusion_min_enter_count": 1,
+            "market_stale_exclusion_max_single_duration_ms": 999_999,
+            "market_stale_exclusion_cooldown_ms": 60_000,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(responses=[[make_raw_market("m1", "yes1", "no1")]])
+    asyncio.run(app.load_markets())
+
+    now = datetime.now(tz=UTC)
+    app.state.market_chronic_stale_excluded_until["m1"] = now - timedelta(seconds=1)
+    app.state.market_chronic_stale_exclusion_started_at["m1"] = now - timedelta(minutes=3)
+    app.state.market_chronic_stale_reason_by_market["m1"] = "repeated_stale_enters"
+    app.state.market_chronic_stale_details_by_market["m1"] = {
+        "market_id": "m1",
+        "market_slug": "event-m1",
+    }
+    with app.sqlite_store.conn:
+        app.sqlite_store.conn.execute(
+            """
+            INSERT INTO diagnostics_events
+            (run_id, event_name, asset_id, market_id, reason, latency_ms, details, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                app.state.run_id,
+                "market_stale_entered",
+                None,
+                "m1",
+                "quote_age_exceeded",
+                None,
+                "",
+                now.isoformat(),
+            ),
+        )
+
+    summary = app._refresh_chronic_stale_runtime_exclusions(now_utc=now + timedelta(milliseconds=1))
+
+    assert "m1" in summary.active_market_ids
+    assert "m1" in summary.entered_market_ids
+    assert "m1" not in summary.extended_market_ids
+    assert "m1" not in summary.cleared_market_ids
+    assert app.state.market_chronic_stale_enter_count_last_cycle == 1
+    assert app.state.market_chronic_stale_cleared_count_last_cycle == 0
+
+    entered_count_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(1)
+        FROM diagnostics_events
+        WHERE event_name = 'market_chronic_stale_exclusion_entered'
+          AND market_id = 'm1'
+        """).fetchone()
+    assert entered_count_row is not None
+    assert int(entered_count_row[0]) == 1
+
+    extended_count_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(1)
+        FROM diagnostics_events
+        WHERE event_name = 'market_chronic_stale_exclusion_extended'
+          AND market_id = 'm1'
+        """).fetchone()
+    assert extended_count_row is not None
+    assert int(extended_count_row[0]) == 0
+
+    asyncio.run(app.shutdown())
+
+
+def test_low_quality_excluded_markets_do_not_backfill_watched_floor_by_default(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_low_quality_floor_default")
     logger.handlers.clear()
     logger.addHandler(logging.NullHandler())
     logger.propagate = False
@@ -2328,6 +2415,91 @@ def test_watched_market_floor_prevents_extreme_universe_shrink(tmp_path: Path) -
             "low_quality_market_min_observations": 1,
             "low_quality_market_exclusion_consecutive_cycles": 1,
             "min_watched_markets_floor": 2,
+            "watched_floor_relax_low_quality_runtime_exclusion": False,
+            "watched_floor_relax_runtime_exclusion": True,
+        },
+        market_filters={
+            "max_markets_to_watch": 3,
+            "min_recent_activity": 0.0,
+            "min_liquidity_proxy": 0.0,
+            "min_volume_24h_proxy": 0.0,
+            "min_days_to_expiry": 0.0,
+            "max_days_to_expiry": 3650.0,
+        },
+    )
+    config = AppConfig(root_dir=tmp_path, settings=settings, markets=MarketsConfig())
+    app = PolymarketStructureArbApp(config=config, logger=logger)
+    app.tick_size_client = FakeTickSizeClient()
+    app.gamma_client = FakeGammaClient(
+        responses=[
+            [
+                make_raw_market("m1", "yes1", "no1"),
+                make_raw_market("m2", "yes2", "no2"),
+                make_raw_market("m3", "yes3", "no3"),
+            ],
+            [
+                make_raw_market("m1", "yes1", "no1"),
+                make_raw_market("m2", "yes2", "no2"),
+                make_raw_market("m3", "yes3", "no3"),
+                make_raw_market("m4", "yes4", "no4"),
+            ],
+        ]
+    )
+
+    asyncio.run(app.load_markets())
+    for market_id in ("m1", "m2", "m3", "m4"):
+        app.state.market_quality_penalty_by_market[market_id] = 8
+        app.state.market_low_quality_consecutive_cycles[market_id] = 2
+        app.state.market_refresh_observed_count[market_id] = 3
+
+    asyncio.run(app.refresh_market_universe())
+
+    assert app.state.watched_markets < 2
+    assert len(app.markets_by_id) < 2
+    assert app.state.last_refresh_low_quality_reintroduced_market_ids == set()
+    assert app.state.last_refresh_watched_low_quality_excluded_market_ids == set()
+    assert "m1" in app.state.last_refresh_runtime_excluded_market_ids
+    assert "m2" in app.state.last_refresh_runtime_excluded_market_ids
+
+    now = datetime.now(tz=UTC)
+    app._record_low_quality_runtime_exclusion_metrics(now_utc=now)
+
+    metric_rows = app.sqlite_store.conn.execute("""
+        SELECT metric_name, metric_value
+        FROM metrics
+        WHERE metric_name IN (
+            'current_watched_low_quality_excluded_count',
+            'low_quality_reintroduced_for_floor_count',
+            'watched_floor_shortfall_due_to_low_quality_exclusion'
+        )
+        ORDER BY id DESC
+        """).fetchall()
+    metric_map = {str(name): float(value) for name, value in metric_rows}
+    assert metric_map["current_watched_low_quality_excluded_count"] == 0.0
+    assert metric_map["low_quality_reintroduced_for_floor_count"] == 0.0
+    assert metric_map["watched_floor_shortfall_due_to_low_quality_exclusion"] >= 1.0
+
+    asyncio.run(app.shutdown())
+
+
+def test_low_quality_relaxation_can_prevent_extreme_universe_shrink_when_enabled(
+    tmp_path: Path,
+) -> None:
+    logger = logging.getLogger("test_low_quality_floor_relaxed")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+
+    settings = Settings(
+        storage={"sqlite_path": "state.db", "export_dir": "exports", "log_dir": "logs"},
+        runtime={
+            "market_refresh_minutes": 1,
+            "market_universe_change_confirmations": 1,
+            "low_quality_market_penalty_threshold": 3,
+            "low_quality_market_min_observations": 1,
+            "low_quality_market_exclusion_consecutive_cycles": 1,
+            "min_watched_markets_floor": 2,
+            "watched_floor_relax_low_quality_runtime_exclusion": True,
             "watched_floor_relax_runtime_exclusion": True,
         },
         market_filters={
@@ -2368,6 +2540,43 @@ def test_watched_market_floor_prevents_extreme_universe_shrink(tmp_path: Path) -
 
     assert app.state.watched_markets >= 2
     assert len(app.markets_by_id) >= 2
+    assert len(app.state.last_refresh_low_quality_reintroduced_market_ids) > 0
+    assert (
+        app.state.last_refresh_watched_low_quality_excluded_market_ids
+        == app.state.last_refresh_low_quality_reintroduced_market_ids
+    )
+
+    now = datetime.now(tz=UTC)
+    app._record_low_quality_runtime_exclusion_metrics(now_utc=now)
+
+    row = app.sqlite_store.conn.execute("""
+        SELECT metric_value, details
+        FROM metrics
+        WHERE metric_name = 'current_watched_low_quality_excluded_count'
+        ORDER BY id DESC
+        LIMIT 1
+        """).fetchone()
+    assert row is not None
+    assert float(row[0]) >= 1.0
+    assert "watched_floor_backfill_low_quality_relaxed" in str(row[1])
+
+    reintroduced_event_count_row = app.sqlite_store.conn.execute("""
+        SELECT COUNT(1)
+        FROM diagnostics_events
+        WHERE event_name = 'market_low_quality_reintroduced_for_floor'
+        """).fetchone()
+    assert reintroduced_event_count_row is not None
+    assert int(reintroduced_event_count_row[0]) >= 1
+
+    shortfall_row = app.sqlite_store.conn.execute("""
+        SELECT metric_value
+        FROM metrics
+        WHERE metric_name = 'watched_floor_shortfall_due_to_low_quality_exclusion'
+        ORDER BY id DESC
+        LIMIT 1
+        """).fetchone()
+    assert shortfall_row is not None
+    assert float(shortfall_row[0]) == 0.0
 
     asyncio.run(app.shutdown())
 

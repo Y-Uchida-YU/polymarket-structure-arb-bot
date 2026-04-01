@@ -278,6 +278,42 @@ class DashboardDataLoader:
                 run_id=run_id,
                 metric_name="low_quality_runtime_excluded_count",
             )
+            low_quality_runtime_exclusion_active_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="low_quality_runtime_exclusion_active_count",
+            )
+            low_quality_runtime_exclusion_enter_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="low_quality_runtime_exclusion_enter_count",
+            )
+            low_quality_runtime_exclusion_cleared_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="low_quality_runtime_exclusion_cleared_count",
+            )
+            low_quality_reintroduced_for_floor_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="low_quality_reintroduced_for_floor_count",
+            )
+            current_watched_low_quality_excluded_count = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="current_watched_low_quality_excluded_count",
+            )
+            watched_floor_shortfall_due_to_low_quality_exclusion = self._latest_metric_value(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name="watched_floor_shortfall_due_to_low_quality_exclusion",
+            )
             chronic_stale_excluded_market_count = self._latest_metric_value(
                 conn=conn,
                 window=window,
@@ -424,6 +460,27 @@ class DashboardDataLoader:
             "min_watched_markets_floor": float(min_watched_markets_floor),
             "low_quality_market_count": float(low_quality_market_count),
             "low_quality_runtime_excluded_count": float(low_quality_runtime_excluded_count),
+            "low_quality_runtime_exclusion_active_count": float(
+                low_quality_runtime_exclusion_active_count
+            ),
+            "low_quality_runtime_exclusion_enter_count": float(
+                low_quality_runtime_exclusion_enter_count
+            ),
+            "low_quality_runtime_exclusion_cleared_count": float(
+                low_quality_runtime_exclusion_cleared_count
+            ),
+            "low_quality_reintroduced_for_floor_count": float(
+                low_quality_reintroduced_for_floor_count
+            ),
+            "current_watched_low_quality_excluded_count": float(
+                current_watched_low_quality_excluded_count
+            ),
+            "current_watched_low_quality_excluded_markets": float(
+                current_watched_low_quality_excluded_count
+            ),
+            "watched_floor_shortfall_due_to_low_quality_exclusion": float(
+                watched_floor_shortfall_due_to_low_quality_exclusion
+            ),
             "chronic_stale_excluded_market_count": float(chronic_stale_excluded_market_count),
             "chronic_stale_exclusion_active_count": float(chronic_stale_exclusion_active_count),
             "chronic_stale_reintroduced_for_floor_count": float(
@@ -1111,6 +1168,60 @@ class DashboardDataLoader:
                         details_like="%universe_change_related=1%",
                     )
                 )
+                low_quality_runtime_exclusion_enter_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_low_quality_runtime_exclusion_entered",
+                )
+                low_quality_runtime_exclusion_cleared_count = self._count_diagnostics_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_low_quality_runtime_exclusion_cleared",
+                )
+                low_quality_reintroduced_for_floor_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="low_quality_reintroduced_for_floor_count",
+                )
+                low_quality_runtime_exclusion_active_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="low_quality_runtime_exclusion_active_count",
+                )
+                current_watched_low_quality_excluded_count = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="current_watched_low_quality_excluded_count",
+                )
+                watched_floor_shortfall_due_to_low_quality_exclusion = self._latest_metric_value(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_name="watched_floor_shortfall_due_to_low_quality_exclusion",
+                )
+                low_quality_reason_breakdown = self._diagnostics_reasons_for_event(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    event_name="market_low_quality_runtime_exclusion_entered",
+                )
+                low_quality_reintroduced_reason_breakdown = self._latest_metric_prefix_breakdown(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_prefix="low_quality_reintroduced_reason:",
+                )
+                watched_low_quality_reason_breakdown = self._latest_metric_prefix_breakdown(
+                    conn=conn,
+                    window=window,
+                    run_id=run_id,
+                    metric_prefix="watched_low_quality_reason:",
+                )
                 chronic_stale_exclusion_enter_count = self._count_diagnostics_event(
                     conn=conn,
                     window=window,
@@ -1333,6 +1444,29 @@ class DashboardDataLoader:
                     "market_stale_universe_change_enter_count": float(
                         market_stale_universe_change_enter_count
                     ),
+                    "low_quality_runtime_exclusion_enter_count": float(
+                        low_quality_runtime_exclusion_enter_count
+                    ),
+                    "low_quality_runtime_exclusion_active_count": float(
+                        low_quality_runtime_exclusion_active_count
+                    ),
+                    "low_quality_runtime_exclusion_cleared_count": float(
+                        low_quality_runtime_exclusion_cleared_count
+                    ),
+                    "low_quality_reintroduced_for_floor_count": float(
+                        low_quality_reintroduced_for_floor_count
+                    ),
+                    "current_watched_low_quality_excluded_count": float(
+                        current_watched_low_quality_excluded_count
+                    ),
+                    "watched_floor_shortfall_due_to_low_quality_exclusion": float(
+                        watched_floor_shortfall_due_to_low_quality_exclusion
+                    ),
+                    "low_quality_reason_breakdown": low_quality_reason_breakdown,
+                    "low_quality_reintroduced_reason_breakdown": (
+                        low_quality_reintroduced_reason_breakdown
+                    ),
+                    "watched_low_quality_reason_breakdown": (watched_low_quality_reason_breakdown),
                     "chronic_stale_exclusion_enter_count": float(
                         chronic_stale_exclusion_enter_count
                     ),
@@ -1438,6 +1572,21 @@ class DashboardDataLoader:
                             conn=conn,
                             window=window,
                             run_id=run_id,
+                        )
+                    ),
+                    "top_reintroduced_low_quality_markets": (
+                        self._top_reintroduced_low_quality_markets(
+                            conn=conn,
+                            window=window,
+                            run_id=run_id,
+                        )
+                    ),
+                    "top_watched_low_quality_excluded_markets": (
+                        self._top_markets_from_latest_metric_reason_details(
+                            conn=conn,
+                            window=window,
+                            run_id=run_id,
+                            metric_name="current_watched_low_quality_excluded_count",
                         )
                     ),
                     "top_long_active_chronic_stale_markets": (
@@ -2018,6 +2167,38 @@ class DashboardDataLoader:
           ON m.market_id = d.market_id
         WHERE d.created_at >= ? AND d.created_at < ?
           AND d.event_name = 'market_chronic_stale_reintroduced_for_floor'
+          AND d.market_id IS NOT NULL
+          AND d.market_id != ''
+        """
+        params: list[object] = [window.start_iso, window.end_iso]
+        if run_id is not None:
+            query += " AND d.run_id = ?"
+            params.append(run_id)
+        query += (
+            " GROUP BY d.market_id, d.reason"
+            " ORDER BY reintroduced_count DESC, d.market_id ASC LIMIT 5"
+        )
+        return pd.read_sql_query(query, conn, params=params)
+
+    def _top_reintroduced_low_quality_markets(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+    ) -> pd.DataFrame:
+        query = """
+        SELECT
+          d.market_id,
+          d.reason AS reintroduced_reason,
+          COUNT(*) AS reintroduced_count,
+          MAX(COALESCE(m.slug, '')) AS market_slug,
+          MAX(COALESCE(m.question, '')) AS market_question
+        FROM diagnostics_events d
+        LEFT JOIN markets m
+          ON m.market_id = d.market_id
+        WHERE d.created_at >= ? AND d.created_at < ?
+          AND d.event_name = 'market_low_quality_reintroduced_for_floor'
           AND d.market_id IS NOT NULL
           AND d.market_id != ''
         """
@@ -2672,6 +2853,23 @@ class DashboardDataLoader:
             results.append((market_id, numeric_value))
         return results
 
+    @staticmethod
+    def _parse_market_reason_details(details: str) -> list[tuple[str, str]]:
+        results: list[tuple[str, str]] = []
+        compact = str(details or "").strip()
+        if not compact:
+            return results
+        for token in compact.split(","):
+            if ":" not in token:
+                continue
+            market_id, reason_text = token.split(":", 1)
+            market_id = market_id.strip()
+            reason_text = reason_text.strip()
+            if not market_id:
+                continue
+            results.append((market_id, reason_text))
+        return results
+
     def _market_context_map(
         self,
         *,
@@ -2738,6 +2936,46 @@ class DashboardDataLoader:
             return frame
         frame = frame.sort_values(value_key, ascending=False).head(max(1, int(limit)))
         return frame.reset_index(drop=True)
+
+    def _top_markets_from_latest_metric_reason_details(
+        self,
+        *,
+        conn: sqlite3.Connection,
+        window: DashboardWindow,
+        run_id: str | None,
+        metric_name: str,
+        reason_key: str = "reason",
+        limit: int = 10,
+    ) -> pd.DataFrame:
+        parsed = self._parse_market_reason_details(
+            self._latest_metric_details(
+                conn=conn,
+                window=window,
+                run_id=run_id,
+                metric_name=metric_name,
+            )
+        )
+        if not parsed:
+            return pd.DataFrame(columns=["market_id", "market_slug", "market_question", reason_key])
+        contexts = self._market_context_map(
+            conn=conn,
+            market_ids=[market_id for market_id, _ in parsed],
+        )
+        rows = []
+        for market_id, reason in parsed:
+            context = contexts.get(market_id, {"market_slug": "", "market_question": ""})
+            rows.append(
+                {
+                    "market_id": market_id,
+                    "market_slug": context["market_slug"],
+                    "market_question": context["market_question"],
+                    reason_key: reason,
+                }
+            )
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+        return frame.head(max(1, int(limit))).reset_index(drop=True)
 
     @staticmethod
     def _extract_kv(details: str, key: str) -> str | None:
@@ -2858,6 +3096,16 @@ class DashboardDataLoader:
             "avg_market_stale_duration_ms": 0.0,
             "max_market_stale_duration_ms": 0.0,
             "market_stale_universe_change_enter_count": 0.0,
+            "low_quality_runtime_exclusion_enter_count": 0.0,
+            "low_quality_runtime_exclusion_active_count": 0.0,
+            "low_quality_runtime_exclusion_cleared_count": 0.0,
+            "low_quality_reintroduced_for_floor_count": 0.0,
+            "current_watched_low_quality_excluded_count": 0.0,
+            "current_watched_low_quality_excluded_markets": 0.0,
+            "watched_floor_shortfall_due_to_low_quality_exclusion": 0.0,
+            "low_quality_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "low_quality_reintroduced_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
+            "watched_low_quality_reason_breakdown": pd.DataFrame(columns=["reason", "count"]),
             "chronic_stale_exclusion_enter_count": 0.0,
             "chronic_stale_exclusion_extended_count": 0.0,
             "chronic_stale_exclusion_active_count": 0.0,
@@ -2974,6 +3222,23 @@ class DashboardDataLoader:
                     "market_question",
                 ]
             ),
+            "top_reintroduced_low_quality_markets": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "reintroduced_reason",
+                    "reintroduced_count",
+                    "market_slug",
+                    "market_question",
+                ]
+            ),
+            "top_watched_low_quality_excluded_markets": pd.DataFrame(
+                columns=[
+                    "market_id",
+                    "market_slug",
+                    "market_question",
+                    "reason",
+                ]
+            ),
             "top_long_active_chronic_stale_markets": pd.DataFrame(
                 columns=[
                     "market_id",
@@ -3047,6 +3312,12 @@ class DashboardDataLoader:
             "min_watched_markets_floor": 0.0,
             "low_quality_market_count": 0.0,
             "low_quality_runtime_excluded_count": 0.0,
+            "low_quality_runtime_exclusion_active_count": 0.0,
+            "low_quality_runtime_exclusion_enter_count": 0.0,
+            "low_quality_runtime_exclusion_cleared_count": 0.0,
+            "low_quality_reintroduced_for_floor_count": 0.0,
+            "current_watched_low_quality_excluded_count": 0.0,
+            "watched_floor_shortfall_due_to_low_quality_exclusion": 0.0,
             "chronic_stale_excluded_market_count": 0.0,
             "chronic_stale_exclusion_active_count": 0.0,
             "chronic_stale_reintroduced_for_floor_count": 0.0,

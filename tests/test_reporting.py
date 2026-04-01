@@ -296,8 +296,8 @@ def test_daily_report_v7_breakdowns_and_warnings(tmp_path: Path) -> None:
     assert "data_not_ready_for_evaluation" in report["warnings"]
 
     console = DailyReportGenerator.format_console(report)
-    assert "watched_markets(current/cumulative): 40 / 120" in console
-    assert "subscribed_assets(current/cumulative): 80 / 240" in console
+    assert "watched_markets(latest_snapshot/cumulative_window): 40 / 120" in console
+    assert "subscribed_assets(latest_snapshot/cumulative_window): 80 / 240" in console
 
 
 def test_daily_report_counts_readiness_no_signal_breakdown(tmp_path: Path) -> None:
@@ -472,6 +472,36 @@ def test_daily_report_explains_no_eligible_markets_causes(tmp_path: Path) -> Non
     assert "watched_too_small" in causes
     assert "all_markets_recovering" in causes
     assert "quality_penalty_excessive" in causes
+
+
+def test_daily_report_includes_low_quality_contamination_causes(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = SQLiteStore(db_path=db_path)
+    now = datetime.now(tz=UTC).isoformat()
+    with store.conn:
+        store.conn.executemany(
+            """
+            INSERT INTO metrics (run_id, metric_name, metric_value, details, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("run-1", "universe_current_watched_markets", 2.0, "", now),
+                ("run-1", "universe_min_watched_markets_floor", 2.0, "", now),
+                ("run-1", "market_state_eligible_count", 0.0, "", now),
+                ("run-1", "current_watched_low_quality_excluded_count", 1.0, "m1:reason", now),
+                ("run-1", "low_quality_reintroduced_for_floor_count", 1.0, "m1:reason", now),
+                ("run-1", "watched_floor_shortfall_due_to_low_quality_exclusion", 1.0, "", now),
+            ],
+        )
+    store.close()
+
+    generator = DailyReportGenerator(db_path=db_path, export_dir=tmp_path)
+    report = generator.generate(date=None, last_hours=24, run_id="run-1")
+
+    causes = set(report["no_eligible_market_causes"])
+    assert "watched_universe_low_quality_contaminated" in causes
+    assert "watched_floor_reintroduced_low_quality" in causes
+    assert "watched_floor_shortfall_low_quality_exclusion" in causes
 
 
 def test_daily_report_includes_recovery_diagnostics_section(tmp_path: Path) -> None:
@@ -1127,6 +1157,62 @@ def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path
             VALUES (?, ?, ?, ?, ?)
             """,
             [
+                (
+                    "run-1",
+                    "low_quality_runtime_exclusion_active_count",
+                    1.0,
+                    "m1:stage=excluded",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "low_quality_runtime_exclusion_enter_count",
+                    1.0,
+                    "m1:stage=excluded",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "low_quality_runtime_exclusion_cleared_count",
+                    1.0,
+                    "m1:stage=excluded",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "low_quality_reintroduced_for_floor_count",
+                    1.0,
+                    "m1:watched_floor_backfill_low_quality_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "current_watched_low_quality_excluded_count",
+                    1.0,
+                    "m1:watched_floor_backfill_low_quality_relaxed",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "watched_floor_shortfall_due_to_low_quality_exclusion",
+                    0.0,
+                    "floor=2;watched=2;shortfall=0;excluded_not_watched=0;low_quality_relax_enabled=1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "low_quality_reintroduced_reason:watched_floor_backfill_low_quality_relaxed",
+                    1.0,
+                    "reintroduced_markets=1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "watched_low_quality_reason:watched_floor_backfill_low_quality_relaxed",
+                    1.0,
+                    "watched_low_quality_markets=1",
+                    now,
+                ),
                 ("run-1", "chronic_stale_excluded_market_count", 1.0, "m1", now),
                 ("run-1", "chronic_stale_exclusion_active_count", 1.0, "m1", now),
                 (
@@ -1174,6 +1260,36 @@ def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
+                (
+                    "run-1",
+                    "market_low_quality_runtime_exclusion_entered",
+                    None,
+                    "m1",
+                    "low_quality_runtime",
+                    None,
+                    "runtime_exclusion_reason=stage=excluded;market_slug=chronic-market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_low_quality_runtime_exclusion_cleared",
+                    None,
+                    "m1",
+                    "low_quality_runtime",
+                    None,
+                    "cleared_reason=quality_recovered_or_universe_requalified;market_slug=chronic-market-1",
+                    now,
+                ),
+                (
+                    "run-1",
+                    "market_low_quality_reintroduced_for_floor",
+                    None,
+                    "m1",
+                    "watched_floor_backfill_low_quality_relaxed",
+                    None,
+                    "market_slug=chronic-market-1",
+                    now,
+                ),
                 (
                     "run-1",
                     "market_chronic_stale_exclusion_entered",
@@ -1257,15 +1373,32 @@ def test_daily_report_includes_chronic_stale_and_missing_book_drilldown(tmp_path
 
     assert report["totals"]["chronic_stale_excluded_market_count"] == 1
     assert report["totals"]["chronic_stale_exclusion_active_count"] == 1
+    assert report["totals"]["low_quality_runtime_exclusion_active_count"] == 1
+    assert report["totals"]["low_quality_runtime_exclusion_enter_count"] == 1
+    assert report["totals"]["low_quality_runtime_exclusion_cleared_count"] == 1
+    assert report["totals"]["low_quality_reintroduced_for_floor_count"] == 1
+    assert report["totals"]["current_watched_low_quality_excluded_count"] == 1
+    assert report["totals"]["watched_floor_shortfall_due_to_low_quality_exclusion"] == 0
     assert report["totals"]["chronic_stale_exclusion_enter_count"] == 1
     assert report["totals"]["chronic_stale_exclusion_extended_count"] == 1
     assert report["totals"]["chronic_stale_exclusion_cleared_count"] == 1
     assert report["totals"]["chronic_stale_reintroduced_for_floor_count"] == 1
     assert report["totals"]["watched_chronic_stale_excluded_market_count"] == 1
+    assert recovery["low_quality_reason_breakdown"][0]["reason"] == "low_quality_runtime"
+    assert (
+        recovery["low_quality_reintroduced_reason_breakdown"][0]["reason"]
+        == "watched_floor_backfill_low_quality_relaxed"
+    )
+    assert (
+        recovery["watched_low_quality_reason_breakdown"][0]["reason"]
+        == "watched_floor_backfill_low_quality_relaxed"
+    )
     assert recovery["chronic_stale_reason_breakdown"][0]["reason"] == "repeated_stale_enters"
     assert (
         recovery["chronic_stale_extension_reason_breakdown"][0]["reason"] == "repeated_stale_enters"
     )
+    assert recovery["top_reintroduced_low_quality_markets"][0]["market_id"] == "m1"
+    assert recovery["top_watched_low_quality_excluded_markets"][0]["market_id"] == "m1"
     assert recovery["top_chronic_stale_markets"][0]["market_slug"] == "chronic-market-1"
     assert recovery["top_reintroduced_chronic_stale_markets"][0]["market_id"] == "m1"
     assert recovery["top_long_active_chronic_stale_markets"][0]["market_id"] == "m1"

@@ -104,6 +104,13 @@ DIAG_EVENT_MARKET_CHRONIC_STALE_EXCLUSION_CLEARED = "market_chronic_stale_exclus
 DIAG_EVENT_MARKET_CHRONIC_STALE_REINTRODUCED_FOR_FLOOR = (
     "market_chronic_stale_reintroduced_for_floor"
 )
+DIAG_EVENT_MARKET_LOW_QUALITY_RUNTIME_EXCLUSION_ENTERED = (
+    "market_low_quality_runtime_exclusion_entered"
+)
+DIAG_EVENT_MARKET_LOW_QUALITY_RUNTIME_EXCLUSION_CLEARED = (
+    "market_low_quality_runtime_exclusion_cleared"
+)
+DIAG_EVENT_MARKET_LOW_QUALITY_REINTRODUCED_FOR_FLOOR = "market_low_quality_reintroduced_for_floor"
 
 CHRONIC_STALE_REASON_REPEATED_STALE_ENTERS = "repeated_stale_enters"
 CHRONIC_STALE_REASON_LONG_SINGLE_STALE_DURATION = "long_single_stale_duration"
@@ -196,6 +203,14 @@ class AppState:
     last_refresh_runtime_excluded_reason_by_market: dict[str, str] = field(default_factory=dict)
     last_refresh_runtime_excluded_count: int = 0
     last_refresh_runtime_excluded_at: datetime | None = None
+    last_refresh_low_quality_reintroduced_market_ids: set[str] = field(default_factory=set)
+    last_refresh_low_quality_reintroduced_reason_by_market: dict[str, str] = field(
+        default_factory=dict
+    )
+    last_refresh_watched_low_quality_excluded_market_ids: set[str] = field(default_factory=set)
+    last_refresh_watched_low_quality_excluded_reason_by_market: dict[str, str] = field(
+        default_factory=dict
+    )
     last_refresh_chronic_reintroduced_market_ids: set[str] = field(default_factory=set)
     last_refresh_chronic_reintroduced_reason_by_market: dict[str, str] = field(default_factory=dict)
     last_refresh_watched_chronic_stale_market_ids: set[str] = field(default_factory=set)
@@ -208,6 +223,8 @@ class AppState:
     market_chronic_stale_details_by_market: dict[str, dict[str, object]] = field(
         default_factory=dict
     )
+    market_low_quality_exclusion_enter_count_last_cycle: int = 0
+    market_low_quality_exclusion_cleared_count_last_cycle: int = 0
     market_chronic_stale_enter_count_last_cycle: int = 0
     market_chronic_stale_cleared_count_last_cycle: int = 0
     market_refresh_observed_count: dict[str, int] = field(default_factory=dict)
@@ -263,6 +280,10 @@ class MarketSnapshot:
     excluded_counts: dict[str, int]
     markets_by_id: dict[str, BinaryMarket]
     token_to_market_side: dict[str, tuple[str, str]]
+    low_quality_reintroduced_for_floor_market_ids: set[str] = field(default_factory=set)
+    low_quality_reintroduced_reason_by_market: dict[str, str] = field(default_factory=dict)
+    watched_low_quality_excluded_market_ids: set[str] = field(default_factory=set)
+    watched_low_quality_excluded_reason_by_market: dict[str, str] = field(default_factory=dict)
     chronic_reintroduced_for_floor_market_ids: set[str] = field(default_factory=set)
     chronic_reintroduced_reason_by_market: dict[str, str] = field(default_factory=dict)
     watched_chronic_stale_market_ids: set[str] = field(default_factory=set)
@@ -421,16 +442,108 @@ class PolymarketStructureArbApp:
             relaxed_filters.require_recent_trade_within_minutes = None
         return relaxed_filters
 
+    def _allow_low_quality_floor_relaxation(self) -> bool:
+        configured = self.config.settings.runtime.watched_floor_relax_low_quality_runtime_exclusion
+        if configured is not None:
+            return bool(configured)
+        return bool(self.config.settings.runtime.watched_floor_relax_runtime_exclusion)
+
+    @staticmethod
+    def _market_activity_score(raw: dict[str, object]) -> float:
+        def _as_float(value: object) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        liquidity = _as_float(raw.get("liquidity")) or _as_float(raw.get("liquidityNum"))
+        volume = (
+            _as_float(raw.get("volume24hr"))
+            or _as_float(raw.get("volume24h"))
+            or _as_float(raw.get("volume"))
+            or _as_float(raw.get("volumeNum"))
+        )
+        return max(0.0, liquidity) + max(0.0, volume)
+
+    def _watched_floor_quality_rank(
+        self, market: BinaryMarket
+    ) -> tuple[float, int, int, float, str]:
+        penalty = float(self.state.market_quality_penalty_by_market.get(market.market_id, 0))
+        consecutive_bad_cycles = self.state.market_low_quality_consecutive_cycles.get(
+            market.market_id,
+            0,
+        )
+        freshness_state = self.state.market_freshness_state_by_market.get(
+            market.market_id,
+            MARKET_FRESHNESS_READY,
+        )
+        freshness_rank = {
+            MARKET_FRESHNESS_READY: 0,
+            MARKET_FRESHNESS_PROBATION: 1,
+            MARKET_FRESHNESS_NOT_READY: 2,
+            MARKET_FRESHNESS_RECOVERING: 3,
+            MARKET_FRESHNESS_STALE_NO_RECENT_QUOTE: 4,
+            MARKET_FRESHNESS_STALE_QUOTE_AGE: 5,
+        }.get(freshness_state, 6)
+        activity_score = self._market_activity_score(market.raw)
+        return (
+            penalty,
+            consecutive_bad_cycles,
+            freshness_rank,
+            -activity_score,
+            market.slug,
+        )
+
+    def _prioritize_watched_floor_candidates(
+        self,
+        candidates: list[BinaryMarket],
+    ) -> list[BinaryMarket]:
+        return sorted(candidates, key=self._watched_floor_quality_rank)
+
     def _save_last_refresh_runtime_exclusions(
         self,
         *,
         excluded_market_ids: set[str],
         reason_by_market: dict[str, str],
+        now_utc: datetime,
     ) -> None:
+        previous_excluded_market_ids = set(self.state.last_refresh_runtime_excluded_market_ids)
+        previous_reason_by_market = dict(self.state.last_refresh_runtime_excluded_reason_by_market)
         self.state.last_refresh_runtime_excluded_market_ids = set(excluded_market_ids)
         self.state.last_refresh_runtime_excluded_reason_by_market = dict(reason_by_market)
         self.state.last_refresh_runtime_excluded_count = len(excluded_market_ids)
-        self.state.last_refresh_runtime_excluded_at = utc_now()
+        self.state.last_refresh_runtime_excluded_at = now_utc
+
+        entered_market_ids = excluded_market_ids - previous_excluded_market_ids
+        cleared_market_ids = previous_excluded_market_ids - excluded_market_ids
+        self.state.market_low_quality_exclusion_enter_count_last_cycle = len(entered_market_ids)
+        self.state.market_low_quality_exclusion_cleared_count_last_cycle = len(cleared_market_ids)
+
+        for market_id in sorted(entered_market_ids):
+            details = self._market_context_by_market_id(market_id)
+            details["runtime_exclusion_reason"] = reason_by_market.get(market_id, "")
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_LOW_QUALITY_RUNTIME_EXCLUSION_ENTERED,
+                now_utc=now_utc,
+                market_id=market_id,
+                reason="low_quality_runtime",
+                details=format_kv_details(details),
+            )
+
+        for market_id in sorted(cleared_market_ids):
+            details = self._market_context_by_market_id(market_id)
+            details["previous_runtime_exclusion_reason"] = previous_reason_by_market.get(
+                market_id,
+                "",
+            )
+            details["cleared_reason"] = "quality_recovered_or_universe_requalified"
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_LOW_QUALITY_RUNTIME_EXCLUSION_CLEARED,
+                now_utc=now_utc,
+                market_id=market_id,
+                reason="low_quality_runtime",
+                details=format_kv_details(details),
+            )
 
     def _market_context_by_market_id(self, market_id: str) -> dict[str, object]:
         market = self.markets_by_id.get(market_id)
@@ -647,7 +760,7 @@ class PolymarketStructureArbApp:
             now_utc=now_utc,
             prune_expired=False,
         )
-        entered_market_ids = active_market_ids - previous_tracked_market_ids
+        entered_market_ids = active_market_ids - previous_active_market_ids
         cleared_market_ids = previous_tracked_market_ids - active_market_ids
 
         for market_id in sorted(entered_market_ids):
@@ -903,6 +1016,183 @@ class PolymarketStructureArbApp:
                 now_utc=now_utc,
             )
 
+    @staticmethod
+    def _low_quality_exclusion_reason_key(raw_reason: str) -> str:
+        for token in str(raw_reason).split(";"):
+            key, sep, value = token.partition("=")
+            if sep and key.strip() == "stage":
+                normalized = value.strip()
+                if normalized:
+                    return normalized
+        return "low_quality_runtime"
+
+    def _record_low_quality_runtime_exclusion_metrics(self, *, now_utc: datetime) -> None:
+        active_market_ids = set(self.state.last_refresh_runtime_excluded_market_ids)
+        active_reason_by_market = dict(self.state.last_refresh_runtime_excluded_reason_by_market)
+        reintroduced_market_ids = set(self.state.last_refresh_low_quality_reintroduced_market_ids)
+        reintroduced_reason_by_market = dict(
+            self.state.last_refresh_low_quality_reintroduced_reason_by_market
+        )
+        watched_low_quality_market_ids = set(
+            self.state.last_refresh_watched_low_quality_excluded_market_ids
+        )
+        watched_low_quality_reason_by_market = dict(
+            self.state.last_refresh_watched_low_quality_excluded_reason_by_market
+        )
+        watched_floor = self._effective_watched_floor()
+        watched_shortfall = max(0, watched_floor - self.state.watched_markets)
+        excluded_not_watched = max(0, len(active_market_ids - set(self.markets_by_id.keys())))
+        shortfall_due_to_low_quality = 0
+        if not self._allow_low_quality_floor_relaxation():
+            shortfall_due_to_low_quality = min(watched_shortfall, excluded_not_watched)
+
+        active_summary = ",".join(
+            f"{market_id}:{active_reason_by_market.get(market_id, '')}"
+            for market_id in sorted(active_market_ids)[:10]
+        )
+        reintroduced_summary = ",".join(
+            f"{market_id}:{reintroduced_reason_by_market.get(market_id, '')}"
+            for market_id in sorted(reintroduced_market_ids)[:10]
+        )
+        watched_summary = ",".join(
+            f"{market_id}:{watched_low_quality_reason_by_market.get(market_id, '')}"
+            for market_id in sorted(watched_low_quality_market_ids)[:10]
+        )
+        shortfall_details = (
+            f"floor={watched_floor};watched={self.state.watched_markets};"
+            f"shortfall={watched_shortfall};excluded_not_watched={excluded_not_watched};"
+            f"low_quality_relax_enabled={int(self._allow_low_quality_floor_relaxation())}"
+        )
+        metrics = {
+            "low_quality_runtime_excluded_count": float(len(active_market_ids)),
+            "low_quality_runtime_exclusion_active_count": float(len(active_market_ids)),
+            "low_quality_runtime_exclusion_enter_count": float(
+                self.state.market_low_quality_exclusion_enter_count_last_cycle
+            ),
+            "low_quality_runtime_exclusion_cleared_count": float(
+                self.state.market_low_quality_exclusion_cleared_count_last_cycle
+            ),
+            "low_quality_reintroduced_for_floor_count": float(len(reintroduced_market_ids)),
+            "current_watched_low_quality_excluded_count": float(
+                len(watched_low_quality_market_ids)
+            ),
+            "current_watched_low_quality_excluded_markets": float(
+                len(watched_low_quality_market_ids)
+            ),
+            "watched_low_quality_excluded_market_count": float(len(watched_low_quality_market_ids)),
+            "watched_floor_shortfall_due_to_low_quality_exclusion": float(
+                shortfall_due_to_low_quality
+            ),
+        }
+        metric_details = {
+            "low_quality_runtime_excluded_count": active_summary,
+            "low_quality_runtime_exclusion_active_count": active_summary,
+            "low_quality_reintroduced_for_floor_count": reintroduced_summary,
+            "current_watched_low_quality_excluded_count": watched_summary,
+            "current_watched_low_quality_excluded_markets": watched_summary,
+            "watched_low_quality_excluded_market_count": watched_summary,
+            "watched_floor_shortfall_due_to_low_quality_exclusion": shortfall_details,
+        }
+        for metric_name, metric_value in metrics.items():
+            details = metric_details.get(metric_name, active_summary)
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=metric_value,
+                details=details,
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                    "details": details,
+                },
+                now_utc=now_utc,
+            )
+
+        active_reason_counts: dict[str, int] = {}
+        for market_id in active_market_ids:
+            reason_key = self._low_quality_exclusion_reason_key(
+                active_reason_by_market.get(market_id, "")
+            )
+            active_reason_counts[reason_key] = active_reason_counts.get(reason_key, 0) + 1
+        for reason_key, count in sorted(active_reason_counts.items()):
+            metric_name = f"low_quality_runtime_exclusion_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=f"active_markets={len(active_market_ids)}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "active_markets": len(active_market_ids),
+                },
+                now_utc=now_utc,
+            )
+
+        reintroduced_reason_counts: dict[str, int] = {}
+        for market_id in reintroduced_market_ids:
+            reason = reintroduced_reason_by_market.get(
+                market_id,
+                "watched_floor_backfill_low_quality_relaxed",
+            )
+            reintroduced_reason_counts[reason] = reintroduced_reason_counts.get(reason, 0) + 1
+        for reason_key, count in sorted(reintroduced_reason_counts.items()):
+            metric_name = f"low_quality_reintroduced_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=f"reintroduced_markets={len(reintroduced_market_ids)}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "reintroduced_markets": len(reintroduced_market_ids),
+                },
+                now_utc=now_utc,
+            )
+
+        watched_reason_counts: dict[str, int] = {}
+        for market_id in watched_low_quality_market_ids:
+            reason = watched_low_quality_reason_by_market.get(
+                market_id,
+                "watched_low_quality_runtime_excluded",
+            )
+            watched_reason_counts[reason] = watched_reason_counts.get(reason, 0) + 1
+        for reason_key, count in sorted(watched_reason_counts.items()):
+            metric_name = f"watched_low_quality_reason:{reason_key}"
+            self.sqlite_store.save_metric(
+                metric_name=metric_name,
+                metric_value=float(count),
+                details=f"watched_low_quality_markets={len(watched_low_quality_market_ids)}",
+                created_at_iso=now_utc.isoformat(),
+                run_id=self.state.run_id,
+            )
+            self.csv_logger.log_metric(
+                {
+                    "run_id": self.state.run_id,
+                    "created_at": now_utc.isoformat(),
+                    "metric_name": metric_name,
+                    "metric_value": count,
+                    "watched_low_quality_markets": len(watched_low_quality_market_ids),
+                },
+                now_utc=now_utc,
+            )
+
     def _runtime_low_quality_excluded_market_ids(self) -> set[str]:
         threshold = max(1, self.config.settings.runtime.low_quality_market_penalty_threshold)
         min_observations = max(
@@ -930,8 +1220,10 @@ class PolymarketStructureArbApp:
         exclusion_reason_by_market: dict[str, str] = {}
         current_markets = set(self.markets_by_id.keys())
         watched_floor = self._effective_watched_floor()
+        allow_low_quality_relaxation = self._allow_low_quality_floor_relaxation()
+        now_utc = utc_now()
         if (
-            self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+            allow_low_quality_relaxation
             and len(current_markets) > 0
             and len(current_markets) <= watched_floor
         ):
@@ -949,6 +1241,7 @@ class PolymarketStructureArbApp:
             self._save_last_refresh_runtime_exclusions(
                 excluded_market_ids=excluded,
                 reason_by_market=exclusion_reason_by_market,
+                now_utc=now_utc,
             )
             return excluded
         for market_id, penalty in self.state.market_quality_penalty_by_market.items():
@@ -970,7 +1263,9 @@ class PolymarketStructureArbApp:
                 )
                 continue
             is_current = market_id in current_markets
-            can_exclude_current = len(current_markets) > watched_floor
+            can_exclude_current = (not allow_low_quality_relaxation) or (
+                len(current_markets) > watched_floor
+            )
             if should_exclude and (not is_current or can_exclude_current):
                 excluded.add(market_id)
                 exclusion_reason_by_market[market_id] = (
@@ -989,6 +1284,7 @@ class PolymarketStructureArbApp:
         self._save_last_refresh_runtime_exclusions(
             excluded_market_ids=excluded,
             reason_by_market=exclusion_reason_by_market,
+            now_utc=now_utc,
         )
         return excluded
 
@@ -998,6 +1294,7 @@ class PolymarketStructureArbApp:
             max_pages=self.config.settings.api.gamma_max_pages,
         )
         low_quality_excluded_market_ids = self._runtime_low_quality_excluded_market_ids()
+        allow_low_quality_floor_relaxation = self._allow_low_quality_floor_relaxation()
         chronic_excluded_market_ids = self._active_chronic_stale_excluded_market_ids(
             now_utc=utc_now(),
             prune_expired=False,
@@ -1018,6 +1315,8 @@ class PolymarketStructureArbApp:
             runtime_excluded_market_ids=runtime_excluded_market_ids,
             runtime_excluded_reason_by_market=runtime_excluded_reason_by_market,
         )
+        low_quality_reintroduced_for_floor_market_ids: set[str] = set()
+        low_quality_reintroduced_reason_by_market: dict[str, str] = {}
         chronic_reintroduced_for_floor_market_ids: set[str] = set()
         chronic_reintroduced_reason_by_market: dict[str, str] = {}
         watched_floor = self._effective_watched_floor()
@@ -1035,11 +1334,14 @@ class PolymarketStructureArbApp:
                 runtime_excluded_reason_by_market=runtime_excluded_reason_by_market,
             )
             needed = max(0, watched_floor - len(extraction.markets))
-            stage1_supplements = [
+            stage1_candidates = [
                 market
                 for market in stage1_extraction.markets
                 if market.market_id not in existing_market_ids
-            ][:needed]
+            ]
+            stage1_supplements = self._prioritize_watched_floor_candidates(stage1_candidates)[
+                :needed
+            ]
             if stage1_supplements:
                 supplements.extend(stage1_supplements)
                 existing_market_ids.update(market.market_id for market in stage1_supplements)
@@ -1050,7 +1352,7 @@ class PolymarketStructureArbApp:
 
             stage2_supplements: list[BinaryMarket] = []
             if (
-                self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+                allow_low_quality_floor_relaxation
                 and len(extraction.markets) + len(supplements) < watched_floor
             ):
                 chronic_only_reason_map = {
@@ -1065,14 +1367,17 @@ class PolymarketStructureArbApp:
                     runtime_excluded_reason_by_market=chronic_only_reason_map,
                 )
                 needed = max(0, watched_floor - (len(extraction.markets) + len(supplements)))
-                stage2_supplements = [
+                stage2_candidates = [
                     market
                     for market in stage2_extraction.markets
                     if (
                         market.market_id in low_quality_excluded_market_ids
                         and market.market_id not in existing_market_ids
                     )
-                ][:needed]
+                ]
+                stage2_supplements = self._prioritize_watched_floor_candidates(stage2_candidates)[
+                    :needed
+                ]
                 if stage2_supplements:
                     supplements.extend(stage2_supplements)
                     existing_market_ids.update(market.market_id for market in stage2_supplements)
@@ -1083,6 +1388,11 @@ class PolymarketStructureArbApp:
                         )
                         + len(stage2_supplements)
                     )
+                    for market in stage2_supplements:
+                        low_quality_reintroduced_for_floor_market_ids.add(market.market_id)
+                        low_quality_reintroduced_reason_by_market[market.market_id] = (
+                            "watched_floor_backfill_low_quality_relaxed"
+                        )
 
             stage3_supplements: list[BinaryMarket] = []
             if (
@@ -1091,7 +1401,7 @@ class PolymarketStructureArbApp:
             ):
                 stage3_runtime_excluded_ids = (
                     set()
-                    if self.config.settings.runtime.watched_floor_relax_runtime_exclusion
+                    if allow_low_quality_floor_relaxation
                     else set(low_quality_excluded_market_ids)
                 )
                 stage3_runtime_reason_map = (
@@ -1111,14 +1421,17 @@ class PolymarketStructureArbApp:
                     runtime_excluded_reason_by_market=stage3_runtime_reason_map,
                 )
                 needed = max(0, watched_floor - (len(extraction.markets) + len(supplements)))
-                stage3_supplements = [
+                stage3_candidates = [
                     market
                     for market in stage3_extraction.markets
                     if (
                         market.market_id in chronic_excluded_market_ids
                         and market.market_id not in existing_market_ids
                     )
-                ][:needed]
+                ]
+                stage3_supplements = self._prioritize_watched_floor_candidates(stage3_candidates)[
+                    :needed
+                ]
                 if stage3_supplements:
                     supplements.extend(stage3_supplements)
                     existing_market_ids.update(market.market_id for market in stage3_supplements)
@@ -1152,11 +1465,21 @@ class PolymarketStructureArbApp:
                     len(stage1_supplements),
                     len(stage2_supplements),
                     len(stage3_supplements),
-                    self.config.settings.runtime.watched_floor_relax_runtime_exclusion,
+                    allow_low_quality_floor_relaxation,
                     self.config.settings.runtime.watched_floor_relax_chronic_stale_exclusion,
                     self.config.settings.runtime.watched_floor_relax_activity_filters,
                 )
         markets_by_id = {market.market_id: market for market in extraction.markets}
+        watched_low_quality_excluded_market_ids = {
+            market_id for market_id in markets_by_id if market_id in low_quality_excluded_market_ids
+        }
+        watched_low_quality_excluded_reason_by_market = {
+            market_id: low_quality_reintroduced_reason_by_market.get(
+                market_id,
+                "watched_low_quality_runtime_excluded",
+            )
+            for market_id in watched_low_quality_excluded_market_ids
+        }
         watched_chronic_stale_market_ids = {
             market_id for market_id in markets_by_id if market_id in chronic_excluded_market_ids
         }
@@ -1176,6 +1499,14 @@ class PolymarketStructureArbApp:
             excluded_counts=extraction.excluded_counts,
             markets_by_id=markets_by_id,
             token_to_market_side=token_to_market_side,
+            low_quality_reintroduced_for_floor_market_ids=(
+                low_quality_reintroduced_for_floor_market_ids
+            ),
+            low_quality_reintroduced_reason_by_market=low_quality_reintroduced_reason_by_market,
+            watched_low_quality_excluded_market_ids=watched_low_quality_excluded_market_ids,
+            watched_low_quality_excluded_reason_by_market=(
+                watched_low_quality_excluded_reason_by_market
+            ),
             chronic_reintroduced_for_floor_market_ids=chronic_reintroduced_for_floor_market_ids,
             chronic_reintroduced_reason_by_market=chronic_reintroduced_reason_by_market,
             watched_chronic_stale_market_ids=watched_chronic_stale_market_ids,
@@ -1209,6 +1540,18 @@ class PolymarketStructureArbApp:
         self.state.subscribed_assets = len(asset_ids)
         self.state.cumulative_watched_market_ids.update(self.markets_by_id.keys())
         self.state.cumulative_subscribed_asset_ids.update(asset_ids)
+        self.state.last_refresh_low_quality_reintroduced_market_ids = set(
+            snapshot.low_quality_reintroduced_for_floor_market_ids
+        )
+        self.state.last_refresh_low_quality_reintroduced_reason_by_market = dict(
+            snapshot.low_quality_reintroduced_reason_by_market
+        )
+        self.state.last_refresh_watched_low_quality_excluded_market_ids = set(
+            snapshot.watched_low_quality_excluded_market_ids
+        )
+        self.state.last_refresh_watched_low_quality_excluded_reason_by_market = dict(
+            snapshot.watched_low_quality_excluded_reason_by_market
+        )
         self.state.last_refresh_chronic_reintroduced_market_ids = set(
             snapshot.chronic_reintroduced_for_floor_market_ids
         )
@@ -1221,6 +1564,24 @@ class PolymarketStructureArbApp:
         self.state.last_refresh_watched_chronic_stale_reason_by_market = dict(
             snapshot.watched_chronic_stale_reason_by_market
         )
+        for market_id in sorted(snapshot.low_quality_reintroduced_for_floor_market_ids):
+            reason = snapshot.low_quality_reintroduced_reason_by_market.get(
+                market_id,
+                "watched_floor_backfill_low_quality_relaxed",
+            )
+            details = {
+                **self._market_context_by_market_id(market_id),
+                "reintroduced_reason": reason,
+                "watched_floor": self._effective_watched_floor(),
+                "low_quality_relax_enabled": int(self._allow_low_quality_floor_relaxation()),
+            }
+            self._save_diagnostics_event(
+                event_name=DIAG_EVENT_MARKET_LOW_QUALITY_REINTRODUCED_FOR_FLOOR,
+                now_utc=now,
+                market_id=market_id,
+                reason=reason,
+                details=format_kv_details(details),
+            )
         for market_id in sorted(snapshot.chronic_reintroduced_for_floor_market_ids):
             reason = snapshot.chronic_reintroduced_reason_by_market.get(
                 market_id,
@@ -1230,9 +1591,7 @@ class PolymarketStructureArbApp:
                 **self._market_context_by_market_id(market_id),
                 "reintroduced_reason": reason,
                 "watched_floor": self._effective_watched_floor(),
-                "low_quality_relax_enabled": int(
-                    self.config.settings.runtime.watched_floor_relax_runtime_exclusion
-                ),
+                "low_quality_relax_enabled": int(self._allow_low_quality_floor_relaxation()),
                 "chronic_relax_enabled": int(
                     self.config.settings.runtime.watched_floor_relax_chronic_stale_exclusion
                 ),
@@ -3811,6 +4170,7 @@ class PolymarketStructureArbApp:
                 SAFE_MODE_REASON_BOOK_STATE_UNHEALTHY,
             }:
                 self._maybe_exit_safe_mode(now)
+            self._record_low_quality_runtime_exclusion_metrics(now_utc=now)
             self._record_chronic_stale_exclusion_metrics(
                 summary=chronic_stale_summary,
                 now_utc=now,
@@ -4302,31 +4662,7 @@ class PolymarketStructureArbApp:
             },
             now_utc=now,
         )
-        excluded_runtime_count = self.state.last_refresh_runtime_excluded_count
-        exclusion_reason_summary = ",".join(
-            f"{market_id}:{reason}"
-            for market_id, reason in sorted(
-                self.state.last_refresh_runtime_excluded_reason_by_market.items(),
-                key=lambda item: item[0],
-            )[:5]
-        )
-        self.sqlite_store.save_metric(
-            metric_name="low_quality_runtime_excluded_count",
-            metric_value=float(excluded_runtime_count),
-            details=exclusion_reason_summary,
-            created_at_iso=now.isoformat(),
-            run_id=self.state.run_id,
-        )
-        self.csv_logger.log_metric(
-            {
-                "run_id": self.state.run_id,
-                "created_at": now.isoformat(),
-                "metric_name": "low_quality_runtime_excluded_count",
-                "metric_value": excluded_runtime_count,
-                "details": exclusion_reason_summary,
-            },
-            now_utc=now,
-        )
+        self._record_low_quality_runtime_exclusion_metrics(now_utc=now)
         self._record_chronic_stale_exclusion_metrics(
             summary=chronic_stale_summary,
             now_utc=now,
